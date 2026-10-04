@@ -1,0 +1,19 @@
+# 默认按 LF 存入仓库，避免跨平台协作时出现整文件的无意义 diff
+* text=auto eol=lf
+
+# Windows 上必须带 CRLF 的文件
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制，Git 不做换行转换也不做差异比较
+*.png binary
+*.ico binary
+*.icns binary
+*.dll binary
+*.exe binary
+*.7z binary
+*.zip binary
+
+# 测试媒体：必须按字节比较，不能被换行符转换破坏
+src-tauri/tests/media/** binary

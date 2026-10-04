@@ -1,0 +1,38 @@
+[package]
+name = "video-view"
+version = "0.1.0"
+description = "轻量级 Windows 桌面视频播放器，基于 Tauri + libmpv"
+authors = ["VideoView contributors"]
+license = "GPL-3.0-or-later"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "video_view_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# libmpv 运行时动态加载，不需要 bindgen / import lib
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 原生文件对话框。在 spawn_blocking 里调用，避开 Tauri 的权限配置。
+rfd = { version = "0.17", default-features = false }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

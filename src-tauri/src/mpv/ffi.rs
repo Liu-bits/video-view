@@ -1,0 +1,215 @@
+//! libmpv 的最小 FFI 声明 + 运行时动态加载。
+//!
+//! 为什么不用现成的 crate：`mpv-client` / `libmpv2` 都依赖 bindgen 或要求
+//! 构建期存在 MSVC import lib（`mpv.lib`）。而 Windows 上分发的 libmpv 只有
+//! DLL，没有配套的 `.lib`，装个 libclang 也解决不了链接问题。
+//!
+//! 这里改为运行时用 `LoadLibrary` 加载 DLL 并手工声明用到的符号，好处是：
+//! - 构建期零 C 依赖，只要 rustc + linker 即可，clone 下来就能编译
+//! - 单 exe 分发时 DLL 放同级目录即可，不需要改链接参数
+
+use std::ffi::{c_char, c_double, c_int, c_uint, c_void};
+
+use libloading::Library;
+
+// ---------------------------------------------------------------- mpv_format
+
+pub const MPV_FORMAT_NONE: c_int = 0;
+pub const MPV_FORMAT_STRING: c_int = 1;
+pub const MPV_FORMAT_FLAG: c_int = 3;
+pub const MPV_FORMAT_INT64: c_int = 4;
+pub const MPV_FORMAT_DOUBLE: c_int = 5;
+
+// ---------------------------------------------------------------- mpv_event_id
+//
+// 取值来自 mpv 2.x 的 client.h。这些枚举值并不连续，写错会读到错误的事件。
+
+pub const MPV_EVENT_NONE: c_int = 0;
+pub const MPV_EVENT_SHUTDOWN: c_int = 1;
+pub const MPV_EVENT_LOG_MESSAGE: c_int = 2;
+pub const MPV_EVENT_GET_PROPERTY_REPLY: c_int = 3;
+pub const MPV_EVENT_SET_PROPERTY_REPLY: c_int = 4;
+pub const MPV_EVENT_COMMAND_REPLY: c_int = 5;
+pub const MPV_EVENT_START_FILE: c_int = 6;
+pub const MPV_EVENT_END_FILE: c_int = 7;
+pub const MPV_EVENT_FILE_LOADED: c_int = 8;
+pub const MPV_EVENT_CLIENT_MESSAGE: c_int = 16;
+pub const MPV_EVENT_VIDEO_RECONFIG: c_int = 17;
+pub const MPV_EVENT_AUDIO_RECONFIG: c_int = 18;
+pub const MPV_EVENT_SEEK: c_int = 20;
+pub const MPV_EVENT_PLAYBACK_RESTART: c_int = 21;
+pub const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+pub const MPV_EVENT_QUEUE_OVERFLOW: c_int = 23;
+
+// ---------------------------------------------------------------- mpv_end_file_reason
+
+pub const MPV_END_FILE_REASON_EOF: c_int = 0;
+pub const MPV_END_FILE_REASON_STOP: c_int = 2;
+pub const MPV_END_FILE_REASON_QUIT: c_int = 3;
+pub const MPV_END_FILE_REASON_ERROR: c_int = 4;
+
+// ---------------------------------------------------------------- 结构体
+
+#[repr(C)]
+pub struct MpvEvent {
+    pub event_id: c_int,
+    pub error: c_int,
+    pub reply_userdata: u64,
+    pub data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct MpvEventProperty {
+    pub name: *const c_char,
+    pub format: c_int,
+    pub data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct MpvEventEndFile {
+    pub reason: c_int,
+    pub error: c_int,
+    pub playlist_entry_id: i64,
+    pub playlist_insert_id: c_int,
+    pub playlist_insert_num_entries: c_int,
+}
+
+// ---------------------------------------------------------------- 函数签名
+
+type FnCreate = unsafe extern "system" fn() -> *mut c_void;
+type FnInitialize = unsafe extern "system" fn(*mut c_void) -> c_int;
+type FnDestroy = unsafe extern "system" fn(*mut c_void);
+type FnSetOptionString = unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
+type FnSetProperty = unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
+type FnGetProperty = unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
+type FnObserveProperty =
+    unsafe extern "system" fn(*mut c_void, u64, *const c_char, c_int) -> c_int;
+type FnCommand = unsafe extern "system" fn(*mut c_void, *mut *const c_char) -> c_int;
+type FnCommandAsync = unsafe extern "system" fn(*mut c_void, u64, *mut *const c_char) -> c_int;
+type FnWaitEvent = unsafe extern "system" fn(*mut c_void, c_double) -> *mut MpvEvent;
+type FnErrorString = unsafe extern "system" fn(c_int) -> *const c_char;
+type FnFree = unsafe extern "system" fn(*mut c_void);
+// 注意：libmpv 里所有返回状态码的函数都返回 `int`，`mpv_client_api_version`
+// 返回的是 `unsigned int`。声明成 u64 会读到 eax 的高位垃圾，是堆损坏的常见来源。
+type FnClientApiVersion = unsafe extern "system" fn() -> c_uint;
+type FnClientName = unsafe extern "system" fn(*mut c_void) -> *const c_char;
+
+// ---------------------------------------------------------------- API 表
+
+/// 已加载的 libmpv 符号表。
+///
+/// `Library` 必须在所有使用这些函数指针的线程都结束后才允许 drop，
+/// 因此它和 `Mpv` handle 一起由 `MpvContext` 持有，事件线程先 join 再释放。
+pub struct MpvApi {
+    pub create: FnCreate,
+    pub initialize: FnInitialize,
+    pub destroy: FnDestroy,
+    pub set_option_string: FnSetOptionString,
+    pub set_property: FnSetProperty,
+    pub get_property: FnGetProperty,
+    pub observe_property: FnObserveProperty,
+    pub command: FnCommand,
+    pub command_async: FnCommandAsync,
+    pub wait_event: FnWaitEvent,
+    pub error_string: FnErrorString,
+    pub free: FnFree,
+    pub client_api_version: FnClientApiVersion,
+    pub client_name: FnClientName,
+    // 持有 DLL，必须放在最后 drop
+    _lib: Library,
+}
+
+impl MpvApi {
+    /// 从 `path` 加载 libmpv。
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        // RTLD_LOCAL：不让 libmpv 的符号污染宿主进程（本程序是 exe，无所谓，
+        // 但保持局部加载语义更干净）。DLL 上的符号解析仍走默认搜索路径。
+        let lib = unsafe { Library::new(path) }
+            .map_err(|e| format!("加载 {} 失败: {e}", path.display()))?;
+
+        // 逐个取符号。`*sym` 会把 Symbol 解引用成裸函数指针的拷贝，
+        // 这样就不带 libloading 的生命周期约束，但仍要求 _lib 不先于它 drop。
+        unsafe {
+            let create = *lib
+                .get::<FnCreate>(b"mpv_create\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_create".to_string())?;
+            let initialize = *lib
+                .get::<FnInitialize>(b"mpv_initialize\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_initialize".to_string())?;
+            let destroy = *lib
+                .get::<FnDestroy>(b"mpv_destroy\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_destroy".to_string())?;
+            let set_option_string = *lib
+                .get::<FnSetOptionString>(b"mpv_set_option_string\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_set_option_string".to_string())?;
+            let set_property = *lib
+                .get::<FnSetProperty>(b"mpv_set_property\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_set_property".to_string())?;
+            let get_property = *lib
+                .get::<FnGetProperty>(b"mpv_get_property\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_get_property".to_string())?;
+            let observe_property = *lib
+                .get::<FnObserveProperty>(b"mpv_observe_property\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_observe_property".to_string())?;
+            let command = *lib
+                .get::<FnCommand>(b"mpv_command\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_command".to_string())?;
+            let command_async = *lib
+                .get::<FnCommandAsync>(b"mpv_command_async\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_command_async".to_string())?;
+            let wait_event = *lib
+                .get::<FnWaitEvent>(b"mpv_wait_event\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_wait_event".to_string())?;
+            let error_string = *lib
+                .get::<FnErrorString>(b"mpv_error_string\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_error_string".to_string())?;
+            let free = *lib
+                .get::<FnFree>(b"mpv_free\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_free".to_string())?;
+            let client_api_version = *lib
+                .get::<FnClientApiVersion>(b"mpv_client_api_version\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_client_api_version".to_string())?;
+            let client_name = *lib
+                .get::<FnClientName>(b"mpv_client_name\0")
+                .map_err(|_| "libmpv 缺少符号 mpv_client_name".to_string())?;
+
+            Ok(Self {
+                create,
+                initialize,
+                destroy,
+                set_option_string,
+                set_property,
+                get_property,
+                observe_property,
+                command,
+                command_async,
+                wait_event,
+                error_string,
+                free,
+                client_api_version,
+                client_name,
+                _lib: lib,
+            })
+        }
+    }
+
+    /// 把 mpv 错误码转成可读文本。
+    pub fn error_message(&self, code: c_int) -> String {
+        if code >= 0 {
+            return format!("success ({code})");
+        }
+        unsafe {
+            let ptr = (self.error_string)(code);
+            if ptr.is_null() {
+                format!("未知错误 (code {code})")
+            } else {
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            }
+        }
+    }
+}
+
+// 符号全是不透明的裸函数指针，只在 MpvApi 存活期间有效。
+// MpvContext 会保证 handle 的所有使用者都 join 后才 drop MpvApi。
+unsafe impl Send for MpvApi {}
+unsafe impl Sync for MpvApi {}
