@@ -26,9 +26,10 @@ FFmpeg 的 LGPL 构建不包含这两个编码器，无法满足「格式兼容�
 
 ### Tauri
 
-- 用途：应用外壳与 WebView 承载
-- 来源：<https://tauri.app/>
-- 许可证：MIT / Apache-2.0
+- 状态：**v0.2.0 起已不再使用**。界面改为原生 Win32 + GDI 自绘，
+  WebView2 连同 Chromium 运行时一起移出依赖，因此这一项不再随包分发
+- 历史来源：<https://tauri.app/>
+- 历史许可证：MIT / Apache-2.0
 
 ### libloading
 
@@ -44,23 +45,21 @@ FFmpeg 的 LGPL 构建不包含这两个编码器，无法满足「格式兼容�
 
 ### windows
 
-- 用途：创建与定位 mpv 的视频输出窗口
+- 用途：界面绘制、窗口与消息处理、DPI 感知，以及创建与定位
+  mpv 的视频输出窗口
 - 来源：<https://crates.io/crates/windows>
 - 许可证：MIT OR Apache-2.0
 
 ## 不随包分发
 
-### Microsoft Edge WebView2 Runtime
+### NSIS
 
-- 用途：承载界面
-- 说明：本仓库不分发该运行时。安装程序会在目标机器缺失时下载安装包。
-- 来源：<https://developer.microsoft.com/microsoft-edge/webview2/>
-- 许可：需遵循 Microsoft 的 WebView2 使用条款
+- 用途：生成 Windows 安装程序
+- 说明：仅构建期使用，不随 Release 分发
+- 来源：<https://nsis.sourceforge.io/>
+- 许可证：zlib/libpng 许可
 
 ## 构建期依赖
 
-Rust crates 与 npm 包各自适用其上游许可证，
-均不随 Release 分发。清单见：
-
-- `src-tauri/Cargo.lock`
-- `package-lock.json`
+Rust crates 各自适用其上游许可证，均不随 Release 分发。清单见
+`src-tauri/Cargo.lock`。

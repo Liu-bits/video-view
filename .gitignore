@@ -1,26 +1,18 @@
-# 依赖与构建产物
-node_modules/
-dist/
-dist-ssr/
-
 # Rust
-src-tauri/target/
+# `target/` 这条就覆盖了 src-tauri/target/（gitignore 的模式里不含 / 开头
+# 就是任意层级匹配），不必再单写一条重复的
 target/
 **/*.rs.bk
-
-# Tauri 生成的 schema，由构建自动产生
-src-tauri/gen/
 
 # libmpv 是第三方二进制，不入库，由 scripts/fetch-libmpv.ps1 获取
 src-tauri/libmpv-2.dll
 vendor/
 
+# 打包产物
+artifacts/
+
 # 日志与临时文件
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
 
 # 编辑器与操作系统
 .vscode/*
@@ -35,15 +27,6 @@ pnpm-debug.log*
 Thumbs.db
 ehthumbs.db
 desktop.ini
-
-# 打包产物
-*.exe
-*.msi
-*.msix
-*.dmg
-*.AppImage
-*.deb
-*.rpm
 
 # 密钥与本地配置（保险起见）
 .env
