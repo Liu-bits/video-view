@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::lang;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -40,15 +41,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT, HWND_TOP,
-    IDC_ARROW, IDC_HAND, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR,
-    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, MessageBoxW, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT,
+    HWND_TOP, IDC_ARROW, IDC_HAND, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, PM_REMOVE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
@@ -116,6 +118,15 @@ struct UiState {
     has_file: bool,
     /// mpv 报 `idle-active`：当前没有正在播放的文件
     idle: bool,
+    /// mpv 报 `hwdec-current`：当前实际生效的硬件解码器。
+    ///
+    /// `"d3d11va"` / `"dxva2"` = 硬件解码在用；`"no"` = **静默退回了软解**。
+    ///
+    /// 空串表示还没开始解码（`hwdec-current` 在解码器未加载时不可用）。
+    /// 这一项不参与绘制，只作为「这台机器/这个视频是不是走了降级路径」的
+    /// 可观测依据——D3D11VA 格式探测失败时 mpv 不发任何 error 或 warning，
+    /// 那种情况下这个字段是唯一的信号。
+    hwdec: String,
 }
 
 impl Default for UiState {
@@ -130,6 +141,8 @@ impl Default for UiState {
             title: String::new(),
             has_file: false,
             idle: true,
+            // 还没解码任何东西，`hwdec-current` 此时不可用
+            hwdec: String::new(),
         }
     }
 }
@@ -253,6 +266,12 @@ impl Drop for BackBuffer {
 struct App {
     hwnd: HWND,
     video: HWND,
+    /// `WM_CREATE` 失败的原因。
+    ///
+    /// 原本是直接在 `WM_CREATE` 里弹 `MessageBoxW`，但那是在
+    /// `CreateWindowExW` 尚未返回时嵌套跑一个模态消息循环（见该分支的
+    /// 注释）。改成存下来、由 `create_and_loop` 在窗口创建彻底结束后再弹。
+    create_error: Option<String>,
     /// 播放核心。窗口先建（WM_CREATE 里造画面窗口），mpv 再建，
     /// 因为 mpv 的 `wid` 就是画面窗口的句柄。
     player: Option<Arc<MpvPlayer>>,
@@ -271,6 +290,8 @@ struct App {
     saved: Option<SavedWindow>,
     /// 字体 + 画刷缓存。整体在 DPI 变化时重建。
     theme: ui::Theme,
+    /// 当前语言的界面文案。构造时确定一次，之后整个进程不变。
+    strings: lang::Strings,
     dpi: u32,
     /// 鼠标停在哪个可点击控件上，用于高亮
     hover: Hit,
@@ -297,9 +318,16 @@ const MAX_QUEUED_ERRORS: usize = 8;
 
 impl App {
     fn new() -> Self {
+        // 语言先定下来：控件宽度是按当前语言的文案**实测**出来的，
+        // 所以 Theme 必须在 strings 之后建，顺序不能反。
+        let strings = lang::Strings::new(lang::Lang::detect());
+        // DPI 真正生效后 WM_CREATE 会立刻重建字体，这里先用 96 占位
+        let theme = ui::Theme::new(96, &strings);
+        let layout = Layout::new(0, 0, 96, false, &theme.metrics);
         Self {
             hwnd: HWND::default(),
             video: HWND::default(),
+            create_error: None,
             player: None,
             events: Arc::new(Mutex::new(Vec::new())),
             state: UiState::default(),
@@ -308,13 +336,13 @@ impl App {
             theatre: false,
             fullscreen: false,
             saved: None,
-            // DPI 真正生效后 WM_CREATE 会立刻重建字体
-            theme: ui::Theme::new(96),
+            strings,
+            theme,
             dpi: 96,
             hover: Hit::None,
             client_w: 0,
             client_h: 0,
-            layout: Layout::new(0, 0, 96, false),
+            layout,
             back: BackBuffer {
                 dc: HDC::default(),
                 bitmap: HBITMAP::default(),
@@ -352,13 +380,20 @@ impl App {
 
         // 字体必须跟着 DPI 重建，否则 GDI 会拉伸上一档 DPI 的字形。
         // 这就是「放大之后字发虚」的第二个来源。
+        // 语言也在这里比对：换语言后文案宽度全变，字体与布局都得重算。
         let dpi = ui::dpi_for_window(self.hwnd);
-        if dpi != self.dpi || !self.theme.matches(dpi) {
+        if dpi != self.dpi || !self.theme.matches(dpi, self.strings.lang) {
             self.dpi = dpi;
-            self.theme = ui::Theme::new(dpi);
+            self.theme = ui::Theme::new(dpi, &self.strings);
         }
 
-        self.layout = Layout::new(self.client_w, self.client_h, self.dpi, self.theatre);
+        self.layout = Layout::new(
+            self.client_w,
+            self.client_h,
+            self.dpi,
+            self.theatre,
+            &self.theme.metrics,
+        );
 
         let video_rect = RECT {
             left: 0,
@@ -399,7 +434,20 @@ impl App {
         self.invalidate_all();
 
         if let Err(e) = self.player().load_file(path) {
-            self.report_error("打开文件失败", &e);
+            self.report_error(self.strings.err_open, &e);
+            // 加载失败要退回空闲态，否则界面永远停在「已加载但没在播」的样子：
+            // 文件名显示着、播放/停止按钮是亮的（点了也只是又弹一次同样的错）、
+            // 而画面区没有 mpv 子窗口盖着——`App::paint` 会按 `has_file` 跳过
+            // 视频区底色，于是那块露出后备位图里的旧内容，看起来就是
+            // 「打开失败的视频」而不是「打开失败」。
+            self.state.has_file = false;
+            self.state.idle = true;
+            self.state.title.clear();
+            self.state.position = 0.0;
+            self.state.duration = 0.0;
+            surface::set_video_visible(self.video, false);
+            self.relayout();
+            self.invalidate_all();
         }
     }
 
@@ -410,7 +458,7 @@ impl App {
             return;
         }
         if let Err(e) = self.player().toggle_pause() {
-            self.report_error("切换播放状态失败", &e);
+            self.report_error(self.strings.err_toggle, &e);
         }
         // 立即更新按钮文字，不等 mpv 事件绕一圈
         self.state.paused = !self.state.paused;
@@ -422,7 +470,7 @@ impl App {
             return;
         }
         if let Err(e) = self.player().stop() {
-            self.report_error("停止失败", &e);
+            self.report_error(self.strings.err_stop, &e);
         }
         self.state.has_file = false;
         self.state.idle = true;
@@ -438,7 +486,7 @@ impl App {
     fn seek_absolute(&mut self, seconds: f64) {
         let target = seconds.clamp(0.0, self.state.duration.max(0.0));
         if let Err(e) = self.player().seek(target) {
-            self.report_error("跳转失败", &e);
+            self.report_error(self.strings.err_seek, &e);
         }
         self.state.position = target;
         self.invalidate_controls();
@@ -447,7 +495,7 @@ impl App {
     fn set_volume(&mut self, volume: f64) {
         let v = volume.clamp(0.0, 100.0);
         if let Err(e) = self.player().set_volume(v) {
-            self.report_error("调整音量失败", &e);
+            self.report_error(self.strings.err_volume, &e);
         }
         self.state.volume = v;
         self.invalidate_controls();
@@ -456,7 +504,7 @@ impl App {
     fn toggle_mute(&mut self) {
         let next = !self.state.muted;
         if let Err(e) = self.player().set_mute(next) {
-            self.report_error("切换静音失败", &e);
+            self.report_error(self.strings.err_mute, &e);
         }
         self.state.muted = next;
         self.invalidate_controls();
@@ -500,7 +548,7 @@ impl App {
     /// 处理 mpv 事件线程投递过来的消息。
     fn drain_events(&mut self) {
         let batch = {
-            let mut queue = self.events.lock().unwrap();
+            let mut queue = self.events.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *queue)
         };
         let mut layout_dirty = false;
@@ -523,6 +571,17 @@ impl App {
                     "idle-active" if change.value.as_flag().unwrap_or(false) => {
                         layout_dirty |= self.enter_idle();
                     }
+                    // 硬件解码实际用的哪一个。`no` = 静默退回软解。
+                    //
+                    // 存进状态而不是打日志：release 下没有控制台，而「画面能播
+                    // 但 CPU 跑满」这种问题只有用户会注意到——如果他们能在
+                    // 某个界面上看到「当前使用软件解码」，就能立刻判断这台
+                    // 机器/这个视频是不是走了降级路径，而不是先去猜是不是
+                    // 播放器慢。现在只落状态、不上界面（那是另一个决定），
+                    // 但值已经是可读的了。
+                    "hwdec-current" => {
+                        self.state.hwdec = change.value.as_text().unwrap_or("").to_string();
+                    }
                     _ => {}
                 },
                 MpvEventMessage::EndFile => {
@@ -536,7 +595,7 @@ impl App {
                 }
                 MpvEventMessage::Error(msg) => {
                     layout_dirty |= self.enter_idle();
-                    self.report_error("播放出错", &msg);
+                    self.report_error(self.strings.err_playback, &msg);
                 }
             }
         }
@@ -571,7 +630,7 @@ impl App {
         // ensure 会把 w/h 更新成新尺寸，所以重建与否要在它之前判
         let fresh = self.back.w != self.client_w || self.back.h != self.client_h;
         // 位图是新建的，就画整个客户区
-        let dirty = if fresh {
+        let mut dirty = if fresh {
             RECT {
                 left: 0,
                 top: 0,
@@ -589,6 +648,21 @@ impl App {
             // 但两个消费者必须看同一个矩形，否则这条推理就靠"恰好不会发生"撑着。
             ui::clamp_to_client(rc_paint, self.client_w, self.client_h)
         };
+
+        // 有文件在播时，视频区被 mpv 的子窗口整个盖住（`relayout` 里把它摆成
+        // `0,0,client_w,controls.top`），那一块既不用我们画、也不能我们画——
+        // 贴上去只会盖住正在播的画面。
+        //
+        // 这里把脏区裁到控制栏，`ui::paint` 里对应的视频区底色填充也随之跳过
+        // （那边判的是同一个 `loaded`）。两边必须一致：只夹脏区不跳填充，
+        // 视频区仍会被写；只跳填充不夹脏区，旧画面会被 BitBlt 贴回去。
+        //
+        // 省下来的不只是 CPU：4K 下不再每帧摸 8.3MB，那几十 MB 也就不会被
+        // 算进 WorkingSet。对「4G 内存」这个目标，这是我们自己的代码里
+        // 最大的一笔。
+        if self.state.has_file {
+            dirty = intersect_rect(dirty, &self.layout.controls);
+        }
 
         let w = dirty.right - dirty.left;
         let h = dirty.bottom - dirty.top;
@@ -629,6 +703,7 @@ impl App {
                     theatre: self.theatre,
                     idle: self.state.idle,
                     hover: self.hover,
+                    strings: &self.strings,
                 },
                 &dirty,
             );
@@ -698,6 +773,33 @@ impl App {
 /// 与其绕开这个坑，不如让位图和客户区保持同一套坐标系。
 fn blit_points(dirty: &RECT) -> (i32, i32, i32, i32) {
     (dirty.left, dirty.top, dirty.left, dirty.top)
+}
+
+/// 两个矩形的交集，没有交集时返回零面积矩形。
+///
+/// 返回 `right == left || bottom == top` 表示空，调用方现有的
+/// `w <= 0 || h <= 0` 判断就会跳过绘制与 BitBlt——这和 `clamp_to_client`
+/// 表达「这一帧没什么要画」的方式一致，不用在这里另立一套约定。
+fn intersect_rect(a: RECT, b: &RECT) -> RECT {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    // 任一方向反了就归一成空矩形，而不是留下 left > right 的反向矩形
+    if right <= left || bottom <= top {
+        return RECT {
+            left,
+            top,
+            right: left,
+            bottom: top,
+        };
+    }
+    RECT {
+        left,
+        top,
+        right,
+        bottom,
+    }
 }
 
 /// 全屏切换的窗口操作计划。
@@ -853,14 +955,37 @@ unsafe extern "system" fn app_wnd_proc(
                     app.relayout();
                     // 空闲时先藏起来，让欢迎提示露出来
                     surface::set_video_visible(video, false);
-                    let _ = SetTimer(Some(hwnd), TIMER_TICK, TICK_MS, None);
+                    // 注意：**这里不再 SetTimer**。定时器在
+                    // `create_and_loop` 里、`app.player` 就位之后才武装，
+                    // 否则「`player()` 还是 None 就收到 WM_TIMER」会撞上
+                    // `.expect()` 那条 abort 路径。
                     app.invalidate_all();
                     let _ = SetFocus(Some(hwnd));
                     LRESULT(0)
                 }
                 Err(e) => {
-                    message_box(hwnd, "无法创建画面窗口", &e);
-                    // 返回 -1 让 CreateWindowExW 失败，调用方统一报错退出
+                    // **不在这里弹 MessageBox。**
+                    //
+                    // `WM_CREATE` 是在 `CreateWindowExW` 尚未返回时派发出来的，
+                    // 而 `MessageBoxW` 自带完整的模态循环 —— 也就是说它会在
+                    // 「窗口正在被创建」的当中嵌套跑一圈消息派发。三个后果：
+                    //
+                    // 1. 用户在框上按 Esc / Alt+F4（`MB_OK` 的关闭按钮）→
+                    //    `DestroyWindow` 在 `CreateWindowExW` 内部完成 →
+                    //    然后 `WM_CREATE` 还返回 -1。Windows 对「你已经把它
+                    //    销毁了、CreateWindowExW 又拿到 NULL」这个组合的
+                    //    行为没有文档。
+                    // 2. 嵌套循环里到达 `WM_SIZE` → `relayout()` →
+                    //    `set_video_bounds`，而 `app.video` 此刻是
+                    //    `HWND::default()`（`create_video_window` 刚失败）。
+                    // 3. 嵌套循环里任何会碰 `App::player()` 的分支 →
+                    //    `.expect("播放核心尚未初始化")` → `panic = "abort"`
+                    //    下**整个进程直接消失**，连这句报错都看不到。
+                    //
+                    // 改成：把原因存进 `create_error`，`WM_CREATE` 返回 -1，
+                    // 由 `create_and_loop` 在 `CreateWindowExW` 真正返回之后
+                    // 再弹。那时机上窗口已定型、`player()` 不可达。
+                    (*app_ptr).create_error = Some(e);
                     LRESULT(-1)
                 }
             }
@@ -948,7 +1073,10 @@ unsafe extern "system" fn app_wnd_proc(
             // 标志先清再开框，避免对话框被重入时排队的消息重复开一个。
             if (*app_ptr).open_dialog {
                 (*app_ptr).open_dialog = false;
-                if let Some(path) = pick_video_dialog() {
+                // 先取文案副本（Strings 是 Copy）：`pick_video_dialog` 之后要
+                // 拿 `&mut App`，借用不能跨过模态调用
+                let strings = (*app_ptr).strings;
+                if let Some(path) = pick_video_dialog(&strings) {
                     (&mut *app_ptr).open(&path);
                 }
             }
@@ -1117,16 +1245,19 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
 ///
 /// 单独成函数是为了让「模态」这件事在调用点一眼可见：调用它的地方要么在
 /// 借用之外，要么就是 `WM_APP_OPEN_DIALOG` 那个借用已结束的分支。
-fn pick_video_dialog() -> Option<PathBuf> {
+///
+/// 文案按当前语言取，所以要传 `&Strings`；拿 `App` 引用会与调用点的
+/// `&mut App` 撞车（同 `handle_key` 的理由）。
+fn pick_video_dialog(strings: &lang::Strings) -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter(
-            "视频文件",
+            strings.dlg_filter_video,
             &[
                 "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg",
             ],
         )
-        .add_filter("所有文件", &["*"])
-        .set_title("选择要播放的视频")
+        .add_filter(strings.dlg_filter_all, &["*"])
+        .set_title(strings.dlg_title)
         .pick_file()
 }
 
@@ -1196,6 +1327,9 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
 
 /// 处理拖放。只取第一个文件，忽略目录。
 unsafe fn handle_drop(app_ptr: *mut App, hdrop: HDROP) {
+    // 先把文案取出来（`Strings` 是 Copy）��下面要拿 `&mut App` 调
+    // `report_error`，那时就不能再借 `app_ptr.strings` 了。
+    let strings = (*app_ptr).strings;
     let len = DragQueryFileW(hdrop, 0, None);
     if len == 0 {
         DragFinish(hdrop);
@@ -1213,7 +1347,7 @@ unsafe fn handle_drop(app_ptr: *mut App, hdrop: HDROP) {
     let units = match String::from_utf16(&buf[..len as usize]) {
         Ok(s) => s,
         Err(_) => {
-            (&mut *app_ptr).report_error("无法打开", "文件路径不是合法的 Unicode，无法处理。");
+            (&mut *app_ptr).report_error(strings.err_open, strings.err_bad_unicode);
             return;
         }
     };
@@ -1221,7 +1355,7 @@ unsafe fn handle_drop(app_ptr: *mut App, hdrop: HDROP) {
     if path.is_file() {
         (&mut *app_ptr).open(&path);
     } else {
-        (&mut *app_ptr).report_error("无法打开", "拖进来的不是文件。");
+        (&mut *app_ptr).report_error(strings.err_open, strings.err_not_a_file);
     }
 }
 
@@ -1266,6 +1400,16 @@ fn initial_file() -> Option<PathBuf> {
 // ---------------------------------------------------------------- 启动
 
 /// 应用入口。内部已处理所有错误（弹窗提示），不会向上抛。
+/// 启动早期（`App` 还没建起来、或正在建）那几个要弹错误框的地方用的文案。
+///
+/// 这些函数拿不到 `App::strings`，而把 `&Strings` 一路穿过
+/// `run` / `create_and_loop` / `register_app_class` 会让参数列表变长、
+/// 可读性变差。`Strings` 是 `Copy`，而 `Lang::detect()` 只是「读一个环境变量 +
+/// 读一次注册表 + 一次 API」，只有**出错路径**才会调到这里，正常启动一次都不调。
+fn startup_strings() -> lang::Strings {
+    lang::Strings::new(lang::Lang::detect())
+}
+
 pub fn run() {
     enable_dpi_awareness();
 
@@ -1273,7 +1417,7 @@ pub fn run() {
     let com_ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
 
     if let Err(e) = create_and_loop() {
-        message_box(HWND::default(), "VideoView 启动失败", &e);
+        message_box(HWND::default(), startup_strings().err_startup, &e);
     }
 
     if com_ok {
@@ -1302,7 +1446,7 @@ fn enable_dpi_awareness() {
 fn create_and_loop() -> Result<(), String> {
     unsafe {
         let module = windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null())
-            .map_err(|e| format!("获取模块句柄失败: {e}"))?;
+            .map_err(|e| format!("Could not get the module handle: {e}"))?;
         let hinstance = HINSTANCE(module.0);
         register_app_class(hinstance)?;
 
@@ -1334,8 +1478,23 @@ fn create_and_loop() -> Result<(), String> {
             Some(hinstance),
             Some(&mut *app as *mut App as *mut c_void),
         )
-        .map_err(|e| format!("创建主窗口失败: {e}"))?;
+        .map_err(|e| {
+            // `WM_CREATE` 记下的原因比「创建主窗口失败」有用得多：前者是
+            // 「无法创建画面窗口: <真实原因>」。后者之所以没用，是因为
+            // `WM_CREATE` 返回 -1 时 `GetLastError` **根本不会被设置**，
+            // 于是 `e` 往往显示成 0 号错误「操作成功完成」。
+            match &app.create_error {
+                Some(detail) => format!("{detail} (while creating the main window: {e})"),
+                None => format!("Could not create the main window: {e}"),
+            }
+        })?;
         app.hwnd = hwnd;
+
+        // 窗口创建期间（`WM_NCCREATE`…`WM_NCPAINT`）系统发了一批消息，处理过的
+        // 已经处理掉了，绘制类（`WM_PAINT` / `WM_NCPAINT`）的还留在队列里。
+        // 在这里抽干，后面 `MpvPlayer::new` 那几百毫秒（D3D11 设备创建 +
+        // 适配器枚举）就不是面对一个空白窗口。
+        pump_messages();
 
         // mpv 的 wid 就是画面窗口的句柄，所以必须在窗口创建之后。
         //
@@ -1356,6 +1515,19 @@ fn create_and_loop() -> Result<(), String> {
         };
         app.player = Some(Arc::new(player));
 
+        // 250ms 定时器**必须等到 `player` 就位之后再武装**。
+        //
+        // 原来是在 `WM_CREATE` 里 `SetTimer` 的，那时离消息循环还有整整一个
+        // `MpvPlayer::new`（D3D11 初始化，几百毫秒）。这段窗口里只要有任何
+        // 一次消息泵被跑起来——`DllMain` 自己泵、`PeekMessage`、或者任何
+        // 带自己消息循环的 API——`WM_TIMER` 就会进到窗口过程 → `tick()` →
+        // `self.player()` → `.expect("播放核心尚未初始化")` →
+        // `panic = "abort"` 下**整个进程静默消失，用户看不到任何提示**。
+        //
+        // 挪到这里之后，`tick()` 存在的时间范围内 `player` 一定已经是
+        // `Some`，那条 abort 路径被彻底关掉。
+        let _ = SetTimer(Some(hwnd), TIMER_TICK, TICK_MS, None);
+
         // 画面区域的点击 / 双击通过自定义消息回到主线程处理：
         // 画面子窗口的 wnd_proc 可能跑在 mpv 的线程上下文里，不能直接改状态
         let hwnd_raw = hwnd.0 as isize;
@@ -1371,7 +1543,7 @@ fn create_and_loop() -> Result<(), String> {
 
         let queue = app.events.clone();
         app.player().spawn_event_loop(Box::new(move |event| {
-            queue.lock().unwrap().push(event);
+            queue.lock().unwrap_or_else(|e| e.into_inner()).push(event);
             let target = HWND(hwnd_raw as *mut c_void);
             let _ = PostMessageW(Some(target), WM_MPV_EVENT, WPARAM(0), LPARAM(0));
         }));
@@ -1429,20 +1601,52 @@ unsafe fn register_app_class(hinstance: HINSTANCE) -> Result<(), String> {
     if RegisterClassExW(&wc) == 0 {
         let err = GetLastError();
         if err != ERROR_CLASS_ALREADY_EXISTS {
-            return Err(format!("注册窗口类失败: {}", err.0));
+            // 直接替换占位符即可，外面不必再套一层 format!（clippy useless_format）
+            return Err(startup_strings()
+                .err_register_class
+                .replace("{e}", &err.0.to_string()));
         }
     }
     Ok(())
 }
 
 /// 字符串 -> 以 NUL 结尾的 UTF-16 宽字符串。
+/// 把当前线程消息队列里已经排队的消息全部处理掉。
+///
+/// `PeekMessage` + `PM_REMOVE` 循环，**不**进入阻塞等待——所以它不会在没有
+/// 消息时卡住，只是把「已经排在那里的」清干净。
+///
+/// 存在的唯一理由是启动时序：`CreateWindowExW` 已经返回、但主消息循环还没
+/// 开始的那个窗口里，队列里会积着若干绘制类消息。不抽干的话，
+/// 紧接着的 `MpvPlayer::new`（D3D11 初始化）期间窗口是空白的；而反过来，
+/// 如果那段初始化过程中有任何东西泵了一次消息，`WM_TIMER` 就会在
+/// `player()` 还是 `None` 时进到窗口过程。
+///
+/// 抽干之后这两个问题都不存在：绘制在初始化之前完成，定时器在初始化之后
+/// 才武装。
+fn pump_messages() {
+    let mut msg = MSG::default();
+    loop {
+        // 注意 `PeekMessageW` 返回 `BOOL`，不是 windows 0.62 里
+        // `GetMessageW` 那套 `Result` 形状 —— 判 `as_bool()`。
+        let got = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) };
+        if !got.as_bool() {
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{blit_points, BackBuffer, RECT};
+    use super::{blit_points, intersect_rect, BackBuffer, RECT};
     use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
     use windows::Win32::Graphics::Gdi::{HBITMAP, HDC, HGDIOBJ};
 
@@ -1556,5 +1760,61 @@ mod tests {
 
             ReleaseDC(None, screen_dc);
         }
+    }
+
+    /// `intersect_rect` 的三个不变量：结果被两个输入同时夹住、不相交时退化成
+    /// 零面积、以及绝不产生 `left > right` 这种反向矩形。
+    ///
+    /// 反向矩形最危险：调用方现有的判断是 `w <= 0 || h <= 0`，而
+    /// `left=100, right=40` 算出的 `w` 是 `-60`，能被挡住；可一旦有人改成
+    /// 拿绝对值或者改成比较坐标，就会拿一个反向矩形去 `FillRect`——
+    /// GDI 会画出一个上下颠倒的矩形，静默画错地方。
+    #[test]
+    fn 矩形交集的三个不变量() {
+        let r = |l, t, rr, b| RECT {
+            left: l,
+            top: t,
+            right: rr,
+            bottom: b,
+        };
+
+        // 相交：脏区被控制栏夹住
+        let whole = r(0, 0, 1582, 853);
+        let controls = r(0, 775, 1582, 853);
+        let got = intersect_rect(whole, &controls);
+        assert_eq!(got, controls, "播放时整块脏区应该正好退化成控制栏");
+
+        // 只交到一部分
+        let got = intersect_rect(r(0, 700, 1582, 853), &controls);
+        assert_eq!(got, r(0, 775, 1582, 853), "只交到下缘");
+
+        // 脏区完全在控制栏上方（视频区）
+        let got = intersect_rect(r(0, 0, 1582, 700), &controls);
+        assert!(
+            got.right <= got.left && got.bottom <= got.top,
+            "不相交必须退化成零面积，实际 {got:?}"
+        );
+
+        // 完全不相交（左右错开）
+        let got = intersect_rect(r(100, 0, 200, 100), &r(300, 0, 400, 100));
+        assert!(
+            got.right <= got.left && got.bottom <= got.top,
+            "左右错开也必须退化成零面积，实际 {got:?}"
+        );
+
+        // 影院模式下控制栏是零面积矩形（0,client_h,0,client_h）
+        let theatre_controls = r(0, 853, 0, 853);
+        let got = intersect_rect(whole, &theatre_controls);
+        assert!(
+            got.right <= got.left && got.bottom <= got.top,
+            "影院模式下不该留下任何可绘制的面积，实际 {got:?}"
+        );
+
+        // 输入本身反向时也不能产出反向结果
+        let got = intersect_rect(r(200, 100, 40, 10), &whole);
+        assert!(
+            got.right <= got.left && got.bottom <= got.top,
+            "反向输入也要归一成零面积，实际 {got:?}"
+        );
     }
 }

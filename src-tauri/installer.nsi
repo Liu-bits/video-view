@@ -27,6 +27,33 @@ Unicode true
 InstallDir "$PROGRAMFILES64\VideoView"
 InstallDirRegKey HKLM "Software\VideoView" "InstallDir"
 RequestExecutionLevel admin
+
+; ---- 注册表视图：明确用 64 位 ----
+;
+; 放在 `.onInit` 里而不是顶层：`SetRegView` 是**运行时**命令，在顶层
+; （Section 之外）makensis 报 "command SetRegView not valid outside Section
+; or Function"。
+;
+; 为什么需要：makensis 是 **32 位** 进程，而 `RequestExecutionLevel admin`
+; 只提升权限、**不切换注册表视图**。默认视图下
+;
+;     WriteRegStr HKLM "Software\VideoView" "Language" "$LANGUAGE"
+;
+; 写进去的是 `HKLM\SOFTWARE\Wow6432Node\VideoView`，而 `video-view.exe` 是
+; 64 位（`InstallDir` 是 `$PROGRAMFILES64`），它用未重定向的
+; `HKLM\Software\VideoView` 去读 —— 读不到。症状就是「安装器里选了简体中文，
+; 程序界面还是英文」。
+;
+; 顺带记实测结论：本机 NSIS 3.11 实测把 HKCU 的键写进了 **64 位视图**
+; （不是 Wow6432Node），也就是说这个版本的默认值恰好是对的。但那是个没有
+; 文档承诺的默认值 —— 依赖它等于把「语言选择能否生效」押在「用户装的 NSIS
+; 版本恰好默认 64 位」上。显式写一行是零成本，去掉这个依赖。
+;
+; 注意这条**同时**影响 `InstallDirRegKey`（在 Section 之前就要读），
+; 所以它必须在 `.onInit` 里——`.onInit` 在任何页面显示之前跑完。
+Function .onInit
+  SetRegView 64
+FunctionEnd
 ShowInstDetails show
 ShowUninstDetails show
 
@@ -56,6 +83,39 @@ BrandingText "VideoView ${VERSION} · GPL-3.0-or-later"
 
 ; 许可正文来自暂存目录里由 package.ps1 复制好的副本（仓库里的 LICENSE 没有扩展名，
 ; 而 MUI 只认 .txt/.rtf/.html）
+; ---- 界面语言 ----
+;
+; 安装器让用户在 English / 简体中文 之间选，选中的记进注册表，
+; 程序启动时读它（见 src/lang.rs）。
+;
+; ## 为什么是自绘页
+;
+; 直觉上应该写 `!insertmacro MUI_PAGE_LANGUAGE`，但**这个宏在 MUI2 里已经
+; 不存在**了：MUI 时代有，MUI2 把它移除了（连同 `Pages\Language.nsh` 整个
+; 文件）。实测 makensis 直接报
+;
+;     !insertmacro: macro named "MUI_PAGE_LANGUAGE" not found!
+;
+; 更根本的是：MUI2 没有「按 $LANGUAGE 切换安装器界面」的机制了。
+; `MUI_LANGUAGE` 现在只负责建立语言表（供 `${MUI_TEXT_*}` 之类的常量用），
+; 不会再自动弹语言选择页。所以选择页必须自己画——下面用 nsDialogs。
+;
+; 注意 `MUI_PAGE_*` 必须全部写在 `MUI_LANGUAGE` **之前**：MUI2 的
+; `MUI_LANGUAGEEX` 宏在插入时会检查「MUI_PAGE_* 是否已经写过」，没写就报
+; warning。顺序反了不会编译失败，但语言表不会生效——症状是
+; `$LANG_SimpChinese`、`$MUI_BTN_NEXT` 等常量全部变成 "unknown variable"，
+; 页面上出现的是变量名本身而不是文案。
+
+; 语言页必须是**第一页**，所以 `Page custom` 写在所有 `MUI_PAGE_*` 之前。
+; NSIS 按声明顺序决定页面顺序——写在后面的话，实测它会排在「安装完成」页
+; 之后（探测时抓到的顺序是：许可 -> 目录 -> 正在安装 -> 完成 -> 语言页）。
+; 语言选择出现在「安装完成」之后没有任何意义。
+;
+; `MUI_LANGUAGE` 仍然必须写在**所有** `MUI_PAGE_*` 之后（理由见下），
+; 而它不是页面声明、不影响页面顺序。所以顺序是：
+;   Page custom（第一页）-> MUI_PAGE_*（后续页）-> MUI_LANGUAGE（语言表）
+Page custom LangPage
+
 !insertmacro MUI_PAGE_LICENSE "${BUILD_DIR}\LICENSE.txt"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -64,10 +124,206 @@ BrandingText "VideoView ${VERSION} · GPL-3.0-or-later"
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 
-!insertmacro MUI_LANGUAGE "SimpChinese"
+; 语言表的名字要与 `lang::Lang::registry_name` 一致：English / SimpChinese。
+;
+; 顺序的含义：静默 /S 安装不经过选择页，NSIS 会用**第一张表**，所以
+; English 写在前面 = 静默安装默认英文。这也是产品想要的方向。
+;
+; 必须放在 `MUI_PAGE_*` 全部之后：MUI2 的 `MUI_LANGUAGEEX` 宏在插入时会检查
+; 「是否已经声明过 MUI_PAGE_*」，没写就报 warning。顺序反了不会编译失败，
+; 但语言表不生效——症状是 `$LANG_SimpChinese`、`$MUI_BTN_NEXT` 等常量
+; 全部变成 "unknown variable"，页面上直接显示变量名。
 !insertmacro MUI_LANGUAGE "English"
+!insertmacro MUI_LANGUAGE "SimpChinese"
+
+!include "nsDialogs.nsh"
+
+; ---- 语言选择页 ----
+;
+; 页面声明 `Page custom LangPage` 在本节之前（必须排在所有 MUI_PAGE_* 前面，
+; 理由见那里）。
+;
+; 标题字号：这里**不设字体**。想要「跟 MUI 其余页面一样的大标题」，得先从
+; 模板里取出 FontBig 那个 HFONT 再 WM_SETFONT，而 nsDialogs 没有提供这个宏、
+; MUI2 也没有（实测整个 Contrib\Modern UI 2 里没有任何 FONT 相关宏）。
+; 为此写几十行 Win32 取字体代码不值得：这一页只有两行说明加两个单选框，
+; 默认字体完全够读。
+Var LangDialog
+Var LangEn
+Var LangZh
+Var LangChoice
+
+; 页面上的文案。
+;
+; 用变量而不是 `$\"…$\"` 字面量：`$\"` 会把转义引号**原样留在字符串里**，
+; 实测控件文字变成 `"Choose`、`"This`（只有首字符被截断，因为 NSIS 把它当
+; 一个参数处理），页面上直接显示多出来的引号。
+; `StrCpy $S "带空格"` 再把 `$S` 当参数传才是对的。
+Var S
+
+
+; ---- 语言选择页：一个普通的自定义页 ----
+;
+; ## 为什么不用 `MUI_PAGE_COMPONENTS`
+;
+; 试过，两个原因都不成立：
+;
+; 1. `MUI_PAGE_LANGUAGE` 在 MUI2 里已被移除（连 `Pages\Language.nsh` 都
+;    没有了），makensis 直接报 "macro not found"。
+; 2. 拿 components 页来改也不行。它的 `MUI_COMPONENTSPAGE_INTERFACE` 与
+;    `MUI_PAGEDECLARATION_COMPONENTS` 是一对配套的 define，重复定义会报
+;    "already defined"；而只改其一会让页面的 SHOW 函数仍然去
+;    `FindWindow` 找 1006/1017/1032 这几个控件 ID——它们一个都不存在，
+;    结果是页面上留一个空白列表框，还要另外找东西盖住它。
+;
+; 所以直接用最原始的 `PageEx custom`：MUI2 的其它页（MUI_PAGE_DIRECTORY
+; 等）与自定义页是可以混排的，Back / Next / Cancel 三个按钮自己画。
+; 代价是按钮位置和文案要自己管，换来的是这一页与其他 MUI 页完全解耦。
+
+; 声明方式：`PageEx custom` + `PageExEnd` 里直接写 `PageCallbacks`。
+; 没有 `PageExCustom` 这个命令——那是网上旧示例里的写法，NSIS 3.x
+; 会直接报 "Invalid command"。
+;
+; MUI2 自己的 welcome 页（见 Contrib\Modern UI\System.nsh）也是这个写法，
+; 照它来不会踩版本差异。
+; 声明方式：`PageEx custom` + `PageExEnd` 里直接写 `PageCallbacks`。
+; 没有 `PageExCustom` 这个命令——那是网上旧示例里的写法，NSIS 3.x
+; 会直接报 "Invalid command"。
+;
+; MUI2 自己的 welcome 页（见 Contrib\Modern UI\System.nsh）也是这个写法，
+; 照它来不会踩版本差异。
+;
+; PageCallbacks 有两种形式：`(create, leave)` 或 `(pre, show, leave)`。
+; 这里要用三参数那种——页面内容要在 show 回调里用 nsDialogs 画。
+;
+; 为什么不用标签（如 `LangPage: PageEx custom`）：NSIS 会把 PageCallbacks
+; 的参数原样拼进页面表，前面带标签就变成跳转标签，报
+; "Label declaration not valid outside of function"。
+;
+; `custom` 页的标准写法就是 nsDialogs 官方教程里那个：
+;
+;     Page custom LangPage
+;     Function LangPage   ; 这是**唯一**的回调，nsDialogs::Create/Show 都在里面
+;
+; 之前那几版写法都被 makensis 拒了，各有各的原因，记在这里免得再踩：
+;
+;   * `PageEx custom` + `PageCallbacks a b c`（三参数）报 "Usage: PageCallbacks
+;     ([creator] [leave]) | ([pre] [show] [leave])"。`custom` 页没有 pre/show
+;     分开的那套语义，只有「进入页面时调用一次」的单个回调。
+;   * `PageExCustom` 报 "Invalid command"——那是旧示例里的写法，NSIS 3.x 没有。
+;   * `LangPage: PageEx custom` 报 "Label declaration not valid outside of
+;     function"，PageCallbacks 的参数会被当命令拼进页面表，不能带标签。
+;   * `MUI_PAGE_LANGUAGE` 报 "macro not found"——MUI2 已移除该宏。
+;   * `MUI_PAGE_CUSTOMPAGE` 同样不存在（MUI2 只提供 welcome / license /
+;     components / directory / instfiles / finish）。
+;
+; 所以用最朴素的 `Page custom`，回调里自己建对话框。代价是 Back / Next /
+; Cancel 要自己画——下面就是这么做的。
+; 这份 NSIS（3.11 + Tauri 附带的 nsDialogs）比常见的用法**旧一代**，
+; 以下几点是实测（逐个宏编译探测）出来的，不是照抄网上的例子：
+;
+;   * `${NSD_Create*} x y w h text` 五个参数**在创建时就定位**，没有
+;     `NSD_SetPosition`（探测报 "Invalid command"）。所以所有坐标必须在
+;     创建那一刻就写对，之后不能再挪。
+;   * `${NSD_Check} 控件HWND` 只收**一个**参数。传 `对话框 控件` 会报
+;     "requires 1 parameter(s), passed 2"。
+;   * 没有 `NSD_Click`（报 "Plugin function not found"），回车绑定得用
+;     `SendMessage 对话框 WM_COMMAND IDOK`。
+;   * 没有 `NSD_OnClick`。按钮行为只能在页面函数末尾统一按 `$0`（上一个
+;     创建的控件是 Next）判断，或者干脆用控件 ID 走 WM_COMMAND。
+;   * `${NSD_OnChange} / ${NSD_OnClick} 控件回调函数` 是可用的，但
+;     `__NSD_OnControlEvent` 内部会 `Push $0` / `Push $1`，所以**不能**在
+;     紧挨着的下一行写 `Pop $0`：宏参数会连同后面的行一起被吃掉，
+;     makensis 报 `Pop expects 1 parameters, got 6`。
+;   * 没有 `$LangChoice` 这种「最后点击的单选框序号」变量（自己声明一个
+;     `Var LangChoice` 就可以）。
+;   * MUI2 的自定义页没有「描述区」宏可用（`MUI_FUNCTION_DESCRIPTION_*`
+;     绑在 components 页上），所以提示文字自己画。
+;
+; 单选框被点中时的回调。回调在对话框还活着的时候触发，所以这里记下的值
+; 是可靠的。
+;
+; 为什么不能「离开页面时再去问控件」：`nsDialogs::Show` 一返回，对话框就被
+; 销毁，那时 `NSD_GetState` 拿到的是失效句柄。实测那次读出来的是 `5046576`
+;（一个被复用的 HWND 数值），于是无论用户点哪个都判成 English，而且全程
+; 不报错。这正是「在错误的时机问已经死掉的对象」的典型症状：不是返回
+; FALSE，而是返回了一个看起来像整数的错误答案。
+;
+; 也试过 `${NSD_CreateTimer}` 定时轮询（`${NSD_GetState}` 本身可用），实测
+; 一次都没被调用过——这版 nsDialogs 的定时器在自定义页上不工作。
+; `${NSD_OnClick}` 可用，所以用回调。
+Function onPickedEnglish
+  StrCpy $LangChoice 0
+FunctionEnd
+
+Function onPickedChinese
+  StrCpy $LangChoice 1
+FunctionEnd
+
+; 带空格的长文案**必须**先 `StrCpy` 进变量再当参数传（见上面 `Var S` 的说明）。
+Function LangPage
+  nsDialogs::Create 1018
+  Pop $LangDialog
+  ${If} $LangDialog == error
+    Abort
+  ${EndIf}
+
+  ; 文案先过变量，见上面 Var S 的说明。
+  StrCpy $S "Choose the VideoView interface language"
+  ${NSD_CreateLabel} 20 25 340 20 $S
+
+  ; 说明。这一句不能省：不说清「选择会被记住」，用户面对一个没有预览的
+  ; 选项只能靠猜，而这一页又没有事后更改的入口。
+  StrCpy $S "This choice is saved and used every time the app starts."
+  ${NSD_CreateLabel} 20 48 340 16 $S
+
+  ; 两个单选框。同一组里第二个必须用 AdditionalRadioButton：单选框的互斥
+  ; 是靠「同组相邻创建」实现的，两个独立的 RadioButton 会各自独立勾选。
+  ;
+  ; **选择结果由 `${NSD_OnClick}` 回调记进 $LangChoice**，不是在离开页面时
+  ; 去读控件状态——原因见上面 `onPickedChinese` 的说明。
+  ;
+  ; 默认选中第一项（English），与上面语言表的顺序一致，也就是与「静默安装
+  ; 用第一张表」保持同一个默认值。
+  StrCpy $LangChoice 0
+  ${NSD_CreateFirstRadioButton} 30 80 200 16 English
+  Pop $LangEn
+  ${NSD_Check} $LangEn
+  ${NSD_OnClick} $LangEn onPickedEnglish
+
+  StrCpy $S "简体中文"
+  ${NSD_CreateAdditionalRadioButton} 30 105 200 16 $S
+  Pop $LangZh
+  ${NSD_OnClick} $LangZh onPickedChinese
+
+  ; Cancel / Next。这一页是第一页，所以**不画** Back：留一个点不动的按钮
+  ; 在这里比不画更糟，用户会以为程序卡住了。
+  StrCpy $S "Cancel"
+  ${NSD_CreateButton} 20 150 70 22 $S
+  StrCpy $S "Next >"
+  ${NSD_CreateButton} 200 150 70 22 $S
+
+  ; 回车 = Next。这版 nsDialogs 没有 `nsDialogs::Click`（探测报
+  ; "Plugin function not found"），只能把 WM_COMMAND/IDOK 直接发给对话框。
+  SendMessage $LangDialog ${WM_COMMAND} 1 0
+
+  nsDialogs::Show
+FunctionEnd
 
 Section "VideoView" SecMain
+  ; 语言选择的结果在这里落地。
+  ;
+  ; `$LangChoice` 由语言页的 OnChange 回调写入（0 = English，1 = 简体中文），
+  ; 不是在这里去问控件：`Page custom` 只提供单个页面回调、没有 leave 钩子，
+  ; 等到这里时 `nsDialogs::Show` 已经返回、对话框已被销毁，
+  ; `NSD_GetState` 拿到的句柄失效，于是**无论点哪个都是 English**——
+  ; 这正是这个 bug 最初的现场：不报错，但选择被静默丢掉。
+  ${If} $LangChoice == 1
+    StrCpy $LANGUAGE "SimpChinese"
+  ${Else}
+    StrCpy $LANGUAGE "English"
+  ${EndIf}
+
   ; 先结束正在运行的进程，再动 $INSTDIR。
   ;
   ; 顺序反了会怎样：RMDir /r 删不掉的正是被占用的那两个文件（exe 与它
@@ -95,6 +351,17 @@ Section "VideoView" SecMain
   File "${BUILD_DIR}\LICENSE.txt"
 
   WriteRegStr HKLM "Software\VideoView" "InstallDir" "$INSTDIR"
+  ; 用户在语言选择页选的语言。程序启动时读这个值决定界面语言
+  ; （见 src/lang.rs::registry_lang）。
+  ;
+  ; $LANGUAGE 由自定义页的 `SetLanguage` 设为 English / SimpChinese，
+  ; 与 `lang::Lang::registry_name` 一致。写它而不是写死某个值，是为了让
+  ; 「安装器显示的语言」和「程序界面语言」永远一致——之前没有这个键，
+  ; 程序只能猜系统语言，于是会出现「英文安装过程 + 中文界面」。
+  ;
+  ; /S 静默安装不经过语言页，$LANGUAGE 是 NSIS 启动时按系统语言选出的
+  ; 表名，没有就落到第一张表（English）。
+  WriteRegStr HKLM "Software\VideoView" "Language" "$LANGUAGE"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VideoView" "DisplayName"     "${PRODUCT}"

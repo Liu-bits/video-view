@@ -12,15 +12,23 @@
 //!    再由系统拉伸」那种整体模糊。
 //!
 //! 视觉沿用原来的深色工具风格：硬边、等宽时间码、无渐变无圆角。
+//!
+//! ## 多语言
+//!
+//! 文案不在本模块里散落，而是由 `lang::Strings` 统一提供。控件**宽度全部
+//! 按当前文案实测计算**（见 `Metrics`），没有写死的 DIP 常量——中文两字与
+//! 英文单词长度差很多，写死必然有一边被截断或另一边空一大块。
 
+use crate::lang;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetMonitorInfoW,
-    IntersectClipRect, MonitorFromWindow, SelectClipRgn, SelectObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, GDI_REGION_TYPE,
-    HBRUSH, HDC, HFONT, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetDC,
+    GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, IntersectClipRect, MonitorFromWindow,
+    ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FF_DONTCARE, FW_NORMAL, GDI_REGION_TYPE, HBRUSH, HDC, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -39,14 +47,36 @@ const C_BTN_EDGE: COLORREF = rgb(0x3c, 0x43, 0x4a);
 /// 控制栏高度（同时也是视频区与控制栏的分界线）。
 pub const CTRL_H_DIP: i32 = 62;
 
-const PAD_X_DIP: i32 = 10;
+/// 控件距离左右边缘的内边距。
+///
+/// 原来是 10，看着「左半边全糊在边上」——三颗按钮紧贴左边框，而右边
+/// 音量组挤成一团，中间又是空的，视觉重心整个压在左侧。14 加上后面
+/// 按文字算出来的按钮宽度，三组控件才分布得开。
+const PAD_X_DIP: i32 = 14;
 const PAD_TOP_DIP: i32 = 6;
+/// 同组控件之间的间距。
 const GAP_DIP: i32 = 8;
+/// 左边按钮组 / 中间文件名 / 右边音量组**之间**的间距。
+///
+/// 比 `GAP_DIP` 大：这三组是三个独立的信息块，而不是一串控件。组内 8、
+/// 组间 20，眼睛扫过去能自然把它们读成三块。
+const CLUSTER_GAP_DIP: i32 = 20;
 const TRACK_ROW_DIP: i32 = 16;
-const BTN_W_DIP: i32 = 48;
+
+/// 按钮高度下限（实际取「文字高 + 上下内边距」与它的较大者）。
 const BTN_H_DIP: i32 = 26;
+/// 按钮内文字左右的内边距。
+///
+/// 按钮宽度不再写死，而是「实测文字宽 + 2 × 这个」。原来 `BTN_W_DIP = 48`
+/// 是照着中文两字量的：英文 "Pause" / "Volume" 根本放不下，会被
+/// `DT_END_ELLIPSIS` 截成 "Pau…" —— 英文版必须整体重做按钮尺寸的根因。
+const BTN_PAD_X_DIP: i32 = 12;
+/// 按钮内文字上下的内边距。
+const BTN_PAD_Y_DIP: i32 = 5;
+
+/// 时间码列宽下限。实际宽度取「实测 `88:88:88` 宽」与它的较大者，
+/// 这样 h:mm:ss 也不会被切。
 const TIME_W_DIP: i32 = 52;
-const MUTE_W_DIP: i32 = 30;
 const VOL_W_DIP: i32 = 96;
 const SLIDER_THICK_DIP: i32 = 3;
 const THUMB_DIP: i32 = 11;
@@ -122,13 +152,18 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// 按客户区尺寸与当前 DPI 计算布局。
+    /// 按客户区尺寸、当前 DPI 与文案实测尺寸计算布局。
     ///
     /// `client` 的宽高是物理像素（本进程是 per-monitor DPI 感知，
     /// Win32 坐标与客户区尺寸都已经是设备像素，不需要任何虚拟化换算）。
-    pub fn new(client_w: i32, client_h: i32, dpi: u32, theatre: bool) -> Self {
+    ///
+    /// `m` 是当前语言 + DPI 下量出来的文字尺寸，**所有控件宽度都由它算出**，
+    /// 不再有写死的 DIP 常量。这样中文两字与英文单词都恰好放下，
+    /// 切换语言不需要另一套布局。
+    pub fn new(client_w: i32, client_h: i32, dpi: u32, theatre: bool, m: &Metrics) -> Self {
         let pad_x = px(PAD_X_DIP, dpi);
         let gap = px(GAP_DIP, dpi);
+        let cluster_gap = px(CLUSTER_GAP_DIP, dpi);
         let ctrl_h = if theatre { 0 } else { px(CTRL_H_DIP, dpi) };
 
         let mut controls = RECT {
@@ -140,7 +175,8 @@ impl Layout {
 
         let pad_top = px(PAD_TOP_DIP, dpi);
         let track_h = px(TRACK_ROW_DIP, dpi);
-        let time_w = px(TIME_W_DIP, dpi);
+        // 量不出来（0）时退回原常量，至少保证时间码有地方显示
+        let time_w = px(TIME_W_DIP, dpi).max(m.time_w);
         let track_y = controls.top + pad_top;
 
         let time_current = rect(pad_x, track_y, time_w, track_h);
@@ -150,21 +186,39 @@ impl Layout {
         let seek_w = (time_duration.left - gap - seek_x).max(gap);
         let seek = rect(seek_x, track_y, seek_w, track_h);
 
+        // ---- 第二行：左边按钮组 / 中间文件名 / 右边音量组 ----
+        //
+        // 按钮宽度 = 实测文字宽 + 左右内边距。文字宽度为 0（度量失败）时
+        // 仍然给一个 48 DIP 的兜底，免得整排塌成看不见的一条。
+        let btn_pad = px(BTN_PAD_X_DIP, dpi);
+        let btn_pad_y = px(BTN_PAD_Y_DIP, dpi);
+        let btn_w = |text_w: i32| (text_w.max(px(48, dpi)) + 2 * btn_pad).max(px(48, dpi));
+        // 高度取「文字高 + 上下内边距」与下限的较大者：换了语言或 DPI 之后
+        // 行高不会把文字挤出框外。
+        let btn_h = (m.ui_h + 2 * btn_pad_y).max(px(BTN_H_DIP, dpi));
         let btn_y = track_y + track_h + gap;
-        let btn_h = px(BTN_H_DIP, dpi);
-        let btn_w = px(BTN_W_DIP, dpi);
-        let btn_open = rect(pad_x, btn_y, btn_w, btn_h);
-        let btn_play = rect(btn_open.right + gap, btn_y, btn_w, btn_h);
-        let btn_stop = rect(btn_play.right + gap, btn_y, btn_w, btn_h);
 
+        let open_w = btn_w(m.open);
+        let play_w = btn_w(m.play_pause_w());
+        let stop_w = btn_w(m.stop);
+
+        let btn_open = rect(pad_x, btn_y, open_w, btn_h);
+        let btn_play = rect(btn_open.right + gap, btn_y, play_w, btn_h);
+        let btn_stop = rect(btn_play.right + gap, btn_y, stop_w, btn_h);
+        let left_end = btn_stop.right;
+
+        // 右边音量组
         let vol_w = px(VOL_W_DIP, dpi);
-        let mute_w = px(MUTE_W_DIP, dpi);
+        let mute_w = btn_w(m.mute_w());
         let volume = rect(client_w - pad_x - vol_w, btn_y, vol_w, btn_h);
         let mute = rect(volume.left - gap - mute_w, btn_y, mute_w, btn_h);
+        let right_start = mute.left;
 
-        let file_x = btn_stop.right + gap;
-        let file_w = (mute.left - gap - file_x).max(0);
-        let file_name = rect(file_x, btn_y, file_w, btn_h);
+        // 中间留给文件名。两侧各留一个「组间距」，宽度夹到 0 以上——
+        // 窗口窄到放不下时文件名区域消失，而不是把左右两组挤到重叠。
+        let file_left = left_end + cluster_gap;
+        let file_right = (right_start - cluster_gap).max(file_left);
+        let file_name = rect(file_left, btn_y, file_right - file_left, btn_h);
 
         // 影院模式下控制栏整体收起，但仍然给出一个「不在屏幕上」的矩形，
         // 这样上层判断「点到了控制栏」时不会误中视频区。
@@ -246,6 +300,99 @@ pub enum Hit {
 
 // ---------------------------------------------------------------- 绘制状态
 
+/// 当前语言 + 当前 DPI 下，各段文字的**实测**尺寸（物理像素）。
+///
+/// 这些值由 `Theme::new` 在建好字体后量一次得到，`Layout` 据此算控件尺寸。
+///
+/// ## 为什么必须实测，不能写死常量
+///
+/// 之前所有宽度都是 DIP 常量（`BTN_W_DIP = 48`、`MUTE_W_DIP = 30`），
+/// 那些数字是照着中文两字量的：14 DIP 的 "打开" 约 28px，塞进 48 还算宽裕，
+/// 但塞进 30 就只剩 1 DIP 余量 —— 这就是实测截图里「音量」两个字贴着框、
+/// 右边又紧挨滑块的原因。而英文的 "Pause"（约 40px）、"Volume"（约 48px）
+/// 在 48 DIP 的框里直接放不下，会被截成 "Pau…" / "Vol…"。中文能用常量的
+/// 前提是「文案长度已知且固定」，加了英文之后这个前提就不成立了。
+///
+/// 量一次的成本可以忽略：`Theme` 只在 DPI 或语言变化时重建，一��创建
+/// 里多 7 次 `GetTextExtentPoint32W`。
+#[derive(Debug, Clone, Copy)]
+pub struct Metrics {
+    /// 按钮 / 标签文字在 UI 字体下的宽度。
+    pub open: i32,
+    pub play: i32,
+    pub pause: i32,
+    pub stop: i32,
+    pub mute_on: i32,
+    pub mute_off: i32,
+    /// UI 字体单行高度，用作按钮高度下限。
+    pub ui_h: i32,
+    /// 时间码列宽，按最坏情况 `88:88:88` 量。
+    pub time_w: i32,
+}
+
+impl Metrics {
+    /// 播放 / 暂停按钮取两者较宽的那个。
+    ///
+    /// 这样切换播放状态时按钮宽度不变、整排按钮不会左右跳。一个会呼吸的
+    /// 布局比一个略宽的按钮糟糕得多。
+    pub fn play_pause_w(&self) -> i32 {
+        self.play.max(self.pause)
+    }
+
+    /// 静音 / 音量标签取两者较宽的那个，理由同上。
+    pub fn mute_w(&self) -> i32 {
+        self.mute_on.max(self.mute_off)
+    }
+}
+
+/// 量一段文字在 `font` 下的宽度（物理像素）。
+fn measure_w(hdc: HDC, font: HFONT, text: &str) -> i32 {
+    // 换字体失败（字体为空、或 DC 状态异常）时不量，直接 0。
+    // 原来是无条件换、量、再无条件换回去，而 `old` 可能就是 NULL——
+    // 那等于往 DC 上选了个空对象。`Layout` 对 0 宽度有下限兜底，
+    // 控件不会塌掉。
+    let old = unsafe { SelectObject(hdc, font.into()) };
+    if old.is_invalid() {
+        return 0;
+    }
+    let mut buf: Vec<u16> = text.encode_utf16().collect();
+    buf.push(0);
+    // 签名要的是 `*mut SIZE`，所以这里必须传 `&mut`。clippy 的
+    // needless_pass_by_ref_mut 在这个 FFI 绑定上是误报。
+    let mut size = SIZE { cx: 0, cy: 0 };
+    // 用不带 DT_CALCRECT 的版本：只要宽度，高度从 tmHeight 取。
+    // 返回 FALSE 时返回 0，调用方会走「至少给个下限」的分支。
+    let ok = unsafe { GetTextExtentPoint32W(hdc, &buf, &mut size) };
+    unsafe {
+        let _ = SelectObject(hdc, old);
+    }
+    if ok.as_bool() {
+        size.cx
+    } else {
+        0
+    }
+}
+
+/// 量一段文字在 `font` 下的单行高度（物理像素）。
+fn measure_h(hdc: HDC, font: HFONT) -> i32 {
+    // 同 `measure_w`：换字体失败就不量，也不往 DC 上塞空对象。
+    let old = unsafe { SelectObject(hdc, font.into()) };
+    if old.is_invalid() {
+        return 0;
+    }
+    let mut tm = TEXTMETRICW::default();
+    let got = unsafe { GetTextMetricsW(hdc, &mut tm) };
+    unsafe {
+        let _ = SelectObject(hdc, old);
+    }
+    if got.as_bool() {
+        // tmHeight 含上下伸部部分，用它当行高最接近 DrawTextW 的排版结果
+        tm.tmHeight
+    } else {
+        0
+    }
+}
+
 /// 绘制需要的全部界面状态。
 pub struct PaintState<'a> {
     pub position: f64,
@@ -265,13 +412,9 @@ pub struct PaintState<'a> {
     pub idle: bool,
     /// 鼠标当前停在哪个控件上，用于按钮高亮。
     pub hover: Hit,
+    /// 当前语言的文案。
+    pub strings: &'a lang::Strings,
 }
-
-/// 界面字符串。
-pub const IDLE_HINT: &str = "把视频文件拖到这里，或按 Ctrl+O 打开";
-pub const LABEL_OPEN: &str = "打开";
-pub const LABEL_MUTE_ON: &str = "静音";
-pub const LABEL_MUTE_OFF: &str = "音量";
 
 /// 当前 DPI 下的字体集合。DPI 变化时整套重建。
 pub struct Fonts {
@@ -309,6 +452,45 @@ impl Drop for Fonts {
     }
 }
 
+/// 量出所有文案在当前字体下的尺寸。
+///
+/// 只借一次屏幕 DC：借/还各是一次系统调用，而 `GetTextExtentPoint32W`
+/// 本来就必须在某个 DC 上跑。
+fn measure_metrics(fonts: &Fonts, strings: &lang::Strings) -> Metrics {
+    // DC 借不出来（极少见）就让全部尺寸为 0，由 Layout 的下限兜底。
+    // windows 0.62 的 `GetDC` 返回裸 `HDC`，借失败是空句柄而不是 Option。
+    let hdc = unsafe { GetDC(None) };
+    if hdc.is_invalid() {
+        return Metrics {
+            open: 0,
+            play: 0,
+            pause: 0,
+            stop: 0,
+            mute_on: 0,
+            mute_off: 0,
+            ui_h: 0,
+            time_w: 0,
+        };
+    };
+    let ui = fonts.ui;
+    let mono = fonts.mono;
+    let m = Metrics {
+        open: measure_w(hdc, ui, strings.btn_open),
+        play: measure_w(hdc, ui, strings.btn_play),
+        pause: measure_w(hdc, ui, strings.btn_pause),
+        stop: measure_w(hdc, ui, strings.btn_stop),
+        mute_on: measure_w(hdc, ui, strings.mute_on),
+        mute_off: measure_w(hdc, ui, strings.mute_off),
+        ui_h: measure_h(hdc, ui),
+        // h:mm:ss 是最坏情况，按它量一列的宽度：短的不会浪费，长的不会被切
+        time_w: measure_w(hdc, mono, "88:88:88"),
+    };
+    unsafe {
+        let _ = ReleaseDC(None, hdc);
+    }
+    m
+}
+
 /// 绘制资源：字体 + 画刷。
 ///
 /// 打包成一个结构体是因为两者生命周期完全一致（都只在 DPI 变化时重建
@@ -318,19 +500,35 @@ impl Drop for Fonts {
 pub struct Theme {
     fonts: Fonts,
     brushes: Brushes,
+    /// 各段文字的实测尺寸，`Layout` 靠它算控件大小。
+    pub metrics: Metrics,
+    /// 当前语言。字体之外只有语言变了也要重建（文案宽度不同）。
+    lang: lang::Lang,
 }
 
 impl Theme {
-    pub fn new(dpi: u32) -> Self {
+    /// 按 DPI 与语言建立绘制资源。
+    ///
+    /// 建立过程中用屏幕 DC 量一遍所有文案宽度。这里用屏幕 DC 而不是目标
+    /// 窗口的 DC 是安全的：本模块的字体都用 `CreateFontW` 的**负高度**
+    /// （字符高度，单位物理像素）创建，字形大小已经是绝对值、不再受 DC 的
+    /// DPI 影响，所以在哪个 DC 上量出来的宽度都一样。
+    pub fn new(dpi: u32, strings: &lang::Strings) -> Self {
+        let fonts = Fonts::new(dpi);
+        // 量不出来时（极端情况下 GetTextExtentPoint32W 失败）全部为 0，
+        // `Layout` 里有「至少给个下限」的兜底，不会塌成 0 宽。
+        let metrics = measure_metrics(&fonts, strings);
         Self {
-            fonts: Fonts::new(dpi),
+            fonts,
             brushes: Brushes::new(),
+            metrics,
+            lang: strings.lang,
         }
     }
 
-    /// 字体是否还适用于当前 DPI。DPI 变了整套重建，避免拉伸字形。
-    pub fn matches(&self, dpi: u32) -> bool {
-        self.fonts.matches(dpi)
+    /// 字体是否还适用于当前 DPI 与语言。DPI 变了或换了语言就整套重建。
+    pub fn matches(&self, dpi: u32, lang: lang::Lang) -> bool {
+        self.fonts.matches(dpi) && self.lang == lang
     }
 
     pub fn dpi(&self) -> u32 {
@@ -548,17 +746,29 @@ pub fn paint(
             return;
         }
         // 视频区底色。原生视频窗口正常时盖在这一层上面。
-        fill(
-            hdc,
-            theme,
-            &RECT {
-                left: 0,
-                top: 0,
-                right: client_w,
-                bottom: client_h,
-            },
-            C_STAGE,
-        );
+        //
+        // **已经有文件在播时整块跳过**：mpv 的子窗口尺寸是
+        // `0,0,client_w,controls.top`（见 `App::relayout`），把视频区整个盖住，
+        // 影院模式下 `controls.top == client_h`，连整块客户区都盖住。
+        // 这时再填一遍是纯浪费，而且不是「便宜一点点的浪费」：4K 下这是
+        // 3840x2160 = 830 万次写像素，每次 `WM_PAINT` 都做一遍；同时它还把这
+        // 8.3MB 区域的每一页都摸成驻留，WorkingSet 里凭空多出几十 MB。
+        //
+        // `App::paint` 同时把脏区夹到控制栏，所以这里跳过的区域也不会被
+        // BitBlt 贴出去——两边必须一起改，只改一个会让屏幕上出现旧画面。
+        if !s.loaded {
+            fill(
+                hdc,
+                theme,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: client_w,
+                    bottom: client_h,
+                },
+                C_STAGE,
+            );
+        }
         if s.theatre {
             return;
         }
@@ -617,16 +827,24 @@ pub fn paint(
         );
 
         // ---- 第二行：按钮 / 文件名 / 音量 ----
+        //
+        // 三组控件：左边按钮、中间文件名、右边音量。文件名的矩形就是中间
+        // 那一整段（两側各留一个组间距），绘制时居中 —— 这样视线在
+        // 「按钮 — 文件名 — 音量」之间均匀分布，而不是全部堆在左 1/4。
         let hovered = |h: Hit| s.hover == h;
         draw_button(
             hdc,
             theme,
             &layout.btn_open,
-            LABEL_OPEN,
+            s.strings.btn_open,
             hovered(Hit::Open),
             false,
         );
-        let play_label = if s.paused { "播放" } else { "暂停" };
+        let play_label = if s.paused {
+            s.strings.btn_play
+        } else {
+            s.strings.btn_pause
+        };
         draw_button(
             hdc,
             theme,
@@ -639,20 +857,22 @@ pub fn paint(
             hdc,
             theme,
             &layout.btn_stop,
-            "停止",
+            s.strings.btn_stop,
             hovered(Hit::Stop),
             !s.loaded,
         );
 
         let name = if s.loaded { s.title } else { "" };
         if !name.is_empty() {
-            text_right(hdc, theme.fonts.mono, C_DIM, name, &layout.file_name);
+            // 居中而不是右对齐：右对齐会让文件名贴着「音量」那组，两团文字
+            // 挤在窗口右端，左边又空一大片。
+            text_center_ellipsis(hdc, theme.fonts.mono, C_DIM, name, &layout.file_name);
         }
 
         let mute_label = if s.muted || s.volume <= 0.0 {
-            LABEL_MUTE_ON
+            s.strings.mute_on
         } else {
-            LABEL_MUTE_OFF
+            s.strings.mute_off
         };
         text_center(hdc, theme.fonts.ui, C_DIM, mute_label, &layout.mute);
 
@@ -671,7 +891,7 @@ pub fn paint(
                 hdc,
                 theme.fonts.hint,
                 C_DIM,
-                IDLE_HINT,
+                s.strings.idle_hint,
                 &stage_rect(client_w, layout),
             );
         }
@@ -691,11 +911,21 @@ pub fn paint(
 /// 绘制、按它 `BitBlt`。两边各夹一次就可能出现「绘制夹成空、BitBlt 拿原值」
 /// 的错位，那会在屏幕上贴出一块杂色并永久失去重绘。
 pub(crate) fn clamp_to_client(dirty: &RECT, client_w: i32, client_h: i32) -> RECT {
+    // `i32::clamp` 在 `min > max` 时 **panic**（"assertion failed: min <= max"）。
+    // 今天的调用方传进来的 `client_w/h` 都过了 `.max(0)`，所以触发不了；
+    // 但这是 `pub(crate)` 的纯函数，签名里也没写「非负是调用方的义务」。
+    // 将来任何一处忘了 `.max(0)`（或者最小化瞬间拿到负值），在
+    // `panic = "abort"` 下就是**整个进程直接消失、没有 MessageBox**——
+    // 为了一个本可以是零面积矩形的情况。
+    //
+    // 负尺寸归一成 0（零面积），与「夹完为空」的既有约定一致。
+    let w = client_w.max(0);
+    let h = client_h.max(0);
     RECT {
-        left: dirty.left.clamp(0, client_w),
-        top: dirty.top.clamp(0, client_h),
-        right: dirty.right.clamp(0, client_w),
-        bottom: dirty.bottom.clamp(0, client_h),
+        left: dirty.left.clamp(0, w),
+        top: dirty.top.clamp(0, h),
+        right: dirty.right.clamp(0, w),
+        bottom: dirty.bottom.clamp(0, h),
     }
 }
 
@@ -737,15 +967,18 @@ unsafe fn text_center(hdc: HDC, font: HFONT, color: COLORREF, text: &str, rect: 
     );
 }
 
-/// 右对齐（带省略号）。
-unsafe fn text_right(hdc: HDC, font: HFONT, color: COLORREF, text: &str, rect: &RECT) {
+/// 居中单行文字，放不下时尾部加省略号。
+///
+/// 文件名可能有几十个字符，而中间那一段宽度有限。`DT_END_ELLIPSIS` 与
+/// `DT_CENTER` 可以同时用：`DrawTextW` 会先截断再把截断后的结果居中。
+unsafe fn text_center_ellipsis(hdc: HDC, font: HFONT, color: COLORREF, text: &str, rect: &RECT) {
     text_in(
         hdc,
         font,
         color,
         text,
         rect,
-        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
     );
 }
 
@@ -760,15 +993,35 @@ unsafe fn text_in(
     if text.is_empty() {
         return;
     }
+    // 字体可能创建失败（`make_font` 不检查 `CreateFontW` 的返回值），
+    // 这时 `SelectObject` 拿到 NULL 字体、返回的 `old_font` 也是 NULL。
+    // 原写法无条件把 `old_font` 塞回去，于是在**常驻的后备位图 DC** 上执行
+    // `SelectObject(hdc, NULL)`——DC 进入「没有选中绘图对象」状态，之后
+    // `App::paint` 的 `BitBlt` 直接失败，而它的返回值被丢弃，于是控制栏
+    // 整个会话空白、没有任何日志。
+    //
+    // 这里加一道判断：拿不到有效旧对象就不往下画（画不出文字总好过把 DC
+    // 弄坏），并且只在拿到有效旧对象时才恢复。
     let old_font = SelectObject(hdc, font.into());
+    if old_font.is_invalid() || font.is_invalid() {
+        return;
+    }
     let old_color = SetTextColor(hdc, color);
-    SetBkMode(hdc, TRANSPARENT);
+    // 背景模式必须还原：这个 DC 是常驻的，遗留 TRANSPARENT 会让下一次
+    // 用背景色的绘制（比如控件边框）出现意外。
+    // `SetBkMode` 的入参是 `BACKGROUND_MODE`、返回值是旧值的 `i32`（GDI 原型如此），
+    // 所以还原时必须包一层转换。
+    let old_bk = SetBkMode(hdc, TRANSPARENT);
 
     let mut buf: Vec<u16> = text.encode_utf16().collect();
     buf.push(0);
     let mut r = *rect;
     DrawTextW(hdc, &mut buf, &mut r, flags);
 
+    SetBkMode(
+        hdc,
+        windows::Win32::Graphics::Gdi::BACKGROUND_MODE(old_bk as u32),
+    );
     SetTextColor(hdc, old_color);
     SelectObject(hdc, old_font);
 }
@@ -895,6 +1148,40 @@ fn contains(r: &RECT, x: i32, y: i32) -> bool {
 mod tests {
     use super::*;
 
+    /// 按指定语言真实量一遍文案尺寸，交给 `Layout`。
+    ///
+    /// 不能用手编的固定宽度：这一版布局的按钮宽度**就是**由文字宽度算出来的，
+    /// 拿假值去测等于把「英文标签放不下」这个真问题绕了过去。
+    fn metrics_for(lang: lang::Lang) -> Metrics {
+        let s = lang::Strings::new(lang);
+        let fonts = Fonts::new(120);
+        measure_metrics(&fonts, &s)
+    }
+
+    fn layout_for(client_w: i32, client_h: i32, theatre: bool) -> Layout {
+        Layout::new(
+            client_w,
+            client_h,
+            120,
+            theatre,
+            &metrics_for(lang::Lang::ZhCn),
+        )
+    }
+
+    /// 单量一段文字的宽度，测试里断言「按钮装得下文字」时用。
+    fn measure_w_hdc(text: &str, font: HFONT) -> i32 {
+        // 借一次屏幕 DC 量完就还。跟 `measure_metrics` 同一个语义：字体按物理
+        // 像素高度创建，换 DC 量出来的宽度一致。
+        let hdc = unsafe { GetDC(None) };
+        assert!(!hdc.is_invalid(), "借不到屏幕 DC");
+        let w = measure_w(hdc, font, text);
+        unsafe {
+            let _ = ReleaseDC(None, hdc);
+        }
+        assert!(w > 0, "量不到 \"{text}\" 的宽度");
+        w
+    }
+
     #[test]
     fn 时间格式化() {
         assert_eq!(format_time(0.0), "00:00");
@@ -916,7 +1203,7 @@ mod tests {
 
     #[test]
     fn 影院模式下控制栏收起且不参与命中() {
-        let l = Layout::new(1375, 900, 120, true);
+        let l = layout_for(1375, 900, true);
         assert_eq!(l.controls.top, l.controls.bottom);
         assert!(contains(&l.seek, l.seek.left + 1, l.seek.top + 1));
         // 影院模式下点控制栏旧位置应该算点到了视频区
@@ -925,7 +1212,7 @@ mod tests {
 
     #[test]
     fn 正常模式命中与比例() {
-        let l = Layout::new(1375, 900, 120, false);
+        let l = layout_for(1375, 900, false);
         assert_eq!(l.hit(l.btn_play.left + 1, l.btn_play.top + 1), Hit::Play);
         assert_eq!(l.hit(l.seek.left + 1, l.seek.top + 1), Hit::Seek);
         assert_eq!(l.hit(l.volume.right - 1, l.volume.top + 1), Hit::Volume);
@@ -943,7 +1230,7 @@ mod tests {
 
     #[test]
     fn 布局不重叠() {
-        let l = Layout::new(1375, 900, 120, false);
+        let l = layout_for(1375, 900, false);
         // 视频区底边 = 控制栏顶边
         assert_eq!(l.controls.top, 900 - px(62, 120));
         assert!(l.time_current.right < l.seek.left);
@@ -957,11 +1244,129 @@ mod tests {
     #[test]
     fn 窄窗口下也不越界() {
         // 最小宽度 480 DIP * 96 = 480 物理像素（100% 缩放）
-        let l = Layout::new(480, 320, 96, false);
+        let l = Layout::new(480, 320, 96, false, &metrics_for(lang::Lang::ZhCn));
         assert!(l.volume.right <= 480, "volume.right={}", l.volume.right);
         assert!(l.btn_stop.right < 480);
         // 文件名区域宽度可能为 0，但不应为负（rect 已经夹过）
         assert!(l.file_name.right >= l.file_name.left);
+    }
+
+    /// 按钮宽度必须容得下它要显示的文字，两种语言都要过。
+    ///
+    /// 这是「英文版需要重构每一个按钮的区块大小」那条需求的**回归防线**。
+    /// 原来的宽度是写死的 48 DIP：中文「打开」正好，英文 "Pause"（实测约 40px
+    /// 再加左右各 12 DIP 内边距 ≈ 64 DIP）就会被 `DT_END_ELLIPSIS` 截成 "Pau…"，
+    /// 而这种截断在截图里非常不显眼，很容易漏过去。
+    ///
+    /// 断言用「实测文字宽 + 内边距 ≤ 按钮宽」，且两种语言、多个 DPI 都要过。
+    #[test]
+    fn 按钮装得下各自的文字() {
+        for lang in [lang::Lang::ZhCn, lang::Lang::En] {
+            let s = lang::Strings::new(lang);
+            // 覆盖 100% / 125% / 150% / 200%
+            for dpi in [96u32, 120, 144, 192] {
+                let fonts = Fonts::new(dpi);
+                let m = measure_metrics(&fonts, &s);
+                let w_px = |dip: i32| px(dip, dpi);
+                let l = Layout::new(w_px(1375 * 96 / 120), w_px(900 * 96 / 120), dpi, false, &m);
+                let pad = w_px(BTN_PAD_X_DIP);
+
+                let cases: [(&str, &str, &RECT); 4] = [
+                    (s.btn_open, "open", &l.btn_open),
+                    // 播放 / 暂停按钮取两者较宽的那个，所以两个标签都要装得下
+                    (s.btn_play, "play", &l.btn_play),
+                    (s.btn_pause, "pause", &l.btn_play),
+                    (s.btn_stop, "stop", &l.btn_stop),
+                ];
+                for (text, which, rect) in cases {
+                    let w = measure_w_hdc(text, fonts.ui);
+                    assert!(
+                        rect.right - rect.left >= w + 2 * pad,
+                        "{lang:?} @{dpi}dpi 的 {which} 按钮装不下 \"{text}\": \
+                         文字 {w}px + 左右内边距 {} > 按钮 {}px",
+                        2 * pad,
+                        rect.right - rect.left
+                    );
+                }
+
+                // 静音标签同理
+                let mute_text = if s.mute_on.len() > s.mute_off.len() {
+                    s.mute_on
+                } else {
+                    s.mute_off
+                };
+                let mw = measure_w_hdc(mute_text, fonts.ui);
+                assert!(
+                    l.mute.right - l.mute.left >= mw + 2 * pad,
+                    "{lang:?} @{dpi}dpi 的 mute 区域装不下文字：{} > {}",
+                    mw + 2 * pad,
+                    l.mute.right - l.mute.left
+                );
+            }
+        }
+    }
+
+    /// 切换播放状态时按钮宽度不能变。
+    ///
+    /// 「播放 / 暂停」和「音量 / 静音」在两种语言里长度都不同。如果按钮宽度跟着
+    /// 当前文案走，那么每按一次空格，整排按钮就会左右跳一下——用户会以为
+    /// 窗口抖了。`Metrics::play_pause_w` / `mute_w` 取两者较宽者就是为了这个。
+    #[test]
+    fn 播放状态切换时按钮不呼吸() {
+        for lang in [lang::Lang::ZhCn, lang::Lang::En] {
+            let s = lang::Strings::new(lang);
+            let m = metrics_for(lang);
+            assert!(
+                m.play_pause_w() >= m.play && m.play_pause_w() >= m.pause,
+                "{lang:?} 的 play_pause_w 小于其中之一"
+            );
+            assert!(
+                m.mute_w() >= m.mute_on && m.mute_w() >= m.mute_off,
+                "{lang:?} 的 mute_w 小于其中之一"
+            );
+            // 布局用的是 max 值，所以两种状态下的矩形完全一致
+            let a = Layout::new(1375, 900, 120, false, &m);
+            let b = Layout::new(1375, 900, 120, false, &m);
+            assert_eq!(
+                (a.btn_play.left, a.btn_play.right),
+                (b.btn_play.left, b.btn_play.right)
+            );
+            assert!(s.btn_play != s.btn_pause || m.play == m.pause);
+        }
+    }
+
+    /// 三组控件之间必须留出组间距，控件不得互相压。
+    ///
+    /// 回归点是「都偏左、中间一大片空白」：原来文件名的矩形是
+    /// `btn_stop.right + gap` 到 `mute.left - gap`，中间那块空地没有任何东西，
+    /// 视觉重心全压在左侧。改版之后文件名是中间那一整段（有内容居中画），
+    /// 三组均匀分布。
+    #[test]
+    fn 三组控件分布均匀且不重叠() {
+        for lang in [lang::Lang::ZhCn, lang::Lang::En] {
+            let l = Layout::new(1375, 900, 120, false, &metrics_for(lang));
+            let gap = px(CLUSTER_GAP_DIP, 120);
+            let small = px(GAP_DIP, 120);
+
+            // 组内：按钮之间是组内间距
+            assert_eq!(l.btn_play.left - l.btn_open.right, small);
+            assert_eq!(l.btn_stop.left - l.btn_play.right, small);
+            // 组间：按钮组 -> 文件名、音量组 -> 文件名，各留一个组间距
+            assert_eq!(l.file_name.left - l.btn_stop.right, gap);
+            assert_eq!(l.mute.left - l.file_name.right, gap);
+            // 组内：静音标签与音量滑块
+            assert_eq!(l.volume.left - l.mute.right, small);
+
+            // 左右边距对称
+            assert_eq!(l.btn_open.left, 1375 - l.volume.right, "左右边距不对称");
+
+            // 文件名区域要有实际宽度，才谈得上「居中」
+            assert!(
+                l.file_name.right - l.file_name.left > gap * 2,
+                "{lang:?} 下文件名区域太窄（{}px），居中没有意义",
+                l.file_name.right - l.file_name.left
+            );
+        }
     }
 
     /// 画刷必须按颜色复用同一个句柄。

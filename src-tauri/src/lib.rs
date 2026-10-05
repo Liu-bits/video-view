@@ -11,6 +11,8 @@
 //! 且 DPI 缩放由系统与 GDI 原生处理，不存在浏览器位图拉伸导致的文字发虚。
 
 mod app;
+pub mod cpu;
+pub mod lang;
 pub mod mpv;
 mod surface;
 mod ui;

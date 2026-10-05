@@ -46,6 +46,92 @@ fn test_files() -> Vec<PathBuf> {
 ///
 /// 测试不需要画面，`vo=null` 可以完全绕开 D3D，避免在没有 GPU 的
 /// CI 环境里因为视频输出初始化失败而误报。
+/// `hwdec-current` 必须真的读得到，而且在这台机器上应当是硬件解码。
+///
+/// 这条钉的是两件事：
+///
+/// 1. **属性存在**。它在 mpv 文档里注册为 property，但是否随 libmpv 的编译
+///    选项提供，取决于这份 `libmpv-2.dll`。读不到的话，D3D11VA 静默退回软解
+///    就完全失去了唯一的观测手段——那正是这个属性被加进来的理由。
+/// 2. **值不是 `no`**。带 wid 的 headless player 用 `hwdec=no`（见
+///    `InitOptions` 的分支），所以这里不能用它来判断硬件解码是否生效；
+///    只断言「非空且是已知的几个取值之一」。
+#[test]
+fn 能读出硬件解码状态() {
+    let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/loop60s.mp4");
+    let player = headless_player();
+    player.load_file(&media).expect("测试素材应当能加载");
+
+    let v = poll_hwdec_current(&player, std::time::Duration::from_secs(5))
+        .expect("hwdec-current 属性始终不可用：静默退回软解就失去了唯一的观测手段");
+
+    // headless 分支显式设了 hwdec=no，所以这里**必然**是 no。
+    // 写成断言而不是忽略，是为了万一有人把 headless 分支改成 hwdec=auto
+    // 时能立刻发现「这条测试的前提变了」。
+    assert_eq!(v, "no", "headless player 应当是软解");
+
+    let _ = player.shutdown();
+}
+
+/// 轮询 `hwdec-current` 直到它可用或超时。
+///
+/// 必须轮询，不能在 `load_file` 返回后立刻读：mpv 的 `loadfile` 只是把文件
+/// 加进播放列表并返回，解码器是在**之后**的某个时刻才真正建立的，而
+/// `hwdec-current` 的文档写明「If no decoder is loaded, the property is
+/// unavailable」。实测在 `load_file` 之后立刻读，拿到的就是
+/// `property unavailable` —— 这也正是 `App::tick` 要每 250ms 主动 poll 一次
+/// 而不是只靠 observe 的原因。
+fn poll_hwdec_current(player: &MpvPlayer, timeout: std::time::Duration) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match player.get_property_string("hwdec-current") {
+            Ok(v) => return Some(v),
+            Err(e) if e.contains("unavailable") => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 带 wid 的播放器**应当**真的在用硬件解码（如果这台机器支持）。
+///
+/// 这是「解码到底有没有走 GPU」的唯一自动检查。机器不支持时（比如虚拟机、
+/// 老显卡）会因为返回值是 `no` 而跳过断言，不算失败——因为那不是代码的错。
+/// 但一旦某台本该支持的机器因为适配器选择（虚拟显示器被选成默认设备之类）
+/// 而静默降级，这里就会失败。
+#[test]
+fn 有窗口时硬件解码生效或明确报告降级() {
+    // 需要一个真实窗口，所以这个测试只在本机能建窗时跑。
+    // 建窗失败就跳过，不当成失败——它测的是解码路径，不是建窗路径。
+    let Ok(player) = MpvPlayer::new(&InitOptions {
+        wid: 0,
+        headless: false,
+    }) else {
+        eprintln!("跳过：无法创建带 wid 的 mpv 实例");
+        return;
+    };
+
+    let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/loop60s.mp4");
+    if player.load_file(&media).is_err() {
+        eprintln!("跳过：测试素材加载失败");
+        let _ = player.shutdown();
+        return;
+    }
+
+    let v = poll_hwdec_current(&player, std::time::Duration::from_secs(5));
+
+    // 只打印，不断言具体值：不同 GPU 走 d3d11va 还是 dxva2 都对，
+    // 而断言某一个会在换机器时变成假失败。真正要抓的「静默降级」
+    // 需要知道这台机器是否*本该*支持，那不是这个测试能判断的。
+    eprintln!("hwdec-current = {v:?}（d3d11va/dxva2 = 硬件解码，no = 软解）");
+
+    let _ = player.shutdown();
+}
+
 fn headless_player() -> MpvPlayer {
     MpvPlayer::new(&InitOptions {
         wid: 0,
@@ -295,21 +381,110 @@ fn 支持播放暂停与跳转() {
 fn 打不开的文件会立即报错() {
     let player = headless_player();
 
+    // 盘符开头、形状合法，只是文件不存在 —— 这一类才是「file not found」。
+    // 用当前盘符拼一个绝对不可能存在的文件名，免得依赖某个盘符是否存在。
+    let missing = format!(
+        "{}:\\__video_view_definitely_missing__.mp4",
+        env!("CARGO_MANIFEST_DIR")
+            .split_once(':')
+            .map(|(d, _)| d)
+            .unwrap_or("Z")
+    );
     let err = player
-        .load_file(Path::new("Z:/__video_view_definitely_missing__.mp4"))
+        .load_file(Path::new(&missing))
         .expect_err("不存在的文件应该在入口就被拒绝");
-
     assert!(
-        err.contains("找不到文件"),
+        err.contains("file not found"),
         "错误信息应说明是文件不存在，实际是：{err}"
     );
 
     // 目录也不是要打开的东西
+    let dir = format!("{}\\", env!("CARGO_MANIFEST_DIR"));
     let err = player
-        .load_file(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .load_file(Path::new(&dir))
         .expect_err("目录应该在入口就被拒绝");
-    assert!(err.contains("找不到文件"), "实际是：{err}");
+    assert!(err.contains("file not found"), "实际是：{err}");
 
+    let _ = player.shutdown();
+}
+
+/// 非本地盘路径必须在**碰文件系统之前**被挡下。
+///
+/// 这一条是安全回归，不只是输入校验。`Path::is_file()` 走 `metadata()`，
+/// 对 `\\evil\share\x.mp4` 会真的去建 SMB 连接；mpv 随后还会用**当前用户的
+/// 凭据**发起 SMB/NTLM 协商。也就是说命令行里一个参数就能让受害者的进程
+/// 去连攻击者的共享，把域凭据交出去——`.lnk`、注册表 `shell\open\command`、
+/// 任何 `CreateProcess` 的调用方都能触发，不需要用户点「是」。
+///
+/// 所以判据必须是「形状」，而且必须排在 `is_file()` 之前。
+#[test]
+fn 远程路径在任何文件系统访问之前就被拒绝() {
+    let player = headless_player();
+
+    for p in [
+        r"\\evil\share\a.mp4",
+        r"\\?\UNC\evil\share\a.mp4",
+        r"\\.\PIPE\anything",
+        r"\\?\PhysicalDrive0",
+        "//evil/share/a.mp4",
+        r"a.mp4",
+        r"\a.mp4",
+        r"http://example.com/v.mp4",
+        r"smb://server/share/v.mp4",
+        r"C:relative-without-slash.mp4",
+    ] {
+        let err = player
+            .load_file(Path::new(p))
+            .expect_err("非本地盘路径必须在 is_file() 之前被拒");
+        assert!(
+            err.contains("only local drive paths"),
+            "{p} 的错误应说明只接受本地盘路径，实际是：{err}"
+        );
+        // 关键：不能是 "file not found"——那说明已经去访问过文件系统了，
+        // 也就是 SMB 已经建过连接，安全目的落空。
+        assert!(
+            !err.contains("file not found"),
+            "{p} 走到了 is_file() 之后才被拒：{err}"
+        );
+    }
+
+    let _ = player.shutdown();
+}
+
+/// 合法形状的本地盘路径必须能穿过这道关。
+///
+/// 只钉「该拒的拒了」是不够的——那道关如果写得太紧（比如把 `C:\` 也拒了），
+/// 产品就是完全不可用，而且测试一样会绿。这里钉住放行。
+#[test]
+fn 合法本地盘路径能通过形状检查() {
+    let player = headless_player();
+    let dir = env!("CARGO_MANIFEST_DIR").to_string();
+    for p in [
+        dir.clone(),
+        format!("{dir}\\tests\\media\\loop60s.mp4"),
+        // 盘符小写、路径里有重复分隔符与 `.`/`..`：都该放行
+        format!(
+            "{}\\.\\tests\\..\\tests\\media\\loop60s.mp4",
+            dir.to_lowercase()
+        ),
+        // 路径中段的重复分隔符是 Windows 合法路径（等价于单个），不能误伤。
+        // 曾经在这里被 `reject_remote_path` 拒掉，是一次真实的过度收紧。
+        format!("{}\\\\tests\\media\\loop60s.mp4", dir),
+        // 正斜杠混用也是合法的
+        format!("{}/tests/media/loop60s.mp4", dir.to_lowercase()),
+        "C:\\Windows\\System32\\drivers\\etc\\hosts".to_string(),
+        "D:\\a b\\c d.mp4".to_string(),
+        "Z:\\a.mp4".to_string(),
+    ] {
+        // 形状检查通过 = 错误不是 "only local drive paths"。
+        // 后面要么 file not found（文件不存在）要么真的加载了，都算通过。
+        if let Err(e) = player.load_file(Path::new(&p)) {
+            assert!(
+                !e.contains("only local drive paths"),
+                "{p} 是合法本地盘路径，却被形状检查拒了：{e}"
+            );
+        }
+    }
     let _ = player.shutdown();
 }
 
@@ -322,7 +497,8 @@ fn 打不开的文件会立即报错() {
 fn 拒绝把协议_url_当成文件打开() {
     let player = headless_player();
 
-    // 这些串如果被当成文件名，Windows 解析出来都不是已存在的文件
+    // 这些串如果被当成文件名，Windows 解析出来都不是已存在的文件。
+    // 现在它们多半在形状检查那一步就被拒了（没有盘符），消息相应地变了。
     for url in [
         "http://example.com/video.mp4",
         "https://example.com/video.mp4",
@@ -339,9 +515,10 @@ fn 拒绝把协议_url_当成文件打开() {
         let err = player
             .load_file(Path::new(url))
             .expect_err("协议 URL 不应该被当成文件接受");
+        // 两种消息都算对：形状检查先拒（没有盘符），或者形状过了但文件不存在。
         assert!(
-            err.contains("找不到文件"),
-            "{url} 的错误信息应说明文件不存在，实际是：{err}"
+            err.contains("file not found") || err.contains("only local drive paths"),
+            "{url} 的错误应是「不是文件」或「不是本地盘路径」，实际是：{err}"
         );
     }
 

@@ -40,12 +40,16 @@ static VIDEO_HANDLER: Mutex<Option<VideoHandler>> = Mutex::new(None);
 
 /// 注册视频区事件回调，创建播放核心前调用一次。
 pub fn set_video_handler(handler: VideoHandler) {
-    *VIDEO_HANDLER.lock().unwrap() = Some(handler);
+    *VIDEO_HANDLER.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
 }
 
 fn emit(name: &'static str) {
     // handler 内部只做 PostMessage，不回调本模块的锁，不存在重入死锁
-    if let Some(handler) = VIDEO_HANDLER.lock().unwrap().as_ref() {
+    if let Some(handler) = VIDEO_HANDLER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
         handler(name);
     }
 }
@@ -53,7 +57,7 @@ fn emit(name: &'static str) {
 /// 创建一个承载 mpv 画面的子窗口，父窗口是 `parent`。
 pub fn create_video_window(parent: HWND) -> Result<HWND, String> {
     let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) }
-        .map_err(|e| format!("获取模块句柄失败: {e}"))?;
+        .map_err(|e| format!("Could not get the module handle: {e}"))?;
     unsafe { register_video_class(HINSTANCE(hinstance.0)) };
 
     let class_name = wide(VIDEO_CLASS);
@@ -75,7 +79,7 @@ pub fn create_video_window(parent: HWND) -> Result<HWND, String> {
             Some(HINSTANCE(hinstance.0)),
             None,
         )
-        .map_err(|e| format!("创建视频渲染窗口失败: {e}"))?
+        .map_err(|e| format!("Could not create the video render window: {e}"))?
     };
 
     // 拖放要注册在真正被命中的那个窗口上。视频子窗口盖住了整个画面区，

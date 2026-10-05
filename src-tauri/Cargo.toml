@@ -27,6 +27,13 @@ windows = { version = "0.62", features = [
   "Win32_System_Com",
   "Win32_System_LibraryLoader",
   "Win32_System_Ole",
+  # 语言判定：读安装器写入的注册表值 + 系统界面语言（GetUserDefaultUILanguage）
+  "Win32_Globalization",
+  "Win32_System_Registry",
+  # GetLogicalProcessorInformationEx：按物理核枚举，取物理核数
+  # （注意它不在 SystemServices 里，那是常量的聚集地）
+  "Win32_System_SystemInformation",
+  "Win32_System_SystemServices",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   # HDROP / DragAcceptFiles / DragQueryFileW 所在模块
