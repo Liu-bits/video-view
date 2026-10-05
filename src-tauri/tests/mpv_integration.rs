@@ -3,8 +3,9 @@
 //! 这些用例直接驱动真实的 `libmpv-2.dll`，验证「格式能不能打开」这个
 //! 项目的核心承诺，而不是只验证能编译。
 //!
-//! 前置条件：测试媒体放在 `tests/media/`，可用 `scripts/make-test-media.sh`
-//! 之类的工具生成。这里只跑存在的文件，缺失时自动跳过并提示。
+//! 前置条件：测试媒体放在 `tests/media/`，由 `scripts/make-test-media.ps1`
+//! 生成（仓库里已经带了产物，日常跑测试不需要执行它）。这里只跑存在的
+//! 文件，缺失时自动跳过并提示。
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -73,10 +74,7 @@ fn 能加载_dll_并初始化() {
 fn 能播放各种格式() {
     let files = test_files();
     if files.is_empty() {
-        eprintln!(
-            "跳过：{} 下没有测试媒体",
-            media_dir().display()
-        );
+        eprintln!("跳过：{} 下没有测试媒体", media_dir().display());
         return;
     }
     assert!(
@@ -97,7 +95,7 @@ fn 能播放各种格式() {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
 
         let _ = player.stop();
-        if player.load_file(&file.to_string_lossy()).is_err() {
+        if player.load_file(file).is_err() {
             failures.push(format!("{name}: loadfile 命令被拒绝"));
             continue;
         }
@@ -135,7 +133,7 @@ fn 能播放各种格式() {
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(300)) {
                 Ok(MpvEventMessage::Property(p)) if p.name == "duration" => {
-                    if let Some(v) = p.value.as_f64() {
+                    if let Some(v) = p.value.as_number() {
                         if v > 0.0 {
                             duration = v;
                             break;
@@ -182,39 +180,48 @@ fn 支持播放暂停与跳转() {
         let _ = tx.send(msg);
     }));
 
-    player.load_file(&file.to_string_lossy()).expect("加载失败");
+    player.load_file(file).expect("加载失败");
 
-    // 等解码真正开始
+    // 等解码真正开始。
+    // 这里刻意轮询 `time-pos` 而不是等事件：`time-pos` 已经不在观察列表里
+    // （界面改成定时主动读），依赖它的事件流会永远等不到。
     let mut started = false;
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(MpvEventMessage::Property(p))
-                if p.name == "time-pos" && p.value.as_f64().unwrap_or(0.0) > 0.0 =>
-            {
-                started = true;
+        if let Ok(v) = rx.recv_timeout(Duration::from_millis(500)) {
+            if matches!(v, MpvEventMessage::Error(_)) {
                 break;
             }
-            _ => {}
+        }
+        if player.get_double_property("time-pos").unwrap_or(0.0) > 0.0 {
+            started = true;
+            break;
         }
     }
     assert!(started, "播放位置始终为 0，文件可能没真正在播");
 
     // 暂停后位置不应再前进。
-    // 这里直接读属性而不用事件：`time-pos` 只在值变化时推送，暂停后它不再变，
-    // 也就不会再有事件，依赖事件流会误判成「暂停失败」。
+    // 这里直接读属性而不用事件：`time-pos` 已经不在观察列表里，暂停期间
+    // 不会有任何相关事件，依赖事件流会误判成「暂停失败」。
     player.set_pause(true).expect("暂停失败");
     // 等 pause 属性真正生效
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !player.get_pause().unwrap_or(false) {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(player.get_pause().expect("读取 pause 失败"), "pause 属性未生效");
+    assert!(
+        player.get_pause().expect("读取 pause 失败"),
+        "pause 属性未生效"
+    );
 
     std::thread::sleep(Duration::from_millis(200));
-    let pos_before = player.get_double_property("time-pos").expect("读取 time-pos 失败");
+    let pos_before = player
+        .get_double_property("time-pos")
+        .expect("读取 time-pos 失败");
     std::thread::sleep(Duration::from_millis(800));
-    let pos_after = player.get_double_property("time-pos").expect("读取 time-pos 失败");
+    let pos_after = player
+        .get_double_property("time-pos")
+        .expect("读取 time-pos 失败");
 
     player.set_pause(false).expect("取消暂停失败");
 
@@ -253,18 +260,17 @@ fn 支持播放暂停与跳转() {
         "toggle_pause 没有把 pause 切回 false"
     );
 
-    // 跳转：跳到 3 秒后再回读 time-pos
+    // 跳转：跳到 3 秒后再回读 time-pos（轮询，原因同上）
     let target = 3.0_f64;
     player.seek(target).expect("跳转失败");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut reached = false;
     while Instant::now() < deadline {
-        if let Ok(MpvEventMessage::Property(p)) = rx.recv_timeout(Duration::from_millis(300)) {
-            if p.name == "time-pos" && p.value.as_f64().unwrap_or(0.0) >= target - 0.5 {
-                reached = true;
-                break;
-            }
+        if player.get_double_property("time-pos").unwrap_or(0.0) >= target - 0.5 {
+            reached = true;
+            break;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
     assert!(reached, "跳转到 {target}s 后位置没有跟上");
 
@@ -290,7 +296,7 @@ fn 打不开的文件会立即报错() {
     let player = headless_player();
 
     let err = player
-        .load_file("Z:/__video_view_definitely_missing__.mp4")
+        .load_file(Path::new("Z:/__video_view_definitely_missing__.mp4"))
         .expect_err("不存在的文件应该在入口就被拒绝");
 
     assert!(
@@ -300,7 +306,7 @@ fn 打不开的文件会立即报错() {
 
     // 目录也不是要打开的东西
     let err = player
-        .load_file(env!("CARGO_MANIFEST_DIR"))
+        .load_file(Path::new(env!("CARGO_MANIFEST_DIR")))
         .expect_err("目录应该在入口就被拒绝");
     assert!(err.contains("找不到文件"), "实际是：{err}");
 
@@ -331,7 +337,7 @@ fn 拒绝把协议_url_当成文件打开() {
         "file:///C:/Windows/System32/drivers/etc/hosts",
     ] {
         let err = player
-            .load_file(url)
+            .load_file(Path::new(url))
             .expect_err("协议 URL 不应该被当成文件接受");
         assert!(
             err.contains("找不到文件"),
@@ -340,8 +346,11 @@ fn 拒绝把协议_url_当成文件打开() {
     }
 
     // 空串和只有空白同样要挡住
-    assert!(player.load_file("").is_err(), "空路径应该被拒绝");
-    assert!(player.load_file("   ").is_err(), "纯空白路径应该被拒绝");
+    assert!(player.load_file(Path::new("")).is_err(), "空路径应该被拒绝");
+    assert!(
+        player.load_file(Path::new("   ")).is_err(),
+        "纯空白路径应该被拒绝"
+    );
 
     let _ = player.shutdown();
 }

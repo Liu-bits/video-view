@@ -45,7 +45,11 @@ fn test_all_options() {
             let code_ctx = set_opt(ctx, c_ctx.as_ptr(), c_ctx_val.as_ptr());
 
             let code_init = init(ctx);
-            let status = if code_vo == 0 && code_ctx == 0 && code_init == 0 { "OK" } else { "FAIL" };
+            let status = if code_vo == 0 && code_ctx == 0 && code_init == 0 {
+                "OK"
+            } else {
+                "FAIL"
+            };
             eprintln!(
                 "{status:4} vo={vo_name} + gpu-context={ctx_name}: set_vo={code_vo} set_ctx={code_ctx} init={code_init}"
             );

@@ -1,0 +1,66 @@
+// 文件必须是纯 ASCII：rc.exe 按系统 ANSI 代码页读这个文件，遇到非 ASCII 的
+// 字符串内容会直接报 RC2132 / RC2133 把 VERSIONINFO 结构解析坏掉。中文注释
+// 不影响解析，只有引号里的内容必须是 ASCII。
+
+#define IDI_APP_ICON 1
+
+IDI_APP_ICON ICON "../icons/icon.ico"
+
+// RT_MANIFEST，资源 id 1。
+// DPI 感知声明写进清单而不是只靠运行期 API：清单在进程创建时由系统加载，
+// 比 SetProcessDpiAwarenessContext 早——进程一旦创建了窗口，DPI 感知模式就
+// 再也改不了，靠运行期调用就有时序风险。
+1 24 "app.manifest"
+
+// 版本号由 build.rs 从 CARGO_PKG_VERSION 传进来（见 build.rs::embed_resources）。
+// 这里刻意不写死：Cargo.toml 和 rc 脚本各写一遍的必然结果是某次只改了一处，
+// 装出来的软件文件名写 0.3.0、文件属性里却显示 0.2.0。
+//
+// 手工用 rc.exe 验证本脚本时必须带上这两个宏（字符串那个的引号不能省，
+// 少了引号 rc 会把 0.2.0 当数字字面量解析，字段值静默变空）：
+//   rc.exe /nologo /fo test.res /dVV_FILEVERSION=0,2,0,0 "/dVV_VERSION=\"0.2.0\"" app.rc
+#ifndef VV_FILEVERSION
+#error VV_FILEVERSION is not defined; build.rs must pass it from CARGO_PKG_VERSION
+#endif
+#ifndef VV_VERSION
+#error VV_VERSION is not defined; build.rs must pass it from CARGO_PKG_VERSION
+#endif
+
+// FILEOS / FILETYPE 直接写数值，而不是 VOS_NT_WINDOWS32 / VFT_APP：
+// 后者定义在 winver.h 里，而 rc.exe 只有在 INCLUDE 环境变量指向 SDK 头文件
+// 目录时才看得到。数值版对构建机的 SDK 安装方式完全不敏感。
+#define VOS_NT_WINDOWS32 0x00040004
+#define VFT_APP          0x00000001
+
+// 字符串结尾不要写 \0：RC 不会把它当终止符，会原样进 exe，文件属性里就会
+// 看到 "VideoView\0"。
+1 VERSIONINFO
+FILEVERSION     VV_FILEVERSION
+PRODUCTVERSION  VV_FILEVERSION
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = zh-CN，04b0 = Unicode
+        BLOCK "080404b0"
+        BEGIN
+            // FileDescription / ProductName 只能是 ASCII（见文件开头），
+            // 中文名留给安装包显示
+            VALUE "FileDescription",  "VideoView"
+            VALUE "FileVersion",      VV_VERSION
+            VALUE "InternalName",     "VideoView"
+            // 产物就叫 video-view.exe（Cargo 的 bin 名），这里必须照实写，
+            // 否则任务管理器「映像名称」和文件属性对不上
+            VALUE "OriginalFilename", "video-view.exe"
+            VALUE "ProductName",      "VideoView"
+            VALUE "ProductVersion",   VV_VERSION
+            VALUE "CompanyName",      "VideoView"
+            VALUE "LegalCopyright",   "GPL-3.0-or-later"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

@@ -17,12 +17,23 @@ use std::thread::JoinHandle;
 
 use ffi::*;
 
-/// 需要观察的属性。变更时通过 `mpv_event` 推给前端。
+/// 某个被观察属性的 MPV_FORMAT_*，供事件解码时还原类型。
+fn observed_format(name: &str) -> Option<c_int> {
+    OBSERVED_PROPERTIES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, fmt)| *fmt)
+}
+
+/// 需要观察的属性。变更时通过 `mpv_event` 推给界面。
 ///
 /// 这里不依赖 `reply_userdata` 做映射，而是拿事件里的属性名反查，
 /// 少一层状态，代价只是一次极短的线性查找。
+///
+/// **刻意不观察 `time-pos`**：它每个视频帧都会变一次，观察它等于把
+/// 几十到几百条事件/秒转成界面刷新。进度条改成界面线程定时读取，
+/// 刷新率由定时器决定（见 `app::TICK_MS`，250ms），事件流量降为零。
 const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
-    ("time-pos", MPV_FORMAT_DOUBLE),
     ("duration", MPV_FORMAT_DOUBLE),
     ("pause", MPV_FORMAT_FLAG),
     ("volume", MPV_FORMAT_DOUBLE),
@@ -31,11 +42,47 @@ const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
     ("idle-active", MPV_FORMAT_FLAG),
 ];
 
-/// mpv 报告的属性变化，前端据此更新 UI。
+/// 属性的值。
+///
+/// 原来这里用的是 `serde_json::Value`，因为界面是网页、事件要序列化成
+/// JSON 跨进程传输。界面改成原生自绘之后没有任何序列化需求，
+/// 直接用枚举省掉一次堆分配和一次 JSON 解析。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropertyValue {
+    Flag(bool),
+    Number(f64),
+    /// mpv 内部持有的字符串，克隆时已经复制了一份
+    Text(String),
+}
+
+impl PropertyValue {
+    pub fn as_flag(&self) -> Option<bool> {
+        match self {
+            PropertyValue::Flag(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            PropertyValue::Number(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            PropertyValue::Text(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// mpv 报告的属性变化，界面据此更新。
 #[derive(Debug, Clone)]
 pub struct PropertyChange {
     pub name: &'static str,
-    pub value: serde_json::Value,
+    pub value: PropertyValue,
 }
 
 /// 事件循环产生的所有消息。
@@ -79,6 +126,13 @@ pub struct MpvPlayer {
     pending: Arc<Mutex<HashMap<u64, PendingCommand>>>,
     /// `reply_userdata` 自增序列，保证每个在途命令的 id 唯一。
     next_reply_id: AtomicU64,
+    /// 上下文是否已经 `mpv_destroy` 过。
+    ///
+    /// `shutdown()` 和 `Drop` 都会走到 `finish`，两次 `mpv_destroy` 同一个
+    /// 句柄是 use-after-free。用标志位而不是把 `handle` 改成 `AtomicPtr` 置空：
+    /// 几十处调用点都直接读 `self.handle`，改成每次都 load 一遍既啰嗦又
+    /// 掩盖了「这里本来该有个有效句柄」这个不变量。
+    destroyed: AtomicBool,
 }
 
 /// 一条在途异步命令持有的参数内存。
@@ -127,6 +181,7 @@ impl MpvPlayer {
             event_thread: Mutex::new(None),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_reply_id: AtomicU64::new(1),
+            destroyed: AtomicBool::new(false),
         })
     }
 
@@ -135,11 +190,7 @@ impl MpvPlayer {
         unsafe { (self.api.client_api_version)() }
     }
 
-    fn configure(
-        api: &MpvApi,
-        handle: *mut c_void,
-        options: &InitOptions,
-    ) -> Result<(), String> {
+    fn configure(api: &MpvApi, handle: *mut c_void, options: &InitOptions) -> Result<(), String> {
         unsafe {
             let set_opt = |name: &str, value: &CString| -> Result<(), String> {
                 let cname =
@@ -149,8 +200,8 @@ impl MpvPlayer {
             };
 
             // 渲染目标窗口：mpv 用 Direct3D 直接画到这个 HWND。
-            let wid = CString::new(options.wid.to_string())
-                .map_err(|_| "非法窗口句柄".to_string())?;
+            let wid =
+                CString::new(options.wid.to_string()).map_err(|_| "非法窗口句柄".to_string())?;
             set_opt("wid", &wid)?;
 
             // 不读用户的 mpv.conf：那里可以改 vo / hwdec / 协议等几乎所有
@@ -163,6 +214,22 @@ impl MpvPlayer {
             set_opt("load-scripts", &CString::new("no").unwrap())?;
             set_opt("ytdl", &CString::new("no").unwrap())?;
 
+            // 内存上限。mpv 默认的 demux 缓存是 150MiB，为高延迟网络流设计；
+            // 本地文件用不上这么多，实测默认配置下光这一项就吃掉上百 MB。
+            set_opt("demuxer-max-bytes", &CString::new("48MiB").unwrap())?;
+            set_opt("demuxer-max-back-bytes", &CString::new("16MiB").unwrap())?;
+            // 缓存写满时暂停读取是网络流的容错手段，本地文件只会平白占用内存。
+            set_opt("cache-pause", &CString::new("no").unwrap())?;
+            // 解码线程数：mpv 默认取 CPU 核心数（这台机器 16），每条软解线程
+            // 各有一份帧缓冲池，而硬件解码时这些线程根本用不到。
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 4))
+                .unwrap_or(2);
+            set_opt(
+                "vd-lavc-threads",
+                &CString::new(threads.to_string()).unwrap(),
+            )?;
+
             if options.headless {
                 // 不开视频输出。必须在 initialize 之前设，vo 选项初始化后再改
                 // 未必生效。
@@ -174,7 +241,8 @@ impl MpvPlayer {
                 set_opt("force-window", &CString::new("yes").unwrap())?;
                 // 用旧版 vo=gpu（而非 gpu-next）+ d3d11 上下文：
                 // flip-model 呈现是 gpu-next 的特性，旧版 gpu VO 用 blit 模型，
-                // 不要求窗口消息循环泵送，避免 Tauri 主线程不泵送消息导致黑屏。
+                // 不要求窗口消息循环泵送，画面不会因为主线程没及时
+                // WM_PAINT 而黑屏。
                 // d3d11-flip-model 选项只能在 VO 初始化后用 set_property 设置，
                 // 无法在 mpv_initialize 之前用 set_option 设置（返回 -5）。
                 set_opt("vo", &CString::new("gpu").unwrap())?;
@@ -189,10 +257,8 @@ impl MpvPlayer {
             check(api, (api.initialize)(handle), "mpv_initialize")?;
 
             for (name, format) in OBSERVED_PROPERTIES {
-                let cname =
-                    CString::new(*name).map_err(|_| "属性名包含空字节".to_string())?;
-                let code =
-                    (api.observe_property)(handle, 0, cname.as_ptr(), *format);
+                let cname = CString::new(*name).map_err(|_| "属性名包含空字节".to_string())?;
+                let code = (api.observe_property)(handle, 0, cname.as_ptr(), *format);
                 check(api, code, &format!("观察属性 {name}"))?;
             }
         }
@@ -225,7 +291,7 @@ impl MpvPlayer {
                     match event.event_id {
                         MPV_EVENT_SHUTDOWN => break,
                         MPV_EVENT_PROPERTY_CHANGE => {
-                            if let Some(msg) = decode_property(event.data) {
+                            if let Some(msg) = decode_property(event.data, observed_format) {
                                 on_event(msg);
                             }
                         }
@@ -338,9 +404,7 @@ impl MpvPlayer {
     fn command(&self, args: &[&str]) -> Result<(), String> {
         let mut owned: Vec<CString> = Vec::with_capacity(args.len());
         for a in args {
-            owned.push(
-                CString::new(*a).map_err(|_| format!("命令参数 {a:?} 包含空字节"))?,
-            );
+            owned.push(CString::new(*a).map_err(|_| format!("命令参数 {a:?} 包含空字节"))?);
         }
         let args: Box<[CString]> = owned.into_boxed_slice();
 
@@ -410,19 +474,28 @@ impl MpvPlayer {
     /// `memory` / `fd` 等一批协议，而 mpv 0.40 起已经没有 `protocol-white`
     /// 选项可用，所以只能在入口挡。要求「确实是磁盘上已存在的普通文件」，
     /// 能通过这一关的必然是本地文件，`D:\a.mp4` 与 `http://…` 由此分清。
-    pub fn load_file(&self, path: &str) -> Result<(), String> {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
+    ///
+    /// 传 `&Path` 而不是 `&str`：路径的原始形态是 UTF-16，mpv 的命令接口只收
+    /// UTF-8，转码不可逆时（未配对的代理项，emoji 文件名能造出来）必须明确
+    /// 报错。`to_string_lossy` 会悄悄把非法字符换成 U+FFFD，拼出来的路径指向
+    /// 一个不存在的文件，用户看到的却是「找不到文件」，报错完全指错方向。
+    pub fn load_file(&self, path: &Path) -> Result<(), String> {
+        if path.as_os_str().is_empty() {
             return Err("文件路径为空".to_string());
         }
-        if trimmed.contains('\0') {
+        // 先验存在性再转码：这样「找不到文件」和「路径无法表示」是两种错误，
+        // 不会混成一条
+        if !path.is_file() {
+            return Err(format!("找不到文件：{}", path.display()));
+        }
+        let url = path
+            .to_str()
+            .ok_or_else(|| format!("路径无法表示为 UTF-8：{}", path.display()))?;
+        if url.contains('\0') {
             return Err("文件路径包含空字节".to_string());
         }
-        if !Path::new(trimmed).is_file() {
-            return Err(format!("找不到文件：{trimmed}"));
-        }
         // loadfile <url> <flags>；replace 表示替换当前播放列表
-        self.command(&["loadfile", trimmed, "replace"])
+        self.command(&["loadfile", url, "replace"])
     }
 
     pub fn toggle_pause(&self) -> Result<(), String> {
@@ -469,9 +542,27 @@ impl MpvPlayer {
         }
         // 先让 mpv 停播，事件线程会收到 EVENT_SHUTDOWN 自行退出
         let result = self.command(&["quit"]);
-        self.join_event_thread();
-        unsafe { (self.api.destroy)(self.handle) };
+        self.finish();
         result
+    }
+
+    /// join 事件线程、清掉未归还的命令参数、销毁上下文。
+    ///
+    /// `shutdown` 与 `Drop` 共用：命令是异步的，`pending` 里登记的参数靠
+    /// `COMMAND_REPLY` 归还。`shutdown` 里先置了 shutdown 标志，事件线程可能
+    /// 在回复到达之前就退出了，于是那批 `CString` 再没人 `remove`，得在这里
+    /// 统一清掉。
+    fn finish(&self) {
+        self.join_event_thread();
+        self.pending.lock().unwrap().clear();
+        // swap 而不是 load+store：两个调用点（shutdown 与 Drop）并发时
+        // 也只有一个能拿到 true
+        if self.destroyed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !self.handle.is_null() {
+            unsafe { (self.api.destroy)(self.handle) };
+        }
     }
 
     fn join_event_thread(&self) {
@@ -483,10 +574,12 @@ impl MpvPlayer {
 
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
-        // 正常路径是显式 shutdown()；这里兜底，保证线程一定被 join，
-        // 否则 MpvApi（以及它持有的 DLL）会在事件线程仍在运行时被卸载。
+        // 正常路径是显式 shutdown()；这里兜底，保证线程一定被 join、
+        // 上下文一定被销毁，否则 MpvApi（以及它持有的 DLL）会在事件线程
+        // 仍在运行时被卸载，mpv 内部的一切资源也都泄漏。
+        // 句柄为空说明 shutdown() 已经销毁过了，`finish` 内部会跳过。
         self.shutdown.store(true, Ordering::Relaxed);
-        self.join_event_thread();
+        self.finish();
     }
 }
 
@@ -500,36 +593,40 @@ fn check(api: &MpvApi, code: c_int, what: &str) -> Result<(), String> {
     }
 }
 
-fn decode_property(data: *mut c_void) -> Option<MpvEventMessage> {
+/// 属性事件里 `prop.data` 的含义由观察时传的格式决定，
+/// 这里按属性名反查格式，把裸指针还原成带类型的值。
+fn decode_property(
+    data: *mut c_void,
+    format_of: impl Fn(&str) -> Option<c_int>,
+) -> Option<MpvEventMessage> {
     if data.is_null() {
         return None;
     }
     let prop = unsafe { &*(data as *const MpvEventProperty) };
     let name = lookup_property(prop.name)?;
+    let format = format_of(name)?;
 
     let value = if prop.data.is_null() {
-        serde_json::Value::Null
+        // 文件被卸载时 mpv 会把已知类型的属性置为 null。
+        // 这不是「值变成 0」，交给上层保持上一份状态。
+        return None;
     } else {
-        match name {
-            "pause" | "mute" | "idle-active" => {
-                serde_json::Value::Bool(unsafe { *(prop.data as *const c_int) != 0 })
-            }
-            "volume" | "time-pos" | "duration" => {
-                serde_json::Value::from(unsafe { *(prop.data as *const f64) })
-            }
-            "media-title" => {
+        match format {
+            MPV_FORMAT_FLAG => PropertyValue::Flag(unsafe { *(prop.data as *const c_int) != 0 }),
+            MPV_FORMAT_DOUBLE => PropertyValue::Number(unsafe { *(prop.data as *const f64) }),
+            MPV_FORMAT_STRING => {
                 let ptr = unsafe { *(prop.data as *const *const c_char) };
                 if ptr.is_null() {
-                    serde_json::Value::Null
-                } else {
                     // 注意：这里读的是 mpv 内部持有的字符串指针，
                     // 不是 mpv 为调用方分配的副本，因此绝不能 mpv_free。
                     // （只有 mpv_get_property 返回的字符串才需要释放。）
+                    PropertyValue::Text(String::new())
+                } else {
                     let text = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
-                    serde_json::Value::String(text)
+                    PropertyValue::Text(text)
                 }
             }
-            _ => serde_json::Value::Null,
+            _ => return None,
         }
     };
 
@@ -558,7 +655,7 @@ fn decode_end_file(
     }
 }
 
-/// 把 mpv 返回的属性名映射回静态字符串，便于前端按固定字段名匹配。
+/// 把 mpv 返回的属性名映射回静态字符串，便于上层按固定字段名匹配。
 fn lookup_property(ptr: *const c_char) -> Option<&'static str> {
     if ptr.is_null() {
         return None;
@@ -577,20 +674,26 @@ const DLL_NAME: &str = "libmpv-2.dll";
 /// 找到 `libmpv-2.dll`。
 ///
 /// 优先级：
-/// 1. 环境变量 `MPV2_DLL` —— 排查打包问题时手动指定
-/// 2. 可执行文件所在目录，以及打包后的 `resources/` 子目录
+/// 1. 环境变量 `MPV2_DLL`（**仅 debug 构建**，排查打包问题时手动指定）
+/// 2. 可执行文件所在目录
 /// 3. debug 构建额外向上找几级、并回退到源码目录
 ///
-/// 向上找只对 debug 开放：cargo 会把测试/示例的可执行文件放进
+/// 向上找和环境变量都只对 debug 开放：cargo 会把测试/示例的可执行文件放进
 /// `target/<profile>/deps/`，而 `build.rs` 把 DLL 放在 `target/<profile>/`。
-/// 正式版本如果也向上找，就等于允许 `C:\Program Files\` 或用户目录里
-/// 任意一个同名 DLL 被优先加载（DLL 劫持），所以 release 只认 exe 同级
-/// 和 `resources/`。
+/// 正式版本如果也向上找、或认环境变量，就等于允许 `C:\Program Files\`、
+/// 用户目录或任何环境变量指定位置里的同名 DLL 被优先加载（DLL 劫持），
+/// 所以 release 只认 exe 同级。
 fn resolve_library_path() -> Result<PathBuf, String> {
-    if let Ok(custom) = std::env::var("MPV2_DLL") {
-        let p = PathBuf::from(custom);
-        if p.exists() {
-            return Ok(p);
+    // MPV2_DLL 只在 debug 构建里认。它是「从任意路径加载一个 DLL」的能力：
+    // 放在 release 里，就等于允许任何能设置环境变量的人（网页链接、别的程序、
+    // 快捷方式）让正式版去加载任意位置的 libmpv-2.dll，比同目录查找危险得多。
+    // 打包后的正式版没有排查 DLL 问题的需求——它旁边就躺着那个 DLL。
+    if cfg!(debug_assertions) {
+        if let Ok(custom) = std::env::var("MPV2_DLL") {
+            let p = PathBuf::from(custom);
+            if p.is_file() {
+                return Ok(p);
+            }
         }
     }
 
@@ -600,9 +703,8 @@ fn resolve_library_path() -> Result<PathBuf, String> {
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf))
     {
-        // 同级优先：打包后 Tauri 把 DLL 放在 exe 同级
+        // 只认 exe 同级：安装程序与免安装包都把 DLL 放在 exe 同级
         candidates.push(dir.join(DLL_NAME));
-        candidates.push(dir.join("resources").join(DLL_NAME));
         if cfg!(debug_assertions) {
             for _ in 0..2 {
                 match dir.parent() {

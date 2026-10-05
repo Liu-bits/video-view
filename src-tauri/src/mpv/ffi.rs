@@ -79,11 +79,13 @@ pub struct MpvEventEndFile {
 type FnCreate = unsafe extern "system" fn() -> *mut c_void;
 type FnInitialize = unsafe extern "system" fn(*mut c_void) -> c_int;
 type FnDestroy = unsafe extern "system" fn(*mut c_void);
-type FnSetOptionString = unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
-type FnSetProperty = unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
-type FnGetProperty = unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
-type FnObserveProperty =
-    unsafe extern "system" fn(*mut c_void, u64, *const c_char, c_int) -> c_int;
+type FnSetOptionString =
+    unsafe extern "system" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
+type FnSetProperty =
+    unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
+type FnGetProperty =
+    unsafe extern "system" fn(*mut c_void, *const c_char, c_int, *mut c_void) -> c_int;
+type FnObserveProperty = unsafe extern "system" fn(*mut c_void, u64, *const c_char, c_int) -> c_int;
 type FnCommand = unsafe extern "system" fn(*mut c_void, *mut *const c_char) -> c_int;
 type FnCommandAsync = unsafe extern "system" fn(*mut c_void, u64, *mut *const c_char) -> c_int;
 type FnWaitEvent = unsafe extern "system" fn(*mut c_void, c_double) -> *mut MpvEvent;
