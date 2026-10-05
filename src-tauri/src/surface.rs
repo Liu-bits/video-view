@@ -271,10 +271,42 @@ fn wide(s: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{is_double_click_tail, DBLCLICK_SLOP, LAST_CLICK};
+    use std::sync::{Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
+    /// 把这几个测试串行化的锁。必须存在，理由见下。
+    ///
+    /// `is_double_click_tail` 的状态存在进程级 `static LAST_CLICK` 里，
+    /// 而 `cargo test` 默认把测试**并行**跑在不同线程上。于是：
+    ///
+    ///   线程 A（第一次点击不吞）  reset()          -> LAST_CLICK = None
+    ///   线程 B（双击第二击被吞）  第一次调用        -> LAST_CLICK = 某个时刻
+    ///   线程 A                    断言 !is_tail()  -> 读到 B 留下的值 -> 失败
+    ///
+    /// 这个失败是随机的：取决于线程调度，本地连续跑十次可能都过，
+    /// 换个机器、换个测试数量、换个 CPU 负载就炸。实测在全新 clone 里
+    /// 编译后第一次跑就挂了（`位置差太远不吞`），而原仓库里重跑又过——
+    /// 这种「有时过有时不过」的测试比没有测试更糟：它会让人怀疑产品代码。
+    ///
+    /// 修法是让这几个测试各自独占这份状态。要改的是测试的组织方式，
+    /// 不是产品逻辑：`is_double_click_tail` 本身的判断是对的。
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// 取串行锁并绑定到当前作用域，作用域结束（测试结束）时自动释放。
+    ///
+    /// 必须返回 `MutexGuard` 而不是只在 `reset()` 里加锁：锁的生命周期
+    /// 要覆盖**整个**测试体，reset 只是其中第一步。
+    ///
+    /// 用 `unwrap_or_else(|e| e.into_inner())` 而不是 `unwrap()`：
+    /// 上一个测试 panic 时锁会中毒，之后每个测试都会 panic 在
+    /// `.unwrap()` 上——一个失败把剩下四个全带崩，报错信息还完全指错方向。
+    fn serial() -> MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 清掉双击基准点。调用前必须已持有 `serial()`。
     fn reset() {
-        *LAST_CLICK.lock().unwrap() = None;
+        *LAST_CLICK.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// 单击必须真的发出去。
@@ -283,6 +315,7 @@ mod tests {
     /// 如果它对第一次点击也返回 true，「单击画面切换播放暂停」就彻底不工作了。
     #[test]
     fn 第一次点击不吞() {
+        let _serial = serial();
         reset();
         let now = Instant::now();
         assert!(!is_double_click_tail(
@@ -300,6 +333,7 @@ mod tests {
     /// 「双击之后画面变暂停了」。
     #[test]
     fn 双击第二击被吞() {
+        let _serial = serial();
         reset();
         let t0 = Instant::now();
         let dbl = Duration::from_millis(500);
@@ -319,6 +353,7 @@ mod tests {
     /// 否则用户把双击时间调到 1 秒后行为就错了。
     #[test]
     fn 超过双击间隔不吞() {
+        let _serial = serial();
         reset();
         let t0 = Instant::now();
         let dbl = Duration::from_millis(500);
@@ -335,6 +370,7 @@ mod tests {
     /// 不该被当成双击（那会吞掉一次本该生效的暂停切换）。
     #[test]
     fn 位置差太远不吞() {
+        let _serial = serial();
         let dbl = Duration::from_millis(500);
 
         // 差一个像素以内：算双击的第二击，click 要被吞
@@ -379,6 +415,7 @@ mod tests {
     /// 「click + 两次被吞」，第三下的暂停切换就丢了。
     #[test]
     fn 吞掉之后时间戳要刷新() {
+        let _serial = serial();
         // 双击窗口取 100ms，三个时间点靠它分界：
         //   A@0ms    第一次点击，不吞
         //   B@60ms   距 A 60ms <= 100ms，吞
