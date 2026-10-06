@@ -1,4 +1,4 @@
-﻿# 界面端到端验收
+# 界面端到端验收
 #
 # 控制栏是 GDI 自绘的，`cargo test` 覆盖不到「像素真的贴对了地方」这件事——
 # 单元测试只能钉住坐标约定，位图最终有没有落到屏幕上得看真实输出。
@@ -75,6 +75,10 @@ public class VV {
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
+  // 右键菜单：#32768 是 Win32 菜单窗口的类名。用类名找而不是枚举全部顶层
+  // 窗口，因为同一时刻系统里只会弹出一个菜单（我们的），不必区分归属。
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string name);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   public delegate bool EnumProc(IntPtr h, IntPtr l);
   public struct RECT { public int Left, Top, Right, Bottom; }
@@ -199,6 +203,25 @@ function Click($x, $y) {
     [VV]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 60
     [VV]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+}
+
+# 右键点击。用 mouse_event 而不是发 WM_RBUTTONUP 给视频子窗口 ——
+# 那条路要先按类名找到子窗口 HWND（surface.rs 里注册的
+# "VideoViewVideoChild"），跨进程发消息到 WS_CHILD 走的路径与同进程内
+# 直接投递不同，不如用真的鼠标事件：它同时验了「消息确实到了子窗口」
+# 和「子窗口的 wnd_proc 确实转交上来了」两件事。
+function RightClick($x, $y) {
+    [VV]::SetCursorPos($x, $y) | Out-Null
+    Start-Sleep -Milliseconds 250
+    # 0x0008 = MOUSEEVENTF_RIGHTDOWN，0x0010 = MOUSEEVENTF_RIGHTUP
+    [VV]::mouse_event(0x0008, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 80
+    [VV]::mouse_event(0x0010, 0, 0, 0, [IntPtr]::Zero)
+}
+
+# 当前有没有 Win32 弹出菜单开着。返回菜单窗口的 HWND（没有则 0）。
+function Find-PopupMenu {
+    [VV]::FindWindowW("#32768", $null)
 }
 
 function PixDiff($a, $b, $x0, $y0, $w, $h, $step) {
@@ -660,6 +683,90 @@ try {
     $vrT3 = VideoRect
     Add-Result "escClosesTrackMenu" ($vrT3.vh -eq $vr4.vh) `
         ("Esc 之后画面高 {0} -> {1}（回到无面板基准 {2}）" -f $vrT1.vh, $vrT3.vh, $vr4.vh)
+
+    # ---- 画面右键菜单 ----------------------------------------------------
+    #
+    # 判据是「系统真的弹出了一个菜单窗口」（类名 #32768），不是截图比对。
+    #
+    # 截图法的问题：菜单弹出时画面本身也可能因为「播放到下一帧」而变化，
+    # 两个变化叠在一起分不清谁是谁。找菜单窗口则是二值的、没有歧义 ——
+    # #32768 是 Win32 给所有弹出菜单的固定类名，我们的菜单是系统画的，
+    # 所以它一定有这个类。
+    #
+    # 右键位置取画面正中偏上：菜单是向下展开的，靠近上边才不会被窗口
+    # 底边顶上去翻转（翻转了 rect 也照样存在，但那时菜单内容在鼠标上方，
+    # 截图看不到第一行）。
+    Force-Foreground $main
+    $vrR0 = VideoRect
+    $rx = [int]($vw / 2)
+    $ry = [int]($vrR0.vy + $vrR0.vh * 0.25)
+    $ptScreen = New-Object VV+POINT
+    $ptScreen.X = $rx; $ptScreen.Y = $ry
+    [VV]::ClientToScreen($main, [ref]$ptScreen) | Out-Null
+
+    RightClick $ptScreen.X $ptScreen.Y
+    Start-Sleep -Milliseconds 1200
+    $menuHwnd = Find-PopupMenu
+    Add-Result "rightMenuOpens" ($menuHwnd -ne [IntPtr]::Zero) `
+        ("右键画面后菜单窗口 HWND = {0}" -f $menuHwnd)
+
+    # 菜单应当出现在鼠标附近。这是「坐标换算对不对」的检查：
+    # ClientToScreen 少做一次的话菜单会整体偏移一个非客户区的高度，
+    # 而这时菜单仍然存在 —— 只有比对位置才抓得到。
+    $menuRectOk = $false
+    $menuNote = "菜单窗口没出现"
+    if ($menuHwnd -ne [IntPtr]::Zero) {
+        $mr = New-Object VV+RECT
+        [VV]::GetWindowRect($menuHwnd, [ref]$mr) | Out-Null
+        # 容差给 40px：菜单左对齐时左边缘正好在鼠标上，而系统可能
+        # 加上自己的几像素边框
+        $near = ([math]::Abs($mr.Left - $ptScreen.X) -lt 60) -and `
+                ($mr.Top -ge $ptScreen.Y - 60) -and `
+                ($mr.Top -le $ptScreen.Y + 200)
+        $menuRectOk = $near -and ($mr.Right - $mr.Left -gt 60) -and ($mr.Bottom - $mr.Top -gt 60)
+        $menuNote = "菜单 ({0},{1})-({2},{3}) 鼠标在 ({4},{5})" -f `
+            $mr.Left, $mr.Top, $mr.Right, $mr.Bottom, $ptScreen.X, $ptScreen.Y
+    }
+    Add-Result "rightMenuAtCursor" $menuRectOk $menuNote
+
+    # 菜单开着的时候画面不该变形（菜单是浮层，不吃画面区）
+    $vrR1 = VideoRect
+    Add-Result "rightMenuFloats" ($vrR1.vh -eq $vrR0.vh) `
+        ("菜单打开时画面高 {0} -> {1}（浮层不吃画面区）" -f $vrR0.vh, $vrR1.vh)
+
+    # 把菜单拍下来留证
+    if ($menuHwnd -ne [IntPtr]::Zero) {
+        $mr = New-Object VV+RECT
+        [VV]::GetWindowRect($menuHwnd, [ref]$mr) | Out-Null
+        $mw = $mr.Right - $mr.Left; $mh = $mr.Bottom - $mr.Top
+        if ($mw -gt 0 -and $mh -gt 0) {
+            $shotDir = Join-Path $PSScriptRoot "..\artifacts\ui-shots"
+            New-Item -ItemType Directory -Path $shotDir -Force | Out-Null
+            $bmpMenu = New-Object System.Drawing.Bitmap $mw, $mh
+            $g = [System.Drawing.Graphics]::FromImage($bmpMenu)
+            $g.CopyFromScreen($mr.Left, $mr.Top, 0, 0, (New-Object System.Drawing.Size($mw, $mh)))
+            $g.Dispose()
+            $bmpMenu.Save((Join-Path $shotDir "context-menu.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmpMenu.Dispose()
+            Write-Host ("  menu screenshot -> {0}" -f (Join-Path $shotDir "context-menu.png"))
+        }
+    }
+
+    # 点外面关掉菜单。发 Esc 给**前台窗口**（菜单是前台的），
+    # 不是给主窗口 —— 给主窗口的话菜单不会关，而我们会误判成「Esc 关不掉」。
+    if ($menuHwnd -ne [IntPtr]::Zero) {
+        [VV]::SetForegroundWindow($menuHwnd) | Out-Null
+        Start-Sleep -Milliseconds 200
+        Send-Key 0x1B
+        Start-Sleep -Milliseconds 900
+        $still = Find-PopupMenu
+        Add-Result "rightMenuCloses" ($still -eq [IntPtr]::Zero) `
+            ("Esc 之后菜单 HWND = {0}" -f $still)
+    } else {
+        Add-Result "rightMenuCloses" $false "菜单没出现，无法验证关闭"
+    }
+    Force-Foreground $main
+    Start-Sleep -Milliseconds 400
 
     # ---- Esc 死锁回归 ----------------------------------------------------
     #

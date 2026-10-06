@@ -1,7 +1,7 @@
 ; VideoView 安装包脚本
 ;
 ; 由 scripts/package.ps1 调用：
-;   makensis /INPUTCHARSET UTF8 -DVERSION=0.5.0 installer.nsi
+;   makensis /INPUTCHARSET UTF8 -DVERSION=0.6.0 installer.nsi
 ;
 ; 产物是一个零外部依赖的安装程序：播放核心 libmpv-2.dll 会装到 $INSTDIR，
 ; 播放器 exe 与它同目录、运行时按同目录查找。对方的机器上不需要装
@@ -13,11 +13,32 @@
 ; 版本号由 scripts/package.ps1 用 -DVERSION 传进来，保证和 Cargo.toml 一致。
 ; 这里保留的默认值只是为了让脚本能被手工执行时也能跑起来。
 !ifndef VERSION
-  !define VERSION "0.5.0"
+  !define VERSION "0.6.0"
 !endif
 !define OUT_FILE "..\artifacts\VideoView-Setup-${VERSION}.exe"
 ; 暂存目录：由 scripts/package.ps1 铺好，里面只有要装进 $INSTDIR 的文件
 !define BUILD_DIR "..\artifacts\stage"
+
+; ---- 变量声明 ----
+;
+; NSIS 要求 `Var` 必须在**使用它的 Function / Section 之前**声明。
+; 这一段放在文件最前面而不是跟着各自的逻辑走，就是因为 `.onInit`
+; （全文第一个 Function）要用 `$MakeDesktopShortcut` —— 声明跟在
+; 语言页那一段的话，`.onInit` 里的 `StrCpy` 会报 "aborting creation
+; process"，而报错信息里**不说是哪个变量**，只看行号很难反应过来。
+;
+; 桌面快捷方式的勾选框句柄与选择结果。
+;
+; 结果由 `${NSD_OnClick}` 回调写进 `$MakeDesktopShortcut`，**不是**在
+; `SecMain` 里去读控件状态 —— `Page custom` 只有页面回调、没有 leave 钩子，
+; 等到 Section 执行时 `nsDialogs::Show` 已经返回、对话框已销毁，
+; `NSD_GetState` 拿到的句柄失效。下面 `$LangChoice` 那段注释写的正是这个坑。
+Var ShortcutBox
+Var MakeDesktopShortcut
+
+; 快捷方式落地的位置与名字。`$DESKTOP` 由 NSIS 解析成当前用户的桌面
+; （落「公用桌面」还是「用户桌面」由 NSIS 与安装权限决定，我们不插手）。
+!define DESKTOP_SHORTCUT "$DESKTOP\VideoView.lnk"
 
 !define PRODUCT "VideoView 视频播放器"
 
@@ -53,6 +74,15 @@ RequestExecutionLevel admin
 ; 所以它必须在 `.onInit` 里——`.onInit` 在任何页面显示之前跑完。
 Function .onInit
   SetRegView 64
+  ; 桌面快捷方式默认**不**建。
+  ;
+  ; 反过来（默认 1）的话 `/S` 静默安装会往每个用户的桌面上放图标 ——
+  ; 无人值守的部署不该做这件事。交互安装时 `LangPage` 会把它改成 1。
+  ;
+  ; 这一行不能省。NSIS 的 `Var` 初值是空串，`${If} $MakeDesktopShortcut == 1`
+  ; 碰上空串的比较行为不保证，而「静默装完多一个图标」是个只有用户看得见
+  ; 的小毛病 —— 不如从一开始就明确写 0。
+  StrCpy $MakeDesktopShortcut 0
 FunctionEnd
 ShowInstDetails show
 ShowUninstDetails show
@@ -151,7 +181,7 @@ Page custom LangPage
 Var LangDialog
 Var LangEn
 Var LangZh
-Var LangChoice
+Var LangChoice
 
 ; 页面上的文案。
 ;
@@ -296,6 +326,34 @@ Function LangPage
   Pop $LangZh
   ${NSD_OnClick} $LangZh onPickedChinese
 
+  ; 桌面快捷方式。
+  ;
+  ; 和语言单选框放在**同一页**而不是新开一页，理由：两者都是「安装选项」，
+  ; 为一个勾选框多开一页要写 40 行 nsDialogs 样板，而这一页已经有标题和
+  ; 说明文字了，位置顺手就够。
+  ;
+  ; **默认勾选。** 用户明确要了桌面快捷方式，而这是个纯增量：不勾也不会
+  ; 影响任何功能，只是桌面上少一个图标；勾了的话多一个图标，删掉也容易。
+  ;
+  ; 位置放在单选框下面 20px：视觉上「单选组」和「勾选框」之间要有一点
+  ; 间隔，否则读起来像第三个单选项。
+  StrCpy $S "Create a shortcut on the desktop"
+  ${NSD_CreateCheckbox} 30 132 300 16 $S
+  Pop $ShortcutBox
+  ; 默认值在**创建控件之后**设置，不是 CreateCheckbox 的第四个参数 ——
+  ; 那个参数是「文本」，不是「是否勾选」。用 `${NSD_Check}` 才不会
+  ; 静默失败（之前 `NSD_GetState` 那条注释里说的坑就是这个性质）。
+  ${NSD_Check} $ShortcutBox
+  ${NSD_OnClick} $ShortcutBox onToggleShortcut
+
+  ; 勾选结果在页面显示**之前**先定好初值。
+  ;
+  ; `${NSD_Check}` 只改控件状态，**不会**触发 `${NSD_OnClick}` —— 所以
+  ; 如果不在这里 `StrCpy $MakeDesktopShortcut 1`，用户勾着框一路点 Next
+  ; 而回调一次都没跑，SecMain 读到的是 0，勾选框形同虚设。这正是
+  ; 「控件显示的状态」和「我们记下来的状态」必须分开设的地方。
+  StrCpy $MakeDesktopShortcut 1
+
   ; Cancel / Next。这一页是第一页，所以**不画** Back：留一个点不动的按钮
   ; 在这里比不画更糟，用户会以为程序卡住了。
   StrCpy $S "Cancel"
@@ -308,6 +366,14 @@ Function LangPage
   SendMessage $LangDialog ${WM_COMMAND} 1 0
 
   nsDialogs::Show
+FunctionEnd
+
+; 勾选框变了就记下来。
+;
+; `${NSD_OnClick}` 在用户点它时才调，不在创建后调，也不随页面切换调 ——
+; 所以初值必须由 LangPage 自己 `StrCpy`（见上面那段注释）。
+Function onToggleShortcut
+  ${NSD_GetState} $ShortcutBox $MakeDesktopShortcut
 FunctionEnd
 
 Section "VideoView" SecMain
@@ -376,12 +442,53 @@ Section "VideoView" SecMain
   ; 文件关联不在安装阶段动。安装程序擅自改系统设置对用户是突袭，
   ; 想关联的第一次启动时自己选一次即可。
 
+  ; ---- 桌面快捷方式 ----
+  ;
+  ; 装完 `$INSTDIR` 的文件之后才建：指向的 exe 必须已经存在，顺序反了会
+  ; 留下一个指向空路径的快捷方式，点开报「找不到项目」。
+  ;
+  ; 写入前先删一次：`CreateShortCut` 在文件已存在时是覆盖，但升级安装时
+  ; 上一版可能只写了一半（崩溃 / 断电），先删能覆盖到那种情况。
+  ;
+  ; `/S` 静默安装走不到自定义页，`$MakeDesktopShortcut` 保持 `.onInit` 里
+  ; 设的初值 0，所以**静默安装不建快捷方式** —— 这正是想要的：无人值守的
+  ; 部署不该往用户桌面上放图标。
+  Delete "${DESKTOP_SHORTCUT}"
+  ${If} $MakeDesktopShortcut == 1
+    ; 五个参数，不写满八个。
+    ;
+    ; 实测（makensis 3.x，Tauri 自带的那份）：**写满**八参数
+    ; 里有两个连续空参数 `"" ""` 的那种形式编译不过，报错落在 `${EndIf}`
+    ; 那一行、只说 "aborting creation process"，不说是哪个参数 —— 看起来
+    ; 像是 `${If}` 配对出了问题。逐个参数数量单独编译验证过：
+    ;
+    ;   2 参数 (link, target)                    -> OK
+    ;   3 参数 (+ "")                             -> OK
+    ;   5 参数 (+ "", icon, 0)                    -> OK
+    ;   6 参数 (+ "", "", icon, 0)                -> FAIL
+    ;
+    ; 所以这里用五参数：第三个 `""` 是 `parameters`（空 = 启动不带命令行），
+    ; 第四个是 `icon.file`，第五个是 `icon_index`。把 `icon.file` 指向 exe
+    ; 自己，于是任务栏和 Alt-Tab 与桌面图标是同一张，不会出现「快捷方式
+    ; 一个样子、启动起来又变一个」。
+    CreateShortCut "${DESKTOP_SHORTCUT}" "$INSTDIR\video-view.exe" "" "$INSTDIR\video-view.exe" 0
+  ${EndIf}
+
 SectionEnd
 
 Section "Uninstall"
   ; 先结束进程再删文件，否则正在播放时 exe 被占用会删不掉
   nsExec::ExecToLog 'taskkill /F /IM video-view.exe'
   Sleep 500
+
+  ; 桌面快捷方式**必须删**。`RMDir /r "$INSTDIR"` 删不到桌面 —— 快捷方式在
+  ; 桌面上，不在安装目录里。漏了这一步的话，卸载完桌面上还留着一个点开
+  ; 报「找不到项目」的图标，而用户在「应用和功能」里看不到任何异常。
+  ;
+  ; 装了两次（不同用户 / 换了安装目录）也只删一份是刻意的：删多了会误删
+  ; 另一个用户自己建的同名快捷方式，而那种情况比留一个死图标更糟。
+  Delete "${DESKTOP_SHORTCUT}"
+
   RMDir /r "$INSTDIR"
 
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VideoView"

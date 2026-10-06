@@ -4,7 +4,24 @@
 # Windows 上必须带 CRLF 的文件
 *.bat text eol=crlf
 *.cmd text eol=crlf
-*.ps1 text eol=crlf
+# `.nsi` 是 NSIS 安装包脚本，只在 Windows 上跑，和 .bat/.cmd 同类。
+# 补这条是因为 installer.nsi 在这条规则出现之前就已经以 CRLF 入库了，
+# 而 git 不会自动重新规范化已入库的文件 —— 结果是每次 `git add` 它都会被
+# `* text=auto eol=lf` 转成 LF，整个 500 行文件在 diff 里全变，真正改的那几行
+# 被淹没。
+#
+# 关键是 **`-text` 而不是 `text eol=crlf`**：
+#   * `text`（不带值）= add 时把 CRLF 归一化成 LF 存进索引。只写
+#     `text eol=crlf` 的话，checkout 出来是 CRLF（对的），但索引里存的是
+#     LF —— 于是 diff 照样全变。实测过。
+#   * `-text` = git 完全不碰这个文件的行尾，add 时原样存、checkout 时原样
+#     取出，索引里一直是 CRLF。NSIS 在 CRLF 下工作正常（0.5.0 / 0.6.0 的
+#     安装包都是这么打出来的）。
+*.nsi -text
+# `.ps1` 不在 CRLF 列表里：仓库里 5 个 .ps1 全是 LF（`git cat-file` 逐个查过），
+# PowerShell 读 LF 脚本完全正常。上面曾经写着 `*.ps1 text eol=crlf`，与实际
+# 存储相反 —— 那会让每个 .ps1 一被 add 就产生一次全文件 diff。
+*.ps1 text eol=lf
 
 # 二进制，Git 不做换行转换也不做差异比较
 *.png binary

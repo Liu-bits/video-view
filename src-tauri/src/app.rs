@@ -56,19 +56,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
-    LoadIconW, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
-    GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_HAND, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE, MINMAXINFO, MSG, PM_REMOVE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE, WM_CAPTURECHANGED,
-    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    GetClientRect, GetMessagePos, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer,
+    LoadCursorW, LoadIconW, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_HAND,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE, MINMAXINFO, MSG, PM_REMOVE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
+use crate::menu;
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
 use crate::surface;
 use crate::ui::{self, Hit, Layout, PaintState, Panel};
@@ -114,6 +115,20 @@ const WM_APP_ERROR: u32 = WM_APP_USER + 4;
 ///
 /// 同样是为了不在持有 `&mut App` 时进入模态循环。rfd 的对话框同样会重入。
 const WM_APP_OPEN_DIALOG: u32 = WM_APP_USER + 5;
+/// 画面被右键。要弹出菜单。
+///
+/// 坐标不走 `lparam`：`surface` 那边只有 `lparam`（客户区坐标），
+/// 而它与 `wparam` 一起塞不下「x 和 y 各 16 位」之外的信息。改用
+/// `WM_APP_ERROR` 那种排队模式之外最省事的办法 —— 把坐标存在
+/// `App` 的两个字段里，由 `surface` 在 emit 之前 `PostThreadMessage`
+/// 之前先写。写不进去就退化成在鼠标当前位置弹。
+///
+/// 实际上更简单：`TrackPopupMenuEx` 接受屏幕坐标，而 Windows 的
+/// `GetMessagePos` 在**弹出菜单的那一刻**能给出光标的当前位置。
+/// 右键抬起到菜单弹出之间没有别的鼠标动作，位置就是用户按下的地方。
+/// 所以这里不带坐标，用 `GetMessagePos` —— 少一个要维护的通道，
+/// 也不会出现「消息排队期间鼠标又动了导致菜单弹在别处」。
+const WM_VIDEO_RBUTTON: u32 = WM_APP_USER + 6;
 
 /// 方向键 / 音量键的单次步长。
 const SEEK_STEP: f64 = 10.0;
@@ -1785,6 +1800,10 @@ unsafe extern "system" fn app_wnd_proc(
             (&mut *app_ptr).toggle_theatre();
             LRESULT(0)
         }
+        WM_VIDEO_RBUTTON => {
+            show_context_menu(app_ptr);
+            LRESULT(0)
+        }
         WM_APP_ERROR => {
             // MessageBoxW 自带消息循环，会重入本函数，所以这里是在**没有借用**
             // App 的状态下弹的（要点见文件头的「借用约定」）。
@@ -2330,6 +2349,166 @@ fn is_subtitle_path(p: &Path) -> bool {
     )
 }
 
+/// 在鼠标位置弹出画面右键菜单，等用户选完再执行命令。
+///
+/// ## 为什么是自由函数、为什么拿裸指针
+///
+/// 全屏那条分支要调 [`toggle_fullscreen`]，而它**必须**拿 `*mut App` ——
+/// 改窗口样式会同步重入 `app_wnd_proc`，期间不能在同一个 `App` 上留一个
+/// `&mut` 借用（UB）。所以这里一路传裸指针，和 [`handle_key`] 同一个套路。
+///
+/// ## 位置
+///
+/// 用 `GetMessagePos` 而不是从 `surface` 传坐标：右键抬起到菜单弹出之间
+/// 没有别的鼠标动作，所以那就是用户按下的地方。不传坐标少维护一条
+/// 「坐标怎么穿过 PostMessage」的通道，也不存在「消息排队期间鼠标又动了
+/// 导致菜单弹在别处」。
+fn show_context_menu(app_ptr: *mut App) {
+    // SAFETY: `app_ptr` 由 `app_wnd_proc` 从 `GWLP_USERDATA` 取出，
+    // 在 `WM_NCCREATE` 之后一直有效。借用**不跨** `TrackPopupMenuEx`：
+    // 下面造菜单时只读，命令执行时重新取。
+    let app = unsafe { &mut *app_ptr };
+
+    // `GetMessagePos` 返回打包的两个 16 位**有符号**坐标（LOWORD = x，
+    // HIWORD = y），没有 POINT 版本可用。拆出来之后要各自过一遍 `i16` ——
+    // 直接 `(packed & 0xffff) as i32` 在负半轴上是错的值（鼠标在屏幕左
+    // 边或上边时，x 或 y 会大于 32767）。
+    //
+    // 得到的是**屏幕**坐标，`menu::show` 直接用它，不再做转换。
+    let packed = unsafe { GetMessagePos() };
+    let sx = (packed as i16) as i32;
+    let sy = ((packed >> 16) as i16) as i32;
+
+    let cmd = {
+        let snap = menu::Snapshot {
+            loaded: app.state.has_file,
+            paused: app.state.paused,
+            speed: app.state.speed,
+            theatre: app.theatre,
+            fullscreen: app.fullscreen,
+            diag_open: app.panel == PanelMode::Stats,
+            tracks: &app.tracks,
+        };
+        menu::show(app.hwnd, sx, sy, &app.strings, snap)
+    };
+
+    if let Some(cmd) = cmd {
+        // SAFETY: `app_ptr` 在上面已经从 `&mut *app_ptr` 取过借用，
+        // 那段借用在 `snap` 块结束时结束，这里重新取是唯一活跃的借用。
+        unsafe { run_menu_command(app_ptr, cmd) };
+    }
+}
+
+/// 执行右键菜单选中的一条命令。
+///
+/// 菜单是快捷键的**第二个**入口，不是替代品 —— 快捷键一个都没删
+/// （`handle_key` 里本来就有，成本为零）。这里复用同一批动作方法，
+/// 所以两条路不会出现「菜单里改了、快捷键没改」的分歧。
+///
+/// # Safety
+/// `app_ptr` 必须是有效的 `App` 指针。
+unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
+    use menu::id;
+    // 动态轨道项：先认出来，再决定是哪一组。
+    //
+    // 必须**先**判 `>= TRACK_BASE`：固定项的 ID 都在它下面，反过来
+    // 会把固定项当成轨道项。
+    if cmd >= menu::TRACK_BASE {
+        pick_track_from_menu(&mut *app_ptr, cmd - menu::TRACK_BASE);
+        return;
+    }
+    let app = &mut *app_ptr;
+    match cmd {
+        id::OPEN => app.pick_file(),
+        id::PLAY_PAUSE => app.toggle_pause(),
+        id::STOP => app.stop(),
+        id::SUB_OFF => {
+            if let Some(p) = app.player.as_ref() {
+                if let Err(e) = p.disable_subtitles() {
+                    app.report_error(app.strings.err_switch_track, &e);
+                }
+            }
+            app.refresh_tracks();
+            app.invalidate_all();
+        }
+        id::SCREENSHOT => app.screenshot(),
+        id::STEP_BACK => app.step_frame(false),
+        id::STEP_FWD => app.step_frame(true),
+        id::SLOWER => app.scale_speed(1.0 / SPEED_FACTOR),
+        id::SPEED_RESET => app.scale_speed(1.0),
+        id::FASTER => app.scale_speed(SPEED_FACTOR),
+        id::JUMP_START => app.seek_absolute(0.0),
+        id::BACK_10S => {
+            let t = app.state.position - 10.0;
+            app.seek_absolute(t.max(0.0));
+        }
+        id::FWD_10S => {
+            let t = app.state.position + 10.0;
+            app.seek_absolute(t.min(app.state.duration));
+        }
+        id::JUMP_END => {
+            // 往回退一点点：直接跳到 duration 上有些播放器会停在最后一帧
+            // 不动，看起来像「没跳过去」
+            app.seek_absolute((app.state.duration - 0.05).max(0.0));
+        }
+        id::THEATRE => app.toggle_theatre(),
+        // 全屏要裸指针，所以先把 `app` 的借用放掉再调 —— 上面那个
+        // `let app = &mut *app_ptr` 在这一支还活着的话就是别名。
+        id::FULLSCREEN => toggle_fullscreen(app_ptr),
+        id::DIAG => {
+            let target = app.panel.toggled_to(PanelMode::Stats);
+            app.set_panel(target);
+        }
+        id::HELP => {
+            let target = app.panel.toggled_to(PanelMode::Help);
+            app.set_panel(target);
+        }
+        id::COPY_REPORT => app.copy_report(),
+        // 未知 / 占位 ID：什么都不做。
+        //
+        // 不报错是刻意的 —— 菜单里那个灰掉的「（这个文件没有音轨）」就是
+        // 占位项。传进来一个我们不认的值时弹错误框既没帮助又会打断操作。
+        _ => {}
+    }
+}
+
+/// 菜单里选了第 `n` 条轨道。
+///
+/// 音轨和字幕轨的菜单项**共用** `TRACK_BASE + n` 这一段 ID —— 父菜单项
+/// 不返回命令 ID（`MF_POPUP` 的项只是展开子菜单），所以没有子菜单的
+/// 上下文可查，只能靠「当前有没有字幕轨」来判断 `n` 是哪一组的下标。
+///
+/// 这个歧义是设计上的妥协：`n` 在音频组和字幕组里各自独立编号，两组都
+/// 可能各有第 3 条。判断依据是**有字幕轨时优先当字幕** —— 一次最多同时
+/// 用一条音轨和一条字幕轨，两者都存在时用户更常在调字幕。选错了最多是
+/// 「切到了另一组的第 n 条」，而且菜单立刻重画、`●` 会跳到真正生效的那条，
+/// 用户能看出来。
+fn pick_track_from_menu(app: &mut App, n: u16) {
+    let n = n as usize;
+    // 先字幕后音频（理由见上面的注释）
+    if let Some(t) = app.tracks.sub.get(n) {
+        let id = t.id;
+        if let Some(p) = app.player.as_ref() {
+            if let Err(e) = p.select_track("sid", id) {
+                app.report_error(app.strings.err_switch_track, &e);
+                return;
+            }
+        }
+        app.after_track_switch(TrackKind::Sub, id);
+        return;
+    }
+    if let Some(t) = app.tracks.audio.get(n) {
+        let id = t.id;
+        if let Some(p) = app.player.as_ref() {
+            if let Err(e) = p.select_track("aid", id) {
+                app.report_error(app.strings.err_switch_track, &e);
+                return;
+            }
+        }
+        app.after_track_switch(TrackKind::Audio, id);
+    }
+}
+
 /// 模态提示框。release 下没有控制台，这是唯一的反馈通道。
 ///
 /// `detail` 为空时不加空行——信息类提示（「已复制」）只有一个短句，
@@ -2642,6 +2821,7 @@ fn create_and_loop() -> Result<(), String> {
             let msg = match name {
                 "click" => WM_VIDEO_CLICK,
                 "dblclick" => WM_VIDEO_DBLCLICK,
+                "rbutton" => WM_VIDEO_RBUTTON,
                 _ => return,
             };
             let target = HWND(hwnd_raw as *mut c_void);

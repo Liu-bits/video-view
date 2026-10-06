@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetParent, LoadCursorW, RegisterClassExW, SendMessageW,
     SetWindowPos, CS_DBLCLKS, HWND_TOP, IDC_ARROW, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_SHOWWINDOW, WM_DROPFILES, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_PARENTNOTIFY,
-    WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE, WS_VISIBLE,
+    WM_RBUTTONUP, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE, WS_VISIBLE,
 };
 
 /// 视频子窗口的窗口类名。自动化脚本按这个名字找画面窗口，改名要同步改脚本。
@@ -34,6 +34,7 @@ const VIDEO_CLASS: &str = "VideoViewVideoChild";
 ///
 /// * `"click"` —— 单击画面
 /// * `"dblclick"` —— 双击画面
+/// * `"rbutton"` —— 右键画面
 type VideoHandler = Box<dyn Fn(&'static str) + Send + Sync>;
 
 static VIDEO_HANDLER: Mutex<Option<VideoHandler>> = Mutex::new(None);
@@ -131,6 +132,10 @@ unsafe extern "system" fn video_wnd_proc(
                     emit("dblclick");
                     LRESULT(0)
                 }
+                WM_RBUTTONUP => {
+                    emit("rbutton");
+                    LRESULT(0)
+                }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
         }
@@ -138,6 +143,16 @@ unsafe extern "system" fn video_wnd_proc(
         WM_LBUTTONDOWN => handle_click(lparam),
         WM_LBUTTONDBLCLK => {
             emit("dblclick");
+            LRESULT(0)
+        }
+        // 右键**抬起**才开菜单，不是按下。
+        //
+        // 用抬起的好处：按下即弹的话，「右键拖动选一段文字」或者「按了右键
+        // 又改主意」都会弹出一张菜单；而抬起时如果鼠标已经拖到别处，系统
+        // 压根不会发 WM_RBUTTONUP，用户什么都没做就什么都不发生。
+        // 视频播放器上右键几乎总是「要个菜单」，不需要按下即弹。
+        WM_RBUTTONUP => {
+            emit("rbutton");
             LRESULT(0)
         }
         // 拖到画面上的文件：原样转交主窗口，由它负责 DragFinish 与打开文件。

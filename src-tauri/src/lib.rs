@@ -17,6 +17,7 @@ pub mod crashlog;
 pub mod diag;
 pub mod gpu;
 pub mod lang;
+pub mod menu;
 pub mod mpv;
 pub mod settings;
 mod surface;
