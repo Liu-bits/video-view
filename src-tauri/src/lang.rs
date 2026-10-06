@@ -284,6 +284,12 @@ pub struct Strings {
     pub menu_diag: &'static str,
     pub menu_help: &'static str,
     pub menu_copy_report: &'static str,
+    /// 字幕子菜单里的「编码」子菜单标题
+    pub menu_sub_coding: &'static str,
+    /// 字幕子菜单里的「大小」子菜单标题
+    pub menu_sub_scale: &'static str,
+    /// 编码列表里 `auto` 那项的标签。其余编码名（GBK / Big5 / …）是专有名词，不译。
+    pub sub_encoding_auto: &'static str,
     // ---- 快捷键总览 ----
     pub help_play_pause: &'static str,
     pub help_seek: &'static str,
@@ -323,6 +329,10 @@ pub struct Strings {
     // ---- 字幕 / 切轨 ----
     /// 切轨失败。mpv 给的原文作为详情一起显示。
     pub err_switch_track: &'static str,
+    /// 改字幕编码（sub-codepage）失败
+    pub err_set_sub_coding: &'static str,
+    /// 改字幕大小（sub-scale）失败
+    pub err_set_sub_scale: &'static str,
     pub err_add_subtitle: &'static str,
     /// 没有媒体可挂时给用户的提示（挂字幕需要一个正在播的视频）
     pub err_no_media_for_sub: &'static str,
@@ -413,6 +423,8 @@ impl Strings {
             track_none: "No audio or subtitle tracks in this file.",
             track_hint: "Enter selects · Esc closes · drag a .srt to add subtitles",
             err_switch_track: "Could not switch track",
+            err_set_sub_coding: "Could not change the subtitle encoding",
+            err_set_sub_scale: "Could not change the subtitle size",
             err_add_subtitle: "Could not load the subtitle file",
             err_no_media_for_sub: "Open a video first, then add the subtitle to it.",
             menu_open: "Open file...",
@@ -437,6 +449,9 @@ impl Strings {
             menu_diag: "Decode diagnostics",
             menu_help: "Keyboard shortcuts",
             menu_copy_report: "Copy diagnostics report",
+            menu_sub_coding: "Text encoding (external subtitles)",
+            menu_sub_scale: "Subtitle size",
+            sub_encoding_auto: "Auto",
             info_subtitle_added: "Subtitle loaded.",
         }
     }
@@ -515,6 +530,8 @@ impl Strings {
             track_none: "这个文件没有可选的音轨或字幕轨。",
             track_hint: "回车选中 · Esc 关闭 · 拖入 .srt 可外挂字幕",
             err_switch_track: "切轨失败",
+            err_set_sub_coding: "改字幕编码失败",
+            err_set_sub_scale: "改字幕大小失败",
             err_add_subtitle: "外挂字幕加载失败",
             err_no_media_for_sub: "请先打开一个视频，再挂字幕。",
             menu_open: "打开文件...",
@@ -539,6 +556,9 @@ impl Strings {
             menu_diag: "解码诊断",
             menu_help: "快捷键总览",
             menu_copy_report: "复制诊断报告",
+            menu_sub_coding: "字幕编码（外挂字幕）",
+            menu_sub_scale: "字幕大小",
+            sub_encoding_auto: "自动",
             info_subtitle_added: "字幕已加载。",
         }
     }

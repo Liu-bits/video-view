@@ -26,7 +26,7 @@ use crate::gpu;
 use crate::lang;
 use crate::settings::{self, Settings};
 use crate::track::{
-    build_rows, cursor_for, group_list, group_of_row, row_id, step_index, RowId, TrackKind,
+    build_rows, cursor_for, group_list, group_of_row, pick_next_track, row_id, RowId, TrackKind,
     TrackRow, TrackSet,
 };
 use windows::core::PCWSTR;
@@ -160,6 +160,12 @@ struct UiState {
     idle: bool,
     /// 当前倍速（`speed` 属性）。0.3.0 没有这个状态，0.4.0 加 `[` `]` 时引入。
     speed: f64,
+    /// 当前字幕编码（mpv 的 `sub-codepage`）。右键菜单要拿它给编码项打勾。
+    ///
+    /// 空串 = 读不到（理论上不会发生，见 `refresh_sub_settings`）。
+    sub_codepage: String,
+    /// 当前字幕大小（mpv 的 `sub-scale`）。
+    sub_scale: f64,
 }
 
 impl Default for UiState {
@@ -175,6 +181,8 @@ impl Default for UiState {
             has_file: false,
             idle: true,
             speed: 1.0,
+            sub_codepage: String::new(),
+            sub_scale: 1.0,
         }
     }
 }
@@ -743,6 +751,10 @@ impl App {
     ///
     /// 「只有一条轨」是正常结果（按了等于没按），所以**不报错**，
     /// 菜单里的 ● 也不动。
+    ///
+    /// 选哪一条交给 `track::pick_next_track`（纯函数）。这里只负责写
+    /// mpv 属性和刷新界面 —— 决策逻辑留在纯函数里，集成测试能直接驱动
+    /// 真 libmpv 验它，见 `tests/track_list.rs`。
     fn cycle_track(&mut self, kind: TrackKind, step: isize) {
         // 没有媒体时 `tracks` 是空的，而 mpv 侧的 `aid` / `sid` 也没有可写的
         // 值 —— 直接返回，不要去写一个必然失败的属性然后弹「切轨失败」。
@@ -755,42 +767,9 @@ impl App {
             TrackKind::Sub => (&self.tracks.sub, "sid"),
             TrackKind::Video => return,
         };
-        // 字幕一条都没选中时，`J` / `L` **打开**字幕而不是什么都不做。
-        //
-        // 不这样的话，用户在菜单里选了「关闭」之后 `J` / `L` 就永久失灵了
-        // ——「关掉字幕之后快捷键就废了」是很容易被当成 bug 报回来的行为。
-        // 打开时挑 `default` 的那条（文件自己声明的那条），没有就挑第一条。
-        let current = list.iter().find(|t| t.selected);
-        let Some(current) = current else {
-            if kind == TrackKind::Sub {
-                let pick = list.iter().find(|t| t.default).or_else(|| list.first());
-                if let Some(t) = pick {
-                    let id = t.id;
-                    if let Some(p) = self.player.as_ref() {
-                        if let Err(e) = p.select_track(prop, id) {
-                            self.report_error(self.strings.err_switch_track, &e);
-                            return;
-                        }
-                    }
-                    self.after_track_switch(kind, id);
-                }
-            }
+        let Some(next) = pick_next_track(list, kind, step) else {
             return;
         };
-        let n = list.len();
-        let Some(pos) = list.iter().position(|t| t.id == current.id) else {
-            return;
-        };
-        let Some(next_idx) = step_index(n, pos, step) else {
-            return;
-        };
-        let Some(next) = list.get(next_idx) else {
-            return;
-        };
-        // 就一条、且正在用它 —— 按了等于没按，早点回来
-        if next.id == current.id {
-            return;
-        }
         let id = next.id;
         if let Some(p) = self.player.as_ref() {
             if let Err(e) = p.select_track(prop, id) {
@@ -818,6 +797,88 @@ impl App {
             self.relayout();
         }
         self.invalidate_all();
+    }
+
+    // ---------------------------------------------------------------- 字幕编码 / 大小
+
+    /// 弹菜单之前读一次 mpv 侧的字幕编码与大小。
+    ///
+    /// 这两个属性**不进观察表** —— mpv 的属性观察是全局回调，每多一个就
+    /// 多一份「每次变更都要跨一次 FFI + 建一棵 `MpvValue`」的成本，而它们
+    /// 除了给菜单打勾之外没有任何界面消费者。右键菜单是唯一读它们的地方，
+    /// 在那里读一次既最新又便宜。
+    ///
+    /// `sub-codepage` 是 `String` 属性，`get_property_string` 拿回来的是
+    /// 原文（`auto` / `gbk` / …），正好可以和 `menu::CODINGS` 逐字比对。
+    /// 读不到时留空 —— 那样菜单里**一项都不打勾**，比猜一个「大概是 auto」
+    /// 打勾诚实（见 `Snapshot::sub_codepage`）。
+    fn refresh_sub_settings(&mut self) {
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        if let Ok(v) = p.get_property_string("sub-codepage") {
+            self.state.sub_codepage = v;
+        }
+        // `sub-scale` 是 double 属性，但 `get_property_string` 对它照样能用
+        // —— mpv 那边按 `MPV_FORMAT_STRING` 导出，得到 `"1.250000"`。
+        // 解析失败就保持原值：宁可打勾打在一个略微偏旧的档位上，
+        // 也不要显示一个明显不对的数。
+        if let Ok(v) = p.get_property_string("sub-scale") {
+            if let Ok(f) = v.trim().parse::<f64>() {
+                self.state.sub_scale = f;
+            }
+        }
+    }
+
+    /// 换字幕编码（`sub-codepage`）。
+    ///
+    /// ## 必须补一条 `sub-reload`
+    ///
+    /// `sub-codepage` 是**读文件时**才用上的。改它不会回头重新读已经加载
+    /// 进来的字幕，于是用户看到的是「编码换了、字幕还是乱的」。
+    /// `sub-reload` 让 mpv 重新读一遍当前字幕。
+    ///
+    /// 不重载只换编码这个坑值得写下来：它是**看起来完全实现了**的功能
+    /// （菜单项会打勾、`sub-codepage` 确实变了），只有真的拿一个 GBK 的
+    /// `.srt` 去试才会发现字幕纹丝不动。
+    fn set_sub_codepage(&mut self, code: &str) {
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        if let Err(e) = p.set_string_property("sub-codepage", code) {
+            self.report_error(self.strings.err_set_sub_coding, &e);
+            return;
+        }
+        self.state.sub_codepage = code.to_string();
+        // `sub-reload` 失败不算错：没有字幕可重载时它本来就会失败，
+        // 而用户此时的期望是「设置成功」，不是「报一个错」。
+        let _ = p.run_command(&["sub-reload"]);
+    }
+
+    /// 换字幕大小（`sub-scale`）。
+    ///
+    /// **不**需要 `sub-reload`：`sub-scale` 是渲染参数，libass 下一帧就用
+    /// 新值重排，与已加载的文本无关 —— 和 `sub-codepage` 正相反。
+    fn set_sub_scale(&mut self, value: f64) {
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        // 夹到 mpv 声明的范围内。超出时 `set_property` 报
+        // `unsupported format for accessing property`（连「这是不是一个
+        // 数字」那关都过不去）。菜单里的六个档位都在范围内，这里仍然
+        // 夹一道：定义表以后若加了一个离谱的值，夹住总比弹错误框好。
+        //
+        // 范围取 **`option-info/sub-scale` 报出来的值**（实测这份 libmpv
+        // 0.41 是 `"min":0.000000,"max":100.000000`），**不是** mpv 手册里
+        // 写的 0.1..10 —— 两者对不上，写 `0.05` 和 `20` 实测都收。
+        // 一开始照手册写 `clamp(0.1, 10.0)`，等于把 mpv 明明允许的
+        // 20% 和 5% 挡在门外。
+        let v = value.clamp(0.0, 100.0);
+        if let Err(e) = p.set_string_property("sub-scale", &format!("{v}")) {
+            self.report_error(self.strings.err_set_sub_scale, &e);
+            return;
+        }
+        self.state.sub_scale = v;
     }
 
     /// 把一个外挂字幕文件加载进来（拖放 / 文件对话框）。
@@ -2368,6 +2429,10 @@ fn show_context_menu(app_ptr: *mut App) {
     // 在 `WM_NCCREATE` 之后一直有效。借用**不跨** `TrackPopupMenuEx`：
     // 下面造菜单时只读，命令执行时重新取。
     let app = unsafe { &mut *app_ptr };
+    // 字幕编码 / 大小是**按需读**的，不进事件观察表 —— mpv 的属性观察是
+    // 全局回调，每多一个就多一份每帧可能发生的转换，而这两个值除了菜单
+    // 打勾之外没人要。弹菜单之前读一次就够。
+    app.refresh_sub_settings();
 
     // `GetMessagePos` 返回打包的两个 16 位**有符号**坐标（LOWORD = x，
     // HIWORD = y），没有 POINT 版本可用。拆出来之后要各自过一遍 `i16` ——
@@ -2387,6 +2452,8 @@ fn show_context_menu(app_ptr: *mut App) {
             theatre: app.theatre,
             fullscreen: app.fullscreen,
             diag_open: app.panel == PanelMode::Stats,
+            sub_codepage: &app.state.sub_codepage,
+            sub_scale: app.state.sub_scale,
             tracks: &app.tracks,
         };
         menu::show(app.hwnd, sx, sy, &app.strings, snap)
@@ -2409,13 +2476,31 @@ fn show_context_menu(app_ptr: *mut App) {
 /// `app_ptr` 必须是有效的 `App` 指针。
 unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
     use menu::id;
-    // 动态轨道项：先认出来，再决定是哪一组。
-    //
-    // 必须**先**判 `>= TRACK_BASE`：固定项的 ID 都在它下面，反过来
-    // 会把固定项当成轨道项。
-    if cmd >= menu::TRACK_BASE {
-        pick_track_from_menu(&mut *app_ptr, cmd - menu::TRACK_BASE);
-        return;
+    // 先落到「哪一段」。ID 分段之后这里不需要任何启发式判断 ——
+    // 音轨、字幕轨、编码、大小各占一段，收到哪段就是哪段。
+    match menu::decode(cmd) {
+        menu::Decoded::AudioTrack(n) => {
+            pick_track_from_menu(&mut *app_ptr, TrackKind::Audio, n);
+            return;
+        }
+        menu::Decoded::SubTrack(n) => {
+            pick_track_from_menu(&mut *app_ptr, TrackKind::Sub, n);
+            return;
+        }
+        menu::Decoded::SubCoding(code) => {
+            (&mut *app_ptr).set_sub_codepage(code);
+            return;
+        }
+        menu::Decoded::SubScale(v) => {
+            (&mut *app_ptr).set_sub_scale(v);
+            return;
+        }
+        // 占位项（`NO_TRACK_ID`）和任何越界值。不当错误处理：菜单里那个
+        // 灰掉的「（这个文件没有音轨）」就是占位项，弹错误框既没帮助
+        // 又会打断操作。
+        menu::Decoded::Unknown => return,
+        // 固定项：ID 原样就是 `id::*` 里的常量，交给下面的 `match`。
+        menu::Decoded::Fixed(_) => {}
     }
     let app = &mut *app_ptr;
     match cmd {
@@ -2464,53 +2549,36 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
             app.set_panel(target);
         }
         id::COPY_REPORT => app.copy_report(),
-        // 未知 / 占位 ID：什么都不做。
-        //
-        // 不报错是刻意的 —— 菜单里那个灰掉的「（这个文件没有音轨）」就是
-        // 占位项。传进来一个我们不认的值时弹错误框既没帮助又会打断操作。
         _ => {}
     }
 }
 
-/// 菜单里选了第 `n` 条轨道。
+/// 菜单里选了第 `n` 条同类轨道。
 ///
-/// 音轨和字幕轨的菜单项**共用** `TRACK_BASE + n` 这一段 ID —— 父菜单项
-/// 不返回命令 ID（`MF_POPUP` 的项只是展开子菜单），所以没有子菜单的
-/// 上下文可查，只能靠「当前有没有字幕轨」来判断 `n` 是哪一组的下标。
-///
-/// 这个歧义是设计上的妥协：`n` 在音频组和字幕组里各自独立编号，两组都
-/// 可能各有第 3 条。判断依据是**有字幕轨时优先当字幕** —— 一次最多同时
-/// 用一条音轨和一条字幕轨，两者都存在时用户更常在调字幕。选错了最多是
-/// 「切到了另一组的第 n 条」，而且菜单立刻重画、`●` 会跳到真正生效的那条，
-/// 用户能看出来。
-fn pick_track_from_menu(app: &mut App, n: u16) {
-    let n = n as usize;
-    // 先字幕后音频（理由见上面的注释）
-    if let Some(t) = app.tracks.sub.get(n) {
-        let id = t.id;
-        if let Some(p) = app.player.as_ref() {
-            if let Err(e) = p.select_track("sid", id) {
-                app.report_error(app.strings.err_switch_track, &e);
-                return;
-            }
-        }
-        app.after_track_switch(TrackKind::Sub, id);
+/// `kind` 是从 **ID 段**来的，不是猜的（见 `menu::decode` 的说明）。
+/// 之前音轨与字幕轨共用 `TRACK_BASE + n`，接收方只能靠「当前有没有字幕轨」
+/// 判断 `n` 属于哪一组，两组都各有第 3 条时就会切错。
+fn pick_track_from_menu(app: &mut App, kind: TrackKind, n: usize) {
+    let Some(prop) = kind.property() else { return };
+    let list = match kind {
+        TrackKind::Audio => &app.tracks.audio,
+        TrackKind::Sub => &app.tracks.sub,
+        TrackKind::Video => return,
+    };
+    // 下标越界就是菜单和状态对不上（理论上不可能，因为两者同一次快照），
+    // 安静返回，别弹错误框。
+    let Some(id) = list.get(n).map(|t| t.id) else {
         return;
-    }
-    if let Some(t) = app.tracks.audio.get(n) {
-        let id = t.id;
-        if let Some(p) = app.player.as_ref() {
-            if let Err(e) = p.select_track("aid", id) {
-                app.report_error(app.strings.err_switch_track, &e);
-                return;
-            }
+    };
+    if let Some(p) = app.player.as_ref() {
+        if let Err(e) = p.select_track(prop, id) {
+            app.report_error(app.strings.err_switch_track, &e);
+            return;
         }
-        app.after_track_switch(TrackKind::Audio, id);
     }
+    app.after_track_switch(kind, id);
 }
 
-/// 模态提示框。release 下没有控制台，这是唯一的反馈通道。
-///
 /// `detail` 为空时不加空行——信息类提示（「已复制」）只有一个短句，
 /// 后面挂两行空白很奇怪。
 fn message_box(owner: HWND, caption: &str, detail: &str, icon: MESSAGEBOX_STYLE) {

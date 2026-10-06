@@ -19,8 +19,24 @@
 //!
 //! 手写常量，不用资源 ID：菜单是运行时拼出来的，没有资源表可查，
 //! 自己编号最容易读，也最容易看出哪段空着。
-//! `1..=999` 给固定项，`1000` 起给动态生成的轨道项 —— 固定项必须全小于
-//! `TRACK_BASE`，`固定命令id互不重复` 那条测试盯着这条不变量。
+//!
+//! 分段，每段一个用途，互不重叠：
+//!
+//! | 段 | 用途 |
+//! |---|---|
+//! | `1..=99` | 固定项（`id::*`） |
+//! | `1000..=1999` | 音轨项 |
+//! | `2000..=2999` | 字幕轨项 |
+//! | `3000..=3099` | 字幕编码项 |
+//! | `3100..=3199` | 字幕大小项 |
+//!
+//! **音轨和字幕轨曾经共用 `1000 + n` 一段**，靠「当前有没有字幕轨」来判断
+//! `n` 是哪一组的下标。那是个真实的歧义：两组的第 3 条是两条不同的轨，
+//! 猜错就是「切到了另一组的第 3 条」。现在两组各占一段，接收方一眼就能
+//! 知道是哪一组，不需要任何启发式判断。
+//!
+//! 代价是段变多了，所以 `固定命令id互不重复` 那条测试之外，
+//! `decode` 会先把 ID 落到段、再落到段内下标，两层都不越界才算过。
 //!
 //! ## 坐标
 //!
@@ -49,14 +65,47 @@ use crate::track::{describe, TrackSet};
 /// 菜单项被选中时返回的命令 ID。
 pub type Command = u16;
 
-/// 动态轨道项的起始 ID。见模块说明里关于编号的那段。
-pub const TRACK_BASE: u16 = 1000;
+/// 动态项各段的起始 ID。见模块说明里关于编号的那张表。
+///
+/// 每一段留 1000 个位置：轨道多的 MKV（各语种音轨 + 完整字幕组）轻松上到
+/// 三四十条，而**最多能画多少行**不归这里管 —— 面板那边按实际行数排版、
+/// 高度不够时截断（见 `app::panel_drawn_rows`）。所以给到 1000 已经很宽松，
+/// 真撞上了 `decode` 会返回 `None` 而不是悄悄切错轨。
+pub mod base {
+    /// 音轨项
+    pub const AUDIO: u16 = 1000;
+    /// 字幕轨项
+    pub const SUB: u16 = 2000;
+    /// 字幕编码项（`sub-codepage`）
+    pub const CODING: u16 = 3000;
+    /// 字幕大小项（`sub-scale`）
+    pub const SCALE: u16 = 3100;
+}
+
+/// 每段的长度（能放多少个项）。
+///
+/// **显式逐段列出来，而不是一个统一的段长。** 曾经给所有段同一个
+/// `SEG_LEN = 1000`，结果 `CODING`(3000) + 1000 越过了 `SCALE`(3100)：
+/// 大小子菜单的第 0 项解出来是「字幕轨第 0 条」，点一下会去切字幕轨。
+/// 那不是理论问题 —— 写完 `decode` 的第一版单测立刻就红了。
+///
+/// 音轨 / 字幕轨给 1000 是因为条目数运行期才知道（各语种音轨 + 完整字幕组
+/// 的 MKV 上三四十条很常见），而**能画多少行**不归这里管 —— 面板那边按
+/// 实际行数排版、高度不够时截断（见 `app::panel_drawn_rows`）。
+/// 编码 / 大小的条目数是编译期常量（`CODINGS.len()` / `SCALES.len()`），
+/// 各留 40 就够，剩下的空位靠「越界解成 `Unknown`」兜住。
+pub const SEGMENTS: &[(u16, u16)] = &[
+    (base::AUDIO, 1000),
+    (base::SUB, 1000),
+    (base::CODING, 40),
+    (base::SCALE, 40),
+];
 
 /// 「没有轨道」时的占位项 ID。
 ///
 /// 用 `0xffff` 而不是 0：0 在 Win32 菜单里有特殊含义（`AppendMenuW` 的
 /// `MF_STRING` + `uidNewItem = 0` 会被当成「按位置插入」），而且它和
-/// `TRACK_BASE` 起的动态段不冲突。
+/// 各动态段都不冲突。
 const NO_TRACK_ID: u16 = 0xffff;
 
 /// 固定命令项的 ID。
@@ -88,6 +137,117 @@ pub mod id {
     pub const COPY_REPORT: u16 = 54;
 }
 
+/// 菜单里可选的字幕编码，映射到 mpv 的 `sub-codepage`。
+///
+/// ## 这个列表是查出来的，不是拍脑袋列的
+///
+/// mpv **没有** `sub-encoding` 这个属性 —— 名字是 `sub-codepage`，
+/// 而且它是自由 String（`option-info/sub-codepage` 的 `type` 就是 `String`、
+/// `default-value` 是 `auto`），任何字符串都写得进去、写错了也不报错，
+/// 只在真正解码字幕时才炸。所以这张表的每个值都得是有依据的：
+///
+/// - `auto` = mpv 的默认值，让 uchardet 去猜
+/// - `gbk` / `gb18030` / `big5` = 简体中文与繁体中文的老字幕（GB2312 已被
+///   GBK 完全覆盖，不再单列）
+/// - `shift-jis` / `euc-kr` = 日文与韩文的老字幕
+/// - `latin-1` = 西欧那一票（这条是**兜底**，不是常用）
+///
+/// 标签照抄编码名，因为那些本来就是专有名词（GBK / Big5 / Shift-JIS /
+/// EUC-KR / Latin-1），翻译成中文反而对不上 mpv 文档和 iconv 的名字。
+/// 只有 `auto` 需要一个译名，走 `lang::Strings::sub_encoding_auto`。
+///
+/// ## 一个必须知道的坑：mpv 先猜 UTF-8
+///
+/// 按 mpv 手册，判定顺序是「`+codepage` 强制 → 数据像 UTF-8 就当 UTF-8 →
+/// 指定的 codepage → uchardet 猜 → UTF-8-BROKEN」。也就是说
+/// **把编码选成 GBK，对一个本来就长得像 UTF-8 的文件不起作用**。
+/// 老字幕文件一般有 UTF-8 之外的字节，会落到第三步，所以实践中够用；
+/// 真要连 UTF-8 也强行按 GBK 解，mpv 的写法是 `--sub-codepage=+gbk`，
+/// 本菜单**故意不给**这个选项 —— 那会把 UTF-8 字幕整个变成乱码，
+/// 而用户没有「我确定这个文件就是 GBK」的知识去做这种选择。
+///
+/// ## 只对文本字幕文件有效
+///
+/// 手册明确：「in particular subtitles in mkv files are always assumed to be
+/// UTF-8」。内嵌字幕（mov_text / MKV SRT）由解封装器转成 UTF-8，
+/// 这个选项对它们没有作用。所以菜单项的文案里带了「外挂字幕」。
+pub const CODINGS: &[&str] = &[
+    "auto",
+    "gbk",
+    "gb18030",
+    "big5",
+    "shift-jis",
+    "euc-kr",
+    "latin-1",
+];
+
+/// 菜单里可选的字幕大小，映射到 mpv 的 `sub-scale`。
+///
+/// mpv 的取值范围是 `0.1..10`，这里只给六个常用档。做成**档位**而不是
+/// 自由输入框是因为菜单本来就没有输入框，而「多大」这个问题绝大多数人
+/// 只会在几个档之间挑。
+///
+/// 50% 不是给「字幕太大了」用的（那种情况用户会想要更小），是给小字号
+/// 字幕在 4K 上铺满全屏时用的。
+pub const SCALES: &[f64] = &[0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+/// 菜单命令落到哪一段。
+///
+/// 有了分段之后，接收方**不需要**再猜「这个 ID 是音轨还是字幕轨」。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decoded {
+    /// 固定项，值就是 `id::*` 里的常量
+    Fixed(u16),
+    /// 第 `n` 条音轨
+    AudioTrack(usize),
+    /// 第 `n` 条字幕轨
+    SubTrack(usize),
+    /// 把 `sub-codepage` 设成这个值
+    SubCoding(&'static str),
+    /// 把 `sub-scale` 设成这个值
+    SubScale(f64),
+    /// 占位项或不该出现的东西。不当错误处理。
+    Unknown,
+}
+
+/// 把菜单返回的命令 ID 翻译成「哪个段里的第几项」。
+///
+/// 两层都越界就返回 `Unknown` 而不是 `unwrap`：ID 来自 Win32，理论上只有
+/// 我们自己写进去的值会回来，但越界能测出来比崩在用户脸上好。
+pub fn decode(cmd: Command) -> Decoded {
+    // 占位项先拦掉：它是 `u16::MAX`，本来也落不进任何段（各段最远到 3140），
+    // 但明确写出来比「碰巧落不进」好 —— 万一以后有人加段加到 65000，
+    // 这里就是唯一拦住它的地方。
+    if cmd == NO_TRACK_ID {
+        return Decoded::Unknown;
+    }
+    for (start, len) in SEGMENTS {
+        let Some(off) = cmd.checked_sub(*start) else {
+            continue;
+        };
+        if off >= *len {
+            continue;
+        }
+        let n = off as usize;
+        return match *start {
+            base::AUDIO => Decoded::AudioTrack(n),
+            base::SUB => Decoded::SubTrack(n),
+            base::CODING => match CODINGS.get(n) {
+                Some(v) => Decoded::SubCoding(v),
+                None => Decoded::Unknown,
+            },
+            base::SCALE => match SCALES.get(n) {
+                Some(v) => Decoded::SubScale(*v),
+                None => Decoded::Unknown,
+            },
+            // `SEGMENTS` 里出现了一个上面没处理的新起点。加段的人忘了在
+            // 这里加分支 —— 宁可当未知，也不要把别的段的语义套上去。
+            _ => Decoded::Unknown,
+        };
+    }
+    Decoded::Fixed(cmd)
+}
+
 /// 构造菜单需要的应用状态。
 ///
 /// 持**借用**而不是克隆：`TrackSet` 里有 `String`，克隆一份是几十次堆分配，
@@ -115,6 +275,14 @@ pub struct Snapshot<'a> {
     pub fullscreen: bool,
     /// 诊断面板开着吗 —— 用它给菜单项打勾
     pub diag_open: bool,
+    /// 当前的 `sub-codepage`。用来给编码子菜单打勾。
+    ///
+    /// 空串（mpv 那边读不到）会让**没有任何一项被打勾** —— 与其猜一个
+    /// 「大概是 auto」去打勾，不如都不勾：用户看到的是一个正常的、
+    /// 暂时没选中任何项的单选组，而不是一个错误的勾。
+    pub sub_codepage: &'a str,
+    /// 当前的 `sub-scale`。用来给大小子菜单打勾。
+    pub sub_scale: f64,
     pub tracks: &'a TrackSet,
 }
 
@@ -243,7 +411,7 @@ fn build_audio(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
             enable(sub, NO_TRACK_ID, false);
         } else {
             for (n, t) in snap.tracks.audio.iter().enumerate() {
-                append(sub, TRACK_BASE + n as u16, &describe(t, s), t.selected);
+                append(sub, base::AUDIO + n as u16, &describe(t, s), t.selected);
             }
         }
         // 可用条件是「有媒体**且**有轨」，两个都要。
@@ -256,7 +424,19 @@ fn build_audio(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
     }
 }
 
-/// 字幕子菜单。第一项恒是「关闭字幕」。
+/// 字幕子菜单。第一项恒是「关闭字幕」，末尾是两个嵌套子菜单。
+///
+/// ## 编码与大小为什么塞进字幕子菜单，而不是主菜单再开两项
+///
+/// 它们是**只对字幕生效**的设置（mpv 的 `sub-codepage` / `sub-scale`），
+/// 而主菜单已经 24 项了。塞进来的好处是：会为了「字幕乱码」去翻字幕菜单的
+/// 人，和会为了「字幕太大」去翻字幕菜单的**是同一批** —— 用户对「字幕的
+/// 事情在字幕菜单里找」这个心智模型本来就成立。代价是三层深，但 Windows
+/// 上这就是 `设置 ▸ 字幕` 的样子，不是缺陷。
+///
+/// 代价是**没有字幕轨时这两个子菜单也跟着置灰**。这是可接受的：没有字幕轨
+/// 时既没有乱码可修、也没有大小要调；而用户拖一个 `.srt` 进来之后轨就
+/// 出现了，菜单立刻可用。
 fn build_sub(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
     // SAFETY: 同 `build_audio`。
     unsafe {
@@ -274,12 +454,63 @@ fn build_sub(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
             );
             separator(sub);
             for (n, t) in snap.tracks.sub.iter().enumerate() {
-                append(sub, TRACK_BASE + n as u16, &describe(t, s), t.selected);
+                append(sub, base::SUB + n as u16, &describe(t, s), t.selected);
             }
+            separator(sub);
+            append_coding_sub(sub, s, snap);
+            append_scale_sub(sub, s, snap);
         }
         // 字幕那个多一个条件：**关字幕**在没有字幕轨时也没意义
         // （本来就没字幕在放，关不掉什么）。
         append_sub(menu, s.menu_sub, sub, snap.loaded && !empty);
+    }
+}
+
+/// 「编码」子菜单，挂在字幕子菜单末尾。
+fn append_coding_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
+    // SAFETY: 只调 Win32 菜单 API。
+    unsafe {
+        let Ok(sub) = CreatePopupMenu() else { return };
+        for (n, &code) in CODINGS.iter().enumerate() {
+            append(
+                sub,
+                base::CODING + n as u16,
+                coding_label(code, s),
+                code == snap.sub_codepage,
+            );
+        }
+        append_sub(parent, s.menu_sub_coding, sub, true);
+    }
+}
+
+/// 「大小」子菜单，挂在字幕子菜单末尾。
+fn append_scale_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
+    // SAFETY: 同 `append_coding_sub`。
+    unsafe {
+        let Ok(sub) = CreatePopupMenu() else { return };
+        for (n, &v) in SCALES.iter().enumerate() {
+            // 标签是「125%」这种纯数字 + 百分号，任何语言都一样，
+            // 所以不进 `lang::Strings`（那里全是「一条文案一个键」，
+            // 塞一个每次现算的字符串进去会让那个约定失效）。
+            append(
+                sub,
+                base::SCALE + n as u16,
+                &format!("{:.0}%", v * 100.0),
+                (v - snap.sub_scale).abs() < 1e-6,
+            );
+        }
+        append_sub(parent, s.menu_sub_scale, sub, true);
+    }
+}
+
+/// 编码项的标签。只有 `auto` 需要翻译，其余照抄编码名。
+fn coding_label(code: &'static str, s: &lang::Strings) -> &'static str {
+    if code == "auto" {
+        s.sub_encoding_auto
+    } else {
+        // `CODINGS` 是 `&[&'static str]` 的字面量表，所以这里拿到的确实是
+        // `'static`，可以直接返回而不分配。
+        code
     }
 }
 
@@ -431,16 +662,19 @@ mod tests {
     }
 
     fn find(m: HMENU, want: &str) -> u32 {
-        (0..count(m) as u32)
-            .find(|i| label(m, *i).as_deref() == Some(want))
-            .unwrap_or_else(|| {
-                panic!(
-                    "菜单里找不到 {want:?}；现有：{:?}",
-                    (0..count(m) as u32)
-                        .map(|i| label(m, i))
-                        .collect::<Vec<_>>()
-                )
-            })
+        find_opt(m, want).unwrap_or_else(|| {
+            panic!(
+                "菜单里找不到 {want:?}；现有：{:?}",
+                (0..count(m) as u32)
+                    .map(|i| label(m, i))
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// 找不到时返回 `None` 而不是 panic —— 用来断言「某一项**不**在菜单里」。
+    fn find_opt(m: HMENU, want: &str) -> Option<u32> {
+        (0..count(m) as u32).find(|i| label(m, *i).as_deref() == Some(want))
     }
 
     fn audio(id: i64, selected: bool) -> Track {
@@ -485,6 +719,13 @@ mod tests {
     };
 
     fn snap(tracks: &TrackSet) -> Snapshot<'_> {
+        snap_full(tracks, "auto", 1.0)
+    }
+
+    /// 能指定字幕编码 / 大小的快照，测那两个子菜单的打勾用。
+    fn snap_full<'a>(tracks: &'a TrackSet, codepage: &'static str, scale: f64) -> Snapshot<'a> {
+        // `'a` 只借 `tracks`；`codepage` 是 `&'static str`（测试里传的全是
+        // 字面量），所以不用跟着 `'a` 走。
         Snapshot {
             loaded: true,
             paused: false,
@@ -492,8 +733,104 @@ mod tests {
             theatre: false,
             fullscreen: false,
             diag_open: false,
+            sub_codepage: codepage,
+            sub_scale: scale,
             tracks,
         }
+    }
+
+    #[test]
+    fn 音轨与字幕轨的命令不再共用同一段() {
+        // 这条守着 0.6.1 修掉的那个设计瑕疵：以前两组都从 `TRACK_BASE + n`
+        // 起，接收方只能靠「当前有没有字幕轨」猜 `n` 是哪一组的下标，
+        // 而两组都各有第 3 条时猜错就是「切到了另一组的第 3 条」。
+        assert_ne!(base::AUDIO, base::SUB, "音轨与字幕轨必须各占一段");
+        // 两段的内容对调也必须解出不同类型
+        assert_ne!(decode(base::SUB), decode(base::AUDIO));
+        assert_eq!(decode(base::AUDIO), Decoded::AudioTrack(0));
+        assert_eq!(decode(base::SUB), Decoded::SubTrack(0));
+        assert_eq!(decode(base::AUDIO + 7), Decoded::AudioTrack(7));
+        assert_eq!(decode(base::SUB + 7), Decoded::SubTrack(7));
+    }
+
+    #[test]
+    fn 固定命令解码回自己() {
+        assert_eq!(decode(id::OPEN), Decoded::Fixed(id::OPEN));
+        assert_eq!(decode(id::FULLSCREEN), Decoded::Fixed(id::FULLSCREEN));
+        assert_eq!(decode(id::COPY_REPORT), Decoded::Fixed(id::COPY_REPORT));
+    }
+
+    #[test]
+    fn 占位项解成未知而不是当成某条轨() {
+        assert_eq!(decode(NO_TRACK_ID), Decoded::Unknown);
+    }
+
+    #[test]
+    fn 段内下标越界解成未知() {
+        // ID 来自 Win32，理论上只有我们自己写进去的会回来。但越界能测出来
+        // 好过在用户脸上 panic —— 而 `n` 越界恰好是「菜单和状态不同步」时
+        // 最可能发生的情况（切轨之后菜单还没重画又弹了一次）。
+        for (start, len) in SEGMENTS {
+            // 段尾之后那个值**可能**正好是下一段的起点（各段首尾相接，
+            // 比如 `AUDIO` 的段尾 2000 就是 `SUB` 的起点），所以不能断言
+            // 它是 `Fixed`。能断言的是：它**不再**被当成原来那一段的项。
+            let start = *start;
+            let out = decode(start + len);
+            assert!(
+                !matches!(
+                    (start, out),
+                    (base::AUDIO, Decoded::AudioTrack(_))
+                        | (base::SUB, Decoded::SubTrack(_))
+                        | (base::CODING, Decoded::SubCoding(_))
+                        | (base::SCALE, Decoded::SubScale(_))
+                ),
+                "段 {start} 越界后的 {out:?} 还被当成了这一段的项"
+            );
+        }
+        // 编码 / 大小段里「在段内但超出表长」的位置必须解成未知。
+        // 这两个表的条数（7 / 6）小于段长（各 40），所以段内确实有空位。
+        assert_eq!(
+            decode(base::CODING + CODINGS.len() as u16),
+            Decoded::Unknown
+        );
+        assert_eq!(decode(base::SCALE + SCALES.len() as u16), Decoded::Unknown);
+        // 段内的合法下标仍然能解出来（防止上面的段长把整段都废了）
+        assert_eq!(decode(base::CODING), Decoded::SubCoding("auto"));
+        assert_eq!(decode(base::SCALE), Decoded::SubScale(0.5));
+    }
+
+    #[test]
+    fn 各段互不重叠() {
+        // 曾经所有段都用同一个 `SEG_LEN = 1000`，于是 `CODING`(3000) 的
+        // 段尾 4000 越过了 `SCALE`(3100)。表现是「大小子菜单的第 0 项
+        // 被解成字幕轨第 0 条」。这条测试就是为了不让它回去。
+        for (i, (a, alen)) in SEGMENTS.iter().enumerate() {
+            for (b, _) in SEGMENTS.iter().skip(i + 1) {
+                assert!(
+                    a + alen <= *b,
+                    "段 {a}（长度 {alen}）越过了段 {b} 的起点，两段重叠"
+                );
+            }
+        }
+        // 编码 / 大小的条目数必须放得进各自的段
+        assert!(CODINGS.len() as u16 <= 40, "编码表比段还长");
+        assert!(SCALES.len() as u16 <= 40, "大小表比段还长");
+        // 而且不能撞上占位 ID。
+        //
+        // 比的是 `SEGMENT_CEILING` 而不是 `NO_TRACK_ID`：后者等于
+        // `u16::MAX`，`x <= u16::MAX` 恒真，clippy 会以
+        // `absurd_extreme_comparisons` 直接拒掉这条测试（而
+        // `x < u16::MAX` 是常量，clippy 同样会以「断言恒真」警告）。
+        // 真要守的是「各段都待在低位区」，4000 是给这个约束一个具体数字，
+        // 而占位 ID 的具体值由 `固定命令id互不重复且都在动态段之前` 守着
+        // 「占位项解码成 Unknown」。
+        const SEGMENT_CEILING: u16 = 4000;
+        assert!(
+            SEGMENTS.iter().all(|(s, l)| s + l <= SEGMENT_CEILING),
+            "有段越过了 {SEGMENT_CEILING}，离占位 ID 太近"
+        );
+        // 顺带确认 `SEGMENT_CEILING` 这个数字本身还站得住
+        assert_eq!(decode(NO_TRACK_ID), Decoded::Unknown);
     }
 
     #[test]
@@ -596,8 +933,8 @@ mod tests {
         assert_eq!(count(sub.0), 2, "两条音轨就该两项");
         assert!(!is_checked(sub.0, 0));
         assert!(is_checked(sub.0, 1), "正在用的那条要打勾");
-        assert_eq!(cmd(sub.0, 0), u32::from(TRACK_BASE));
-        assert_eq!(cmd(sub.0, 1), u32::from(TRACK_BASE) + 1);
+        assert_eq!(cmd(sub.0, 0), u32::from(base::AUDIO));
+        assert_eq!(cmd(sub.0, 1), u32::from(base::AUDIO) + 1);
     }
 
     #[test]
@@ -608,11 +945,137 @@ mod tests {
         let m = owned(&s, snap(&set));
         let pos = find(m.0, s.menu_sub);
         let sub = Owned(sub_handle(m.0, pos));
-        assert_eq!(count(sub.0), 3, "关闭 + 分隔 + 1 条 = 3");
+        // 关闭 + 分隔 + 1 条轨 + 分隔 + 编码子菜单 + 大小子菜单 = 6
+        assert_eq!(count(sub.0), 6, "字幕子菜单的构成变了");
         assert_eq!(cmd(sub.0, 0), id::SUB_OFF as u32);
         // 正在放字幕时「关闭」不该打勾
         assert!(!is_checked(sub.0, 0));
-        assert!(is_checked(sub.0, 2));
+        assert!(is_checked(sub.0, 2), "第 2 项是分隔线，第 3 项才是那条轨");
+    }
+
+    #[test]
+    fn 编码与大小是字幕子菜单里的两个子菜单() {
+        let s = st();
+        let mut set = TrackSet::default();
+        set.sub.push(sub(1, true));
+        let m = owned(&s, snap(&set));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_sub)));
+
+        let cpos = find(sub.0, s.menu_sub_coding);
+        let spos = find(sub.0, s.menu_sub_scale);
+        assert!(!is_grayed(sub.0, cpos), "编码子菜单不该置灰");
+        assert!(!is_grayed(sub.0, spos), "大小子菜单不该置灰");
+
+        let coding = Owned(sub_handle(sub.0, cpos));
+        assert_eq!(
+            count(coding.0),
+            CODINGS.len() as i32,
+            "编码子菜单每种编码一项"
+        );
+        let scale = Owned(sub_handle(sub.0, spos));
+        assert_eq!(
+            count(scale.0),
+            SCALES.len() as i32,
+            "大小子菜单每个档位一项"
+        );
+    }
+
+    #[test]
+    fn 编码子菜单给当前编码打勾() {
+        let s = st();
+        let mut set = TrackSet::default();
+        set.sub.push(sub(1, true));
+        // 当前是 gbk（模拟用户从 GBK 字幕切过来）
+        let m = owned(&s, snap_full(&set, "gbk", 1.0));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_sub)));
+        let coding = Owned(sub_handle(sub.0, find(sub.0, s.menu_sub_coding)));
+        let want = CODINGS
+            .iter()
+            .position(|c| *c == "gbk")
+            .expect("表里有 gbk");
+        let checked: Vec<bool> = (0..count(coding.0) as u32)
+            .map(|i| is_checked(coding.0, i))
+            .collect();
+        assert!(
+            checked[want],
+            "当前编码那项要打勾，实际勾在 {:?}",
+            checked.iter().position(|b| *b)
+        );
+        assert_eq!(
+            checked.iter().filter(|b| **b).count(),
+            1,
+            "这是个单选组，只能有一项打勾"
+        );
+    }
+
+    #[test]
+    fn 大小子菜单给当前大小打勾() {
+        let s = st();
+        let mut set = TrackSet::default();
+        set.sub.push(sub(1, true));
+        let m = owned(&s, snap_full(&set, "auto", 1.25));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_sub)));
+        let scale = Owned(sub_handle(sub.0, find(sub.0, s.menu_sub_scale)));
+        let want = SCALES
+            .iter()
+            .position(|v| (v - 1.25).abs() < 1e-6)
+            .expect("表里有 1.25");
+        assert!(is_checked(scale.0, want as u32));
+        assert_eq!(
+            (0..count(scale.0) as u32)
+                .filter(|i| is_checked(scale.0, *i))
+                .count(),
+            1,
+            "只能有一档打勾"
+        );
+    }
+
+    #[test]
+    fn 读不到当前编码时一项都不打勾() {
+        let s = st();
+        let mut set = TrackSet::default();
+        set.sub.push(sub(1, true));
+        // 空串 = mpv 那边读不到。此时**不猜**，宁可都不勾
+        let m = owned(&s, snap_full(&set, "", 1.0));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_sub)));
+        let coding = Owned(sub_handle(sub.0, find(sub.0, s.menu_sub_coding)));
+        assert!(
+            (0..count(coding.0) as u32).all(|i| !is_checked(coding.0, i)),
+            "读不到时不该瞎勾一项"
+        );
+    }
+
+    #[test]
+    fn 编码与大小子菜单里的每一项都有对应命令且能解码回来() {
+        let s = st();
+        let mut set = TrackSet::default();
+        set.sub.push(sub(1, true));
+        let m = owned(&s, snap(&set));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_sub)));
+
+        let coding = Owned(sub_handle(sub.0, find(sub.0, s.menu_sub_coding)));
+        for (n, _) in CODINGS.iter().enumerate() {
+            let c = cmd(coding.0, n as u32) as u16;
+            assert_eq!(decode(c), Decoded::SubCoding(CODINGS[n]));
+        }
+        let scale = Owned(sub_handle(sub.0, find(sub.0, s.menu_sub_scale)));
+        for (n, v) in SCALES.iter().enumerate() {
+            let c = cmd(scale.0, n as u32) as u16;
+            assert_eq!(decode(c), Decoded::SubScale(*v));
+        }
+    }
+
+    #[test]
+    fn 没有字幕轨时编码与大小跟着一起消失() {
+        let s = st();
+        let m = owned(&s, snap(&EMPTY));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_sub)));
+        assert_eq!(count(sub.0), 1, "没有字幕轨时只有一个占位项");
+        assert!(
+            find_opt(sub.0, s.menu_sub_coding).is_none(),
+            "没有字幕轨就不该出现编码子菜单"
+        );
+        assert!(find_opt(sub.0, s.menu_sub_scale).is_none());
     }
 
     #[test]
@@ -683,12 +1146,12 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), all.len(), "命令 ID 有重复");
         assert!(
-            all.iter().all(|c| *c < TRACK_BASE),
-            "固定命令 ID 必须小于 TRACK_BASE（{TRACK_BASE}）"
+            all.iter().all(|c| *c < base::AUDIO),
+            "固定命令 ID 必须小于动态段起点 base::AUDIO（{}）",
+            base::AUDIO
         );
-        // 占位 ID 是 u16 的最大值。理论上轨道多到 `TRACK_BASE + n` 越过它时
-        // 会撞上 —— 65535 条轨道的片子不存在，不值得为它加检查。真正的护栏
-        // 是「占位项置灰，点它什么都不发生」，那条在
+        // 「不撞上占位 ID」由 `各段互不重叠` 那条统一盯着，这里不重复。
+        // 真正的护栏是「占位项置灰、点它什么都不发生」，那条在
         // `没有轨道时子菜单保留但置灰` 里。
     }
 

@@ -42,7 +42,17 @@ if (-not (Test-Path -LiteralPath $Exe)) {
     throw "找不到 $Exe，先跑 cargo build --release"
 }
 if (-not $Media) {
-    $Media = Join-Path $Root "src-tauri\tests\media\loop60s.mp4"
+    # `loop60s-subs.mp4` 而不是 `loop60s.mp4`：前者是后者的流拷贝加两条
+    # 内嵌字幕轨（`make-test-media.ps1` 造，体积几乎不变），60 秒够长。
+    #
+    # 两个条件都是必需的：
+    #   * **够长**：整轮要 30 秒以上，`multitrack.mp4` 只有 3 秒，播完之后
+    #     mpv 发了 EndFile、本地进入 idle，画面被 `set_video_visible(false)`
+    #     收掉 —— 后半轮 20 项检查会**全部假失败**（实测失败 13 项）。
+    #   * **有字幕轨**：右键菜单里「字幕轨」那一项要是不置灰才能用方向键
+    #     选中（Win32 的 `MF_GRAYED` 项被方向键跳过）。`loop60s.mp4`
+    #     没有字幕轨，那一项是置灰的，右方向键什么都不会发生。
+    $Media = Join-Path $Root "src-tauri\tests\media\loop60s-subs.mp4"
 }
 if (-not (Test-Path -LiteralPath $Media)) {
     throw "找不到测试素材 $Media，跑 scripts/make-test-media.ps1 生成"
@@ -79,6 +89,7 @@ public class VV {
   // 窗口，因为同一时刻系统里只会弹出一个菜单（我们的），不必区分归属。
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowW(string cls, string name);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
   public delegate bool EnumProc(IntPtr h, IntPtr l);
   public struct RECT { public int Left, Top, Right, Bottom; }
@@ -222,6 +233,15 @@ function RightClick($x, $y) {
 # 当前有没有 Win32 弹出菜单开着。返回菜单窗口的 HWND（没有则 0）。
 function Find-PopupMenu {
     [VV]::FindWindowW("#32768", $null)
+}
+
+# 截一块屏幕区域下来，用于「某个东西有没有出现在这块地方」的判断
+function Grab-Region($x, $y, $w, $h) {
+    $b = New-Object System.Drawing.Bitmap $w, $h
+    $g = [System.Drawing.Graphics]::FromImage($b)
+    $g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
+    $g.Dispose()
+    return $b
 }
 
 function PixDiff($a, $b, $x0, $y0, $w, $h, $step) {
@@ -704,9 +724,27 @@ try {
     $ptScreen.X = $rx; $ptScreen.Y = $ry
     [VV]::ClientToScreen($main, [ref]$ptScreen) | Out-Null
 
+    # 后面那条「子菜单有没有弹出来」的检查要往菜单里送方向键，所以
+    # **不能**在这之后按空格 —— Win32 菜单里空格等价于回车（激活当前项），
+    # 会把菜单关掉。（走过这条路：暂停放在了菜单打开之后，22.9% 的像素差异
+    # 稳定地「通过」了三轮，而截图里根本没有菜单。）
+    #
+    # `Force-Foreground` 之后给 600ms：右键是**鼠标消息**，投递给哪个窗口
+    # 取决于那一刻谁在前台。切换前台是异步的，太快发出去会被投递到上一个
+    # 窗口去 —— 实测偶发，表现为 `rightMenuOpens` 单独 FAIL 一次。
+    Start-Sleep -Milliseconds 600
     RightClick $ptScreen.X $ptScreen.Y
     Start-Sleep -Milliseconds 1200
     $menuHwnd = Find-PopupMenu
+    if ($menuHwnd -eq [IntPtr]::Zero) {
+        # 再试一次：先点一下画面把焦点落实，再右键
+        Click $ptScreen.X $ptScreen.Y
+        Start-Sleep -Milliseconds 500
+        RightClick $ptScreen.X $ptScreen.Y
+        Start-Sleep -Milliseconds 1200
+        $menuHwnd = Find-PopupMenu
+        Write-Host ("  right-click retried, menu HWND = {0}" -f $menuHwnd)
+    }
     Add-Result "rightMenuOpens" ($menuHwnd -ne [IntPtr]::Zero) `
         ("右键画面后菜单窗口 HWND = {0}" -f $menuHwnd)
 
@@ -752,11 +790,88 @@ try {
         }
     }
 
-    # 点外面关掉菜单。发 Esc 给**前台窗口**（菜单是前台的），
-    # 不是给主窗口 —— 给主窗口的话菜单不会关，而我们会误判成「Esc 关不掉」。
+    # 「字幕轨 ▸」要能展开，而且里面要有「字幕编码 ▸」和「字幕大小 ▸」
+    #
+    # 判据是 **#32768 窗口的 HWND 变了**：Win32 弹出菜单每一层都是**独立
+    # 的**顶层窗口，所以展开子菜单之后 `FindWindowW("#32768")` 会返回一个
+    # **新的** HWND（实测 12257346 → 8454416，rect 从主菜单挪到子菜单）。
+    # 二值信号，没有歧义。
+    #
+    # ## 三条走过的弯路，留着当记录
+    #
+    # 1. **先试的像素比对**（暂停播放 → 比对菜单右侧区域有没有变化）。
+    #    假通过了一轮：22.9% 的差异，三轮跑出来一模一样。但存下来的截图里
+    #    **根本没有菜单** —— 那 22.9% 是「菜单消失了」给的。像素差异分不清
+    #    「子菜单画上来了」和「菜单整个没了」。
+    # 2. **菜单开着的时候按空格来暂停**。Win32 菜单里空格等价于回车
+    #    （激活当前高亮项），于是菜单被关掉 —— 上面那个假通过的真正原因。
+    #    暂停必须放在**菜单打开之前**。
+    # 3. **`SetForegroundWindow($menuHwnd)` 会把菜单关掉。** 实测返回值是
+    #    `True`，紧接着 `FindWindowW` 就找不到菜单了。菜单处在模态循环里，
+    #    激活别的窗口等于取消它。**不要对菜单窗口调 `SetForegroundWindow`。**
+    #    键盘直接 `keybd_event` 送就行 —— 菜单的模态循环会截获它们。
+    #    （`rightMenuCloses` 那条检查之前也踩了这个，它其实是靠
+    #    `SetForegroundWindow` 关掉菜单的，Esc 有没有起作用根本没验到。）
+    #
+    # 为什么用键盘导航而不是鼠标去点那一项：鼠标得先知道子菜单在屏幕上的
+    # 具体位置，而那个位置随 DPI、窗口尺寸、菜单项文案长度变；键盘只依赖
+    # **顺序**，而顺序是我们自己定的。
+    #
+    # Win32 的**置灰**（`MF_GRAYED`）项**不能被方向键选中**，所以默认素材
+    # 必须带字幕轨 —— 原来那个 `loop60s.mp4` 没有，「字幕轨」是置灰的，
+    # 连按 5 次 ↓ 也高亮不到它。
+    $subNote = "菜单没弹出来"
+    $subOk = $false
     if ($menuHwnd -ne [IntPtr]::Zero) {
-        [VV]::SetForegroundWindow($menuHwnd) | Out-Null
-        Start-Sleep -Milliseconds 200
+        # 5 次方向键下到「字幕轨」：1=打开文件 2=播放/暂停 3=停止 4=音轨 5=字幕轨
+        # （分隔线不算可选项）
+        for ($i = 0; $i -lt 5; $i++) { Send-Key 0x28; Start-Sleep -Milliseconds 150 }
+        Send-Key 0x27
+        Start-Sleep -Milliseconds 900
+        $subHwnd = Find-PopupMenu
+        $subOk = ($subHwnd -ne [IntPtr]::Zero) -and ($subHwnd -ne $menuHwnd)
+        $subNote = ("#32768 HWND {0} -> {1}（变了说明多弹出一层）" -f $menuHwnd, $subHwnd)
+
+        # 把展开后的两块菜单截下来存成产物。
+        #
+        # 这是**唯一**能看出「字幕菜单里那两个子菜单长什么样」的地方 ——
+        # 集成测试只能验 mpv 收不收得下这些值，看不见菜单上画的是什么。
+        if ($subOk) {
+            $sr = Get-Rect $subHwnd
+            $mr2 = Get-Rect $menuHwnd
+            $bx = [Math]::Max(0, [Math]::Min($mr2.Left, $sr.Left))
+            $by = [Math]::Max(0, $mr2.Top)
+            $bw = [Math]::Min([Math]::Max($mr2.Right, $sr.Right) - $bx, [VV]::GetSystemMetrics(0) - $bx)
+            $bh = [Math]::Min(360, [VV]::GetSystemMetrics(1) - $by)
+            if ($bw -gt 0 -and $bh -gt 0) {
+                $bmpSub = Grab-Region $bx $by $bw $bh
+                $bmpSub.Save((Join-Path $PSScriptRoot "..\artifacts\ui-shots\context-menu-sub.png"),
+                    [System.Drawing.Imaging.ImageFormat]::Png)
+                $bmpSub.Dispose()
+                Write-Host ("  submenu screenshot -> context-menu-sub.png ({0}x{1})" -f $bw, $bh)
+            }
+        }
+    }
+    Add-Result "subMenuOpens" $subOk $subNote
+
+    # Esc 分两层关：子菜单开着时，第一下 Esc 只关子菜单，主菜单还在
+    # （Win32 弹出菜单的标准行为 —— 不这样的话用户在三级菜单里按一下
+    # Esc 就整个关掉了，得按三次才能退干净）。
+    #
+    # **不要**对菜单窗口调 `SetForegroundWindow`（见上面）—— 那会在 Esc
+    # 之前就把菜单关掉，这条检查会变成永远成立。
+    if ($menuHwnd -ne [IntPtr]::Zero -and $subOk) {
+        Send-Key 0x1B
+        Start-Sleep -Milliseconds 900
+        $afterSub = Find-PopupMenu
+        Add-Result "subMenuEscCloses" ($afterSub -eq $menuHwnd) `
+            ("第一下 Esc 之后 #32768 HWND = {0}（应当退回主菜单的 {1}）" -f $afterSub, $menuHwnd)
+    } else {
+        Add-Result "subMenuEscCloses" $false "没有展开的子菜单可验"
+    }
+
+    # Esc 关掉菜单。
+    if ($menuHwnd -ne [IntPtr]::Zero) {
         Send-Key 0x1B
         Start-Sleep -Milliseconds 900
         $still = Find-PopupMenu

@@ -172,6 +172,44 @@ pub fn step_index(len: usize, pos: usize, step: isize) -> Option<usize> {
     Some((pos as isize + step).rem_euclid(len as isize) as usize)
 }
 
+/// 按 `step` 走一格之后该切到哪条轨。
+///
+/// 返回 `None` 表示**什么都不用做**（不是错误）：没有媒体、轨没了、
+/// 只有一条且正在用它、字幕关着而这次是往回切。
+///
+/// ## 抽成纯函数是为了让集成测试测到同一份逻辑
+///
+/// 这段决策原本写在 `app.rs::cycle_track` 里，而 `App` 要测它得先把整个
+/// 窗口、渲染、事件循环都搭起来 —— 于是「在三条以上之间循环」这个分支
+/// 长期只有 `step_index` 的单测在覆盖，`aid` / `sid` 那边到底写不写得进去
+/// 只有真机点菜单才知道。抽出来之后，`tests/track_list.rs` 能拿真的
+/// `multitrack.mp4` 驱动真 libmpv，逐条断言写进去的 `aid` 真的生效。
+///
+/// `kind` 只用来在「没选中字幕」时决定要不要顺手打开字幕 —— 音轨没有
+/// 这个行为（没在用的音轨是异常状态，不是「关掉了」）。
+pub fn pick_next_track(list: &[Track], kind: TrackKind, step: isize) -> Option<&Track> {
+    if list.is_empty() {
+        return None;
+    }
+    let current = list.iter().find(|t| t.selected);
+    let Some(current) = current else {
+        // 一条都没选中。字幕关着时 `J` / `L` 是**打开**字幕而不是什么都不做：
+        // 不这样的话，用户在菜单里选了「关闭」之后 `J` / `L` 就永久失灵了。
+        // 打开时挑 `default` 的那条（文件自己声明的那条），没有就挑第一条。
+        if kind != TrackKind::Sub {
+            return None;
+        }
+        return list.iter().find(|t| t.default).or_else(|| list.first());
+    };
+    let pos = list.iter().position(|t| t.id == current.id)?;
+    let next = list.get(step_index(list.len(), pos, step)?)?;
+    // 就一条、且正在用它 —— 按了等于没按，返回 `None` 让调用方安静收尾
+    if next.id == current.id {
+        return None;
+    }
+    Some(next)
+}
+
 /// 菜单里的一行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrackRow {
@@ -503,6 +541,23 @@ mod tests {
         }
     }
 
+    /// 造一条字幕轨（只有 `pick_next_track` 的测试要区分 default）
+    fn mk_sub(id: i64, selected: bool, default: bool) -> Track {
+        Track {
+            id,
+            kind: TrackKind::Sub,
+            codec: "subrip".into(),
+            codec_desc: String::new(),
+            language: String::new(),
+            title: String::new(),
+            selected,
+            default,
+            external: false,
+            audio_channels: None,
+            sample_rate: None,
+        }
+    }
+
     #[test]
     fn 解析实测形状的轨道列表() {
         let root = MpvValue::List(vec![
@@ -619,6 +674,97 @@ mod tests {
         assert_eq!(step_index(0, 0, 1), None, "没有轨就没有下标");
         assert_eq!(step_index(3, 3, 1), None, "pos 越界");
         assert_eq!(step_index(3, 99, -1), None);
+    }
+
+    #[test]
+    fn 选下一条轨在多轨之间绕回() {
+        let list = vec![
+            mk_audio(1, "eng", true, true),
+            mk_audio(2, "chi", false, false),
+            mk_audio(3, "jpn", false, false),
+        ];
+        let pick = |step| pick_next_track(&list, TrackKind::Audio, step).map(|t| t.id);
+
+        assert_eq!(pick(1), Some(2));
+        // `list` 是「就地」改不动 selected 的快照，所以这里手工推进
+        let mut at2 = list.clone();
+        at2[1].selected = true;
+        at2[0].selected = false;
+        assert_eq!(
+            pick_next_track(&at2, TrackKind::Audio, 1).map(|t| t.id),
+            Some(3)
+        );
+
+        let mut at3 = at2.clone();
+        at3[2].selected = true;
+        at3[1].selected = false;
+        assert_eq!(
+            pick_next_track(&at3, TrackKind::Audio, 1).map(|t| t.id),
+            Some(1),
+            "末尾之后绕回第一条"
+        );
+        assert_eq!(
+            pick_next_track(&at3, TrackKind::Audio, -1).map(|t| t.id),
+            Some(2),
+            "末尾往回退一条"
+        );
+    }
+
+    #[test]
+    fn 只有一条轨时切换是无操作() {
+        let list = vec![mk_audio(1, "eng", true, true)];
+        assert_eq!(
+            pick_next_track(&list, TrackKind::Audio, 1),
+            None,
+            "按 A 等于没按，安静收尾而不是报错"
+        );
+        assert_eq!(pick_next_track(&list, TrackKind::Audio, -1), None);
+        assert_eq!(
+            pick_next_track(&[], TrackKind::Audio, 1),
+            None,
+            "没有轨就没有下一步"
+        );
+    }
+
+    #[test]
+    fn 字幕关着时循环会重新打开它() {
+        let list = vec![
+            mk_sub(1, false, false),
+            mk_sub(2, false, true),
+            mk_sub(3, false, false),
+        ];
+        // 一条都没选中 -> 挑 default 那条（这里是 id=2，不是第一条）
+        assert_eq!(
+            pick_next_track(&list, TrackKind::Sub, 1).map(|t| t.id),
+            Some(2),
+            "重新打开字幕时挑文件声明的默认轨"
+        );
+        // 没有 default 就挑第一条
+        let no_def = vec![mk_sub(7, false, false), mk_sub(8, false, false)];
+        assert_eq!(
+            pick_next_track(&no_def, TrackKind::Sub, 1).map(|t| t.id),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn 音轨没选中时循环不会瞎挑一条() {
+        let list = vec![
+            mk_audio(1, "eng", false, true),
+            mk_audio(2, "chi", false, false),
+        ];
+        // 音轨没有「关掉再打开」这回事（`aid` 永远有一条在用），
+        // 所以没选中时不该返回一个看起来很确定的答案
+        assert_eq!(pick_next_track(&list, TrackKind::Audio, 1), None);
+    }
+
+    #[test]
+    fn 视频轨没有可切的() {
+        assert_eq!(TrackKind::Video.property(), None);
+        // `cycle_track` 里对 Video 是提前 return 的，但 `pick_next_track`
+        // 被别处误用时也不该给出答案
+        let list = vec![mk_audio(1, "eng", true, true)];
+        assert_eq!(pick_next_track(&list, TrackKind::Video, 1), None);
     }
 
     #[test]

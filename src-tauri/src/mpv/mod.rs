@@ -834,6 +834,21 @@ impl MpvPlayer {
         self.set_string_property("sid", OFF_TRACK)
     }
 
+    /// 下发一条 mpv 命令。
+    ///
+    /// 目前只有一个调用点：改完 `sub-codepage` 之后发 `sub-reload`，
+    /// 让**已经加载**的字幕用新编码重新解码一遍。
+    ///
+    /// 为什么非要这一步：`sub-codepage` 是**读取**字幕文件时才用上的，
+    /// 改它不会回头去重新读已经读进来的文本。所以用户看到的是「编码换了、
+    /// 字幕还是乱的」，除非显式重载。
+    ///
+    /// 用的是异步版本（同 `command` 的理由），所以返回 `Ok` 只代表
+    /// **命令被接受了**，不代表重载已经完成 —— 调用方不该拿它当同步点。
+    pub fn run_command(&self, args: &[&str]) -> Result<(), String> {
+        self.command(args)
+    }
+
     /// 设置一个字符串属性（`sid` / `aid` / `sub-encoding` …）。
     ///
     /// ## 必须走 `mpv_set_property_string`，不能走 `mpv_set_property` + STRING
