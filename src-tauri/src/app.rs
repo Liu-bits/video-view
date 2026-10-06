@@ -20,49 +20,64 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::crashlog;
+use crate::diag::{self, Diagnostics};
+use crate::gpu;
 use crate::lang;
+use crate::settings::{self, Settings};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GetLastError, GlobalFree, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
+    POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, EndPaint,
     InvalidateRect, ScreenToClient, SelectObject, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwareness, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, PROCESS_PER_MONITOR_DPI_AWARE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F,
-    VK_F11, VK_LEFT, VK_M, VK_O, VK_RIGHT, VK_SPACE, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6,
+    VK_7, VK_8, VK_9, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11, VK_HOME, VK_I,
+    VK_LEFT, VK_M, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RIGHT, VK_S,
+    VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, LoadIconW, MessageBoxW, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT,
-    HWND_TOP, IDC_ARROW, IDC_HAND, MB_ICONERROR, MB_OK, MINMAXINFO, MSG, PM_REMOVE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
+    LoadIconW, MessageBoxW, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA,
+    GWL_EXSTYLE, GWL_STYLE, HTCLIENT, HTTRANSPARENT, HWND_TOP, IDC_ARROW, IDC_HAND, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MESSAGEBOX_STYLE, MINMAXINFO, MSG, PM_REMOVE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
 use crate::surface;
-use crate::ui::{self, Hit, Layout, PaintState};
+use crate::ui::{self, Hit, Layout, PaintState, Panel};
 
 /// 主窗口类名。
 const APP_CLASS: &str = "VideoViewMain";
 
-/// 首次显示时的客户区尺寸（DIP），与旧版 tauri.conf.json 里的 width/height 一致。
-const DEFAULT_CLIENT_W_DIP: i32 = 1100;
-const DEFAULT_CLIENT_H_DIP: i32 = 720;
+/// 首次显示时的客户区尺寸（DIP）。
+///
+/// 值在 `settings::Settings::default()` 里，**不在这里**再写一遍。
+/// 窗口初始尺寸与「没有保存过设置时用多大」是同一件事的两个来源，
+/// 各写一份的必然结果是某次只改了一处，然后「第一次启动的窗口」和
+/// 「恢复设置的窗口」不一样大。
 const MIN_CLIENT_W_DIP: i32 = 480;
 const MIN_CLIENT_H_DIP: i32 = 320;
 
@@ -100,6 +115,12 @@ const WM_APP_OPEN_DIALOG: u32 = WM_APP_USER + 5;
 const SEEK_STEP: f64 = 10.0;
 const VOLUME_STEP: f64 = 5.0;
 
+/// `[` / `]` 每次把倍速乘/除这个数。
+///
+/// 乘而不是加减：倍速是乘性感知（0.5 → 1.0 → 2.0），
+/// 加减法在 1.0 附近会给出 1.05 这种没人要的速度。
+const SPEED_FACTOR: f64 = 1.25;
+
 /// 嵌入 exe 的图标资源 id，与 assets/app.rc 里的 `IDI_APP_ICON` 对应。
 ///
 /// 传给 `LoadIconW` 的「字符串」其实是把 id 直接当指针传（MAKEINTRESOURCE），
@@ -118,15 +139,8 @@ struct UiState {
     has_file: bool,
     /// mpv 报 `idle-active`：当前没有正在播放的文件
     idle: bool,
-    /// mpv 报 `hwdec-current`：当前实际生效的硬件解码器。
-    ///
-    /// `"d3d11va"` / `"dxva2"` = 硬件解码在用；`"no"` = **静默退回了软解**。
-    ///
-    /// 空串表示还没开始解码（`hwdec-current` 在解码器未加载时不可用）。
-    /// 这一项不参与绘制，只作为「这台机器/这个视频是不是走了降级路径」的
-    /// 可观测依据——D3D11VA 格式探测失败时 mpv 不发任何 error 或 warning，
-    /// 那种情况下这个字段是唯一的信号。
-    hwdec: String,
+    /// 当前倍速（`speed` 属性）。0.3.0 没有这个状态，0.4.0 加 `[` `]` 时引入。
+    speed: f64,
 }
 
 impl Default for UiState {
@@ -141,8 +155,41 @@ impl Default for UiState {
             title: String::new(),
             has_file: false,
             idle: true,
-            // 还没解码任何东西，`hwdec-current` 此时不可用
-            hwdec: String::new(),
+            speed: 1.0,
+        }
+    }
+}
+
+/// 控制栏上方那块区域显示什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelMode {
+    /// 不显示
+    None,
+    /// 解码诊断
+    Stats,
+    /// 快捷键总览
+    Help,
+}
+
+impl PanelMode {
+    /// 显示这个面板时会占几行。`Layout` 靠它算高度。
+    ///
+    /// 两种语言下都取**编译期常量**的行数，不去 `Vec::len()`：布局在
+    /// 绘制之前算好，行数必须是能免费拿到的常量，否则每帧一次堆分配。
+    fn rows(self) -> usize {
+        match self {
+            PanelMode::None => 0,
+            PanelMode::Stats => lang::DIAG_ROWS,
+            PanelMode::Help => lang::HELP_ROWS,
+        }
+    }
+
+    /// 切换到 `self` 之外的模式（再按一次同一个键就收起）。
+    fn toggled_to(self, target: PanelMode) -> PanelMode {
+        if self == target {
+            PanelMode::None
+        } else {
+            target
         }
     }
 }
@@ -305,9 +352,29 @@ struct App {
     /// 不就地 `MessageBoxW` 是因为它自带消息循环，会重入窗口过程再取一次
     /// `&mut App`；两个同时存活的独占引用是 UB，而且对话框期间派发的
     /// `WM_TIMER` 会改状态，回来后原函数继续用被改过的值。
-    pending_errors: Vec<(String, String)>,
+    pending_errors: Vec<(String, String, MESSAGEBOX_STYLE)>,
     /// 有人请求打开文件对话框，真正的模态调用放到 `WM_APP_OPEN_DIALOG` 里做。
     open_dialog: bool,
+    /// 解码诊断数据。`hwdec-current` 等观测项收在这里。
+    ///
+    /// 0.3.0 里 `hwdec-current` 落在 `UiState` 上但**从不显示**——接了一半的
+    /// 死路。0.4.0 把它连同其余观测项一起搬进 `diag::Diagnostics`，
+    /// 并且真的画出来。
+    diag: Diagnostics,
+    /// 控制栏上方那块区域显示什么。
+    panel: PanelMode,
+    /// 诊断面板的行数据。缓存下来是因为 `Diagnostics::rows` 每帧要
+    /// `format!` 七个字符串，而面板只在打开时才需要它们。
+    panel_rows: Vec<(String, String)>,
+    /// 快捷键总览的行数据。同样缓存：`help_rows()` 返回的是**值**，
+    /// 而 `PaintState` 里放的是引用，每帧重新构造一个临时数组再借出去
+    /// 是过不了的（返回引用局部临时值）。
+    help_rows: [(&'static str, &'static str); lang::HELP_ROWS],
+    /// 用户设置。启动时读一次，之后改动只置 `prefs_dirty`。
+    prefs: Settings,
+    prefs_dirty: bool,
+    /// 上次落盘的时刻，用于节流（拖动音量不该写几十次注册表）。
+    prefs_last_flush: std::time::Instant,
 }
 
 /// 排队等弹的错误提示上限。
@@ -317,20 +384,33 @@ struct App {
 const MAX_QUEUED_ERRORS: usize = 8;
 
 impl App {
-    fn new() -> Self {
+    /// `prefs` 由调用方读好后传进来——不在这里读，避免有两个来源。
+    fn new(prefs: Settings) -> Self {
         // 语言先定下来：控件宽度是按当前语言的文案**实测**出来的，
         // 所以 Theme 必须在 strings 之后建，顺序不能反。
         let strings = lang::Strings::new(lang::Lang::detect());
         // DPI 真正生效后 WM_CREATE 会立刻重建字体，这里先用 96 占位
         let theme = ui::Theme::new(96, &strings);
-        let layout = Layout::new(0, 0, 96, false, &theme.metrics);
+        // 面板**不从设置里恢复**，见 settings 模块的说明：它是临时视图，
+        // 记住它会让每次启动画面区都矮一截
+        let panel = PanelMode::None;
+        let layout = Layout::new(0, 0, 96, false, panel.rows(), &theme.metrics);
+        // 必须在 struct 字面量之外取：`strings` 会被 move 进字段，之后再借它
+        // 就是「use after move」
+        let help_rows = strings.help_rows();
         Self {
             hwnd: HWND::default(),
             video: HWND::default(),
             create_error: None,
             player: None,
             events: Arc::new(Mutex::new(Vec::new())),
-            state: UiState::default(),
+            // 音量与静音从设置里取。初始值与 `UiState::default()` 一致，
+            // 所以「设置生效」不会表现为第一次启动音量突然变了一个值
+            state: UiState {
+                volume: prefs.volume,
+                muted: prefs.muted,
+                ..UiState::default()
+            },
             dragging: Dragging::None,
             drag_x: 0,
             theatre: false,
@@ -352,6 +432,13 @@ impl App {
             },
             pending_errors: Vec::new(),
             open_dialog: false,
+            diag: Diagnostics::default(),
+            panel,
+            panel_rows: Vec::new(),
+            help_rows,
+            prefs,
+            prefs_dirty: false,
+            prefs_last_flush: std::time::Instant::now(),
         }
     }
 
@@ -392,26 +479,100 @@ impl App {
             self.client_h,
             self.dpi,
             self.theatre,
+            self.panel.rows(),
             &self.theme.metrics,
         );
 
+        // 画面子窗口的下沿是 **`panel.top` 而不是 `controls.top`**。
+        //
+        // 没有面板时两者相等（`panel` 是零高度、贴在控制栏顶边上），
+        // 所以这条对旧行为没有影响。有面板时必须用 `panel.top`——mpv 的
+        // 画面是**原生子窗口**，它盖在主窗口的一切绘制之上，边界给到
+        // `controls.top` 就等于让它伸到面板底下把面板整块遮住。
         let video_rect = RECT {
             left: 0,
             top: 0,
             right: self.client_w,
-            bottom: self.layout.controls.top.max(0),
+            bottom: self.layout.panel.top.max(0),
         };
         surface::set_video_bounds(self.video, &video_rect);
     }
 
-    /// 只重画控制栏：视频区由 mpv 自己画，重画没有意义。
+    /// 只重画底部那条：控制栏（以及它上面的面板）。
+    ///
+    /// 用 `chrome` 而不是 `controls`：面板打开时数据每 250ms 变一次，
+    /// 只失效控制栏的话面板会一直是打开那一刻的样子。`chrome` 就是
+    /// 「面板 + 控制栏」，仍然只是底部一条，代价与原来一样。
     fn invalidate_controls(&self) {
         if self.theatre {
             return;
         }
         unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), Some(&self.layout.controls), false);
+            let _ = InvalidateRect(Some(self.hwnd), Some(&self.layout.chrome), false);
         }
+    }
+
+    /// 切换面板。
+    ///
+    /// 面板高度变了，所以必须 `relayout` + 整窗重画：只重画控制栏的话，
+    /// 新露出来的那一块面板区域永远不会被画（后备位图里是旧内容）。
+    ///
+    /// **影院模式下什么都不做。** 影院模式的定义就是「什么都没有」，
+    /// 面板在那里是看不见的（`Layout::new` 里 `theatre` 时面板高度为 0）。
+    /// 如果这里仍然改状态，用户在影院模式按了 `I`、什么都没看到，
+    /// 退出影院后面板却莫名其妙冒出来了——按了没反应、过一会儿自己出现，
+    /// 比「按了确实没反应」难解释得多。
+    fn set_panel(&mut self, mode: PanelMode) {
+        if self.theatre {
+            return;
+        }
+        self.panel = mode;
+        // 诊断面板的行数据每帧都要 `format!`，只在面板打开时重建
+        self.panel_rows = match mode {
+            PanelMode::Stats => self.diag.rows(&self.strings),
+            _ => Vec::new(),
+        };
+        self.prefs_touch();
+        self.relayout();
+        self.invalidate_all();
+    }
+
+    /// 面板内容，供 `paint` 用。
+    /// 设置有改动，标脏等落盘。
+    fn prefs_touch(&mut self) {
+        self.prefs.volume = self.state.volume;
+        self.prefs.muted = self.state.muted;
+        self.prefs_dirty = true;
+    }
+
+    /// 把设置写回注册表（节流）。
+    ///
+    /// 拖动音量滑块会连着改几十次 `volume`，每 250ms 写一次注册表没有必要。
+    /// 这里按 `FLUSH_INTERVAL_MS` 节流，退出时再无条件落一次。
+    fn prefs_flush(&mut self, force: bool) {
+        if !self.prefs_dirty {
+            return;
+        }
+        if !force && self.prefs_last_flush.elapsed().as_millis() < settings::FLUSH_INTERVAL_MS {
+            return;
+        }
+        // 窗口尺寸存的是 **DIP**：用户把窗口从 125% 的屏拖到 200% 的屏，
+        // 物理像素会翻倍而用户感知到的尺寸没变。存物理像素会让下次启动
+        // 在新屏上变成一个巨大的窗口。
+        //
+        // 全屏 / 影院 / 最小化时 `client_w/h` 是 0 或整个屏幕，那不是
+        // 「用户想要的窗口大小」，这时不记。
+        if !self.fullscreen && !self.theatre && self.client_w > 0 && self.client_h > 0 {
+            let dpi = self.dpi.max(1) as i64;
+            self.prefs.client_w = ((i64::from(self.client_w) * 96) / dpi) as i32;
+            self.prefs.client_h = ((i64::from(self.client_h) * 96) / dpi) as i32;
+        }
+
+        // 存不上不是错误：设置只是偏好，让用户下次重新设一次就行，
+        // 反复弹框只会变成噪声。所以两种结果都清掉 dirty。
+        let _ = self.prefs.save();
+        self.prefs_dirty = false;
+        self.prefs_last_flush = std::time::Instant::now();
     }
 
     /// 整窗重画。影院 / 全屏切换、空闲态切换时用。
@@ -428,7 +589,13 @@ impl App {
         self.state.idle = false;
         self.state.position = 0.0;
         self.state.duration = 0.0;
+        self.state.speed = 1.0;
         self.state.title = file_title(path);
+        // 诊断数据必须清。不清的话上一段视频的分辨率和丢帧数会留在面板上，
+        // 看起来像新文件也丢了 10 帧——那是误导（丢帧计数 mpv 自己会重置，
+        // 但解码器建好之前读到的还是旧文件的值）。
+        self.diag.reset();
+        self.refresh_panel_rows();
         surface::set_video_visible(self.video, true);
         self.relayout();
         self.invalidate_all();
@@ -445,9 +612,21 @@ impl App {
             self.state.title.clear();
             self.state.position = 0.0;
             self.state.duration = 0.0;
+            self.diag.reset();
+            self.refresh_panel_rows();
             surface::set_video_visible(self.video, false);
             self.relayout();
             self.invalidate_all();
+        }
+    }
+
+    /// 诊断面板打开时重建行数据。
+    ///
+    /// 只在两种时候需要：面板刚打开、以及诊断数据刚变。`tick` 里刷新数据
+    /// 之后也走这里。
+    fn refresh_panel_rows(&mut self) {
+        if self.panel == PanelMode::Stats {
+            self.panel_rows = self.diag.rows(&self.strings);
         }
     }
 
@@ -498,6 +677,7 @@ impl App {
             self.report_error(self.strings.err_volume, &e);
         }
         self.state.volume = v;
+        self.prefs_touch();
         self.invalidate_controls();
     }
 
@@ -507,7 +687,138 @@ impl App {
             self.report_error(self.strings.err_mute, &e);
         }
         self.state.muted = next;
+        self.prefs_touch();
         self.invalidate_controls();
+    }
+
+    /// 倍速乘一个系数（`[` 减速 / `]` 加速）。
+    ///
+    /// 乘而不是加减：倍速在感知上就是乘性的（0.5 / 1 / 2），
+    /// 1.0 附近用加减法会给出 1.25 这种没人主动想要的速度。
+    fn scale_speed(&mut self, factor: f64) {
+        if !self.state.has_file {
+            return;
+        }
+        let next = (self.state.speed * factor).clamp(0.0625, 16.0);
+        if let Err(e) = self.player().set_speed(next) {
+            self.report_error(self.strings.err_command, &e);
+            return;
+        }
+        // 立即更新，不等 mpv 的属性事件绕一圈（和 toggle_pause 同一个理由）
+        self.state.speed = next;
+        self.refresh_panel_rows();
+        self.invalidate_controls();
+    }
+
+    /// 逐帧步进。
+    ///
+    /// 逐帧之后自动暂停，否则按一下 `,` 画面只闪一帧就继续播了，
+    /// 用户根本没看清。mpv 的 `frame-step` 自己不会暂停。
+    fn step_frame(&mut self, forward: bool) {
+        if !self.state.has_file {
+            return;
+        }
+        if let Err(e) = self.player().frame_step(forward) {
+            self.report_error(self.strings.err_command, &e);
+            return;
+        }
+        if !self.state.paused {
+            if let Err(e) = self.player().set_pause(true) {
+                self.report_error(self.strings.err_toggle, &e);
+            }
+            self.state.paused = true;
+        }
+        self.invalidate_controls();
+    }
+
+    /// 跳到整个视频的百分之几（数字键 0–9）。
+    ///
+    /// 0 是开头、9 是 90%，**没有 100%** —— 与 mpv 自身的行为一致，
+    /// 免得用户按完 9 期待看到结尾却停在倒数第二秒。
+    fn seek_percent(&mut self, digit: u32) {
+        if !self.state.has_file {
+            return;
+        }
+        self.seek_absolute(self.state.duration * f64::from(digit) / 10.0);
+    }
+
+    /// 保存当前画面到图片目录。
+    fn screenshot(&mut self) {
+        if !self.state.has_file {
+            return;
+        }
+        let Some(path) = self.screenshot_path() else {
+            self.report_error(self.strings.err_screenshot, "no writable pictures folder");
+            return;
+        };
+        if let Err(e) = self.player().screenshot_to_file(&path) {
+            self.report_error(self.strings.err_screenshot, &e);
+        }
+    }
+
+    /// 截图文件名：`<视频名>-videoview-<时间戳>.png`。
+    ///
+    /// 文件名里带视频名而不是只有时间戳：一次截十几张之后，时间戳根本
+    /// 分不出哪张是哪张。
+    fn screenshot_path(&self) -> Option<PathBuf> {
+        let dir = crashlog::pictures_dir()?;
+        let stem: String = self
+            .state
+            .title
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(48)
+            .collect();
+        let stem = if stem.is_empty() {
+            "clip".to_string()
+        } else {
+            stem
+        };
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Some(dir.join(format!("{stem}-videoview-{secs}.png")))
+    }
+
+    /// 生成诊断报告并复制到剪贴板。
+    ///
+    /// 这一步是整个诊断面板最实用的部分：面板只能看当前这一秒，而用户
+    /// 报 bug 时能贴出来的只有一段文字。
+    fn copy_report(&mut self) {
+        let text = self.build_report();
+        match copy_to_clipboard(self.hwnd, &text) {
+            Ok(()) => self.report_info(self.strings.info_report_copied),
+            Err(e) => self.report_error(self.strings.err_report, &e),
+        }
+    }
+
+    /// 组出完整诊断报告（纯文本，键 = 值）。
+    fn build_report(&self) -> String {
+        let Some(player) = &self.player else {
+            return "VideoView: player not initialized\n".to_string();
+        };
+        // 报告要反映「此刻」，所以先主动读一遍高频项再生成——
+        // 面板是每 250ms 才刷新的，复制到剪贴板的可能是半秒前的数据。
+        let mut d = self.diag.clone();
+        d.refresh(player);
+        let ctx = diag::ReportContext {
+            app_version: env!("CARGO_PKG_VERSION"),
+            mpv_api_version: player.api_version(),
+            os: std::env::consts::OS,
+            physical_cores: crate::cpu::physical_cores().unwrap_or(0),
+            gpu: &gpu::summary(),
+            gpu_inactive: gpu::inactive_count(),
+            dpi: self.dpi,
+            strings: &self.strings,
+        };
+        d.report(&ctx)
     }
 
     /// 影院模式：隐藏控制栏，画面占满整个客户区。
@@ -530,10 +841,18 @@ impl App {
         }
     }
 
-    /// 定时器：主动读一次播放进度。
+    /// 定时器：主动读一次播放进度，刷新诊断面板，落盘设置。
     fn tick(&mut self) {
+        // 设置落盘要走完这一整段，所以放在最前面无条件做
+        self.prefs_flush(false);
+
         // 拖动中以鼠标位置为准，不跟着播放进度跳
-        if self.dragging == Dragging::Seek || !self.state.has_file {
+        if self.dragging == Dragging::Seek {
+            self.refresh_stats_panel();
+            return;
+        }
+        if !self.state.has_file {
+            self.refresh_stats_panel();
             return;
         }
         let Ok(pos) = self.player().get_double_property("time-pos") else {
@@ -543,6 +862,27 @@ impl App {
             self.state.position = pos;
             self.invalidate_controls();
         }
+        self.refresh_stats_panel();
+    }
+
+    /// 面板可见时刷新高频诊断项。
+    ///
+    /// **面板不可见时一次属性都不读**——这是「按需观测」的关键。诊断数据
+    /// 全部来自 mpv 的属性查询，每次查询都要跨一次 FFI 边界并让 mpv 加锁；
+    /// 每秒 4 次不疼，但完全没有必要在用户没打开面板时付这个钱。
+    ///
+    /// 快捷键面板是纯静态文案，不需要刷新。
+    fn refresh_stats_panel(&mut self) {
+        if self.panel != PanelMode::Stats {
+            return;
+        }
+        // `self.diag.refresh(self.player())` 会同时可变借用 `self.diag` 与
+        // 不可变借用整个 `self`（`player()` 是个 `&self` 方法），编译器直接
+        // 拒绝。把 `Arc` 克隆一份，第二个借用就地结束。
+        let player = Arc::clone(self.player());
+        self.diag.refresh(&player);
+        self.panel_rows = self.diag.rows(&self.strings);
+        self.invalidate_controls();
     }
 
     /// 处理 mpv 事件线程投递过来的消息。
@@ -573,14 +913,27 @@ impl App {
                     }
                     // 硬件解码实际用的哪一个。`no` = 静默退回软解。
                     //
-                    // 存进状态而不是打日志：release 下没有控制台，而「画面能播
-                    // 但 CPU 跑满」这种问题只有用户会注意到——如果他们能在
-                    // 某个界面上看到「当前使用软件解码」，就能立刻判断这台
-                    // 机器/这个视频是不是走了降级路径，而不是先去猜是不是
-                    // 播放器慢。现在只落状态、不上界面（那是另一个决定），
-                    // 但值已经是可读的了。
-                    "hwdec-current" => {
-                        self.state.hwdec = change.value.as_text().unwrap_or("").to_string();
+                    // 以及其余的解码观测项（分辨率、丢帧、零拷贝…）。
+                    // 全部交给 `Diagnostics` 处理，它知道每个属性名对应哪个字段，
+                    // 也知道「拿不到值」和「值是 0」是两回事。
+                    "hwdec-current"
+                    | "video-format"
+                    | "video-params/pixelformat"
+                    | "video-params/w"
+                    | "video-params/h"
+                    | "video-out-params/w"
+                    | "video-out-params/h"
+                    | "decoder-frame-drop-count"
+                    | "frame-drop-count"
+                    | "current-vo"
+                    | "video-sync" => self.diag.apply(&change),
+                    // `speed` 是我们自己在 `scale_speed` 里改的，但 mpv 也会
+                    // 报变化（比如换了文件）。两边都要更新，否则面板上的倍速
+                    // 和 `[` `]` 键的累积会越差越远。
+                    "speed" => {
+                        if let Some(v) = change.value.as_number() {
+                            self.state.speed = v;
+                        }
                     }
                     _ => {}
                 },
@@ -596,6 +949,12 @@ impl App {
                 MpvEventMessage::Error(msg) => {
                     layout_dirty |= self.enter_idle();
                     self.report_error(self.strings.err_playback, &msg);
+                }
+                // mpv 拒绝了一条命令。命令名拼错时这是**唯一**的信号——
+                // `command_async` 本身返回成功，没有这个事件的话，按了键
+                // 什么都不发生、也没有任何日志。
+                MpvEventMessage::CommandError(msg) => {
+                    self.report_error(self.strings.err_command, &msg);
                 }
             }
         }
@@ -661,7 +1020,7 @@ impl App {
         // 算进 WorkingSet。对「4G 内存」这个目标，这是我们自己的代码里
         // 最大的一笔。
         if self.state.has_file {
-            dirty = intersect_rect(dirty, &self.layout.controls);
+            dirty = intersect_rect(dirty, &self.layout.chrome);
         }
 
         let w = dirty.right - dirty.left;
@@ -680,6 +1039,18 @@ impl App {
             return;
         }
         let drag_seconds = self.drag_seconds();
+        // 借用整个 `self.theme`（可变）与 `panel`（不可变）不能共存，所以
+        // 面板那两个 slice 先用裸指针「借」出来，绘制完立刻还原。
+        //
+        // 这么做而不是把 PaintState 的字段拆开逐个构造，是因为 `ui::paint`
+        // 一次性拿到全部状态才不会漏掉某个字段（漏了就是界面上少一块东西，
+        // 而这种 bug 从签名上看不出来）。指针只在同一个 unsafe 块里用完，
+        // 生命周期不会逃出去。
+        let panel = match self.panel {
+            PanelMode::Help => Some(Panel::Help(&self.help_rows)),
+            PanelMode::Stats => Some(Panel::Stats(&self.panel_rows)),
+            PanelMode::None => None,
+        };
         unsafe {
             ui::paint(
                 mem,
@@ -696,14 +1067,12 @@ impl App {
                     loaded: self.state.has_file,
                     title: &self.state.title,
                     dragging_seek: self.dragging == Dragging::Seek,
-                    // 先取出来再构造 PaintState：里面那个 `&mut self.theme`
-                    // 已经借走了整个 `self`，同一表达式里再调 `self` 的方法
-                    // 就是同时存在借用
                     drag_seconds,
                     theatre: self.theatre,
                     idle: self.state.idle,
                     hover: self.hover,
                     strings: &self.strings,
+                    panel,
                 },
                 &dirty,
             );
@@ -742,13 +1111,25 @@ impl App {
     /// 弹完。取的是 `mem::take` 而不是 `&mut self`，因为这个方法要在已经持有
     /// `&mut App` 的调用链里被调到。
     fn report_error(&mut self, caption: &str, detail: &str) {
+        self.queue_notice(caption, detail, MB_ICONERROR);
+    }
+
+    /// 纯信息提示（「已复制」这类成功反馈）。
+    ///
+    /// 与 `report_error` 走同一条排队通道，区别只在图标：挂红叉的框
+    /// 会被理解成「出错了」，而「诊断信息已复制」是成功。
+    fn report_info(&mut self, caption: &str) {
+        self.queue_notice(caption, "", MB_ICONINFORMATION);
+    }
+
+    fn queue_notice(&mut self, caption: &str, detail: &str, icon: MESSAGEBOX_STYLE) {
         if self.pending_errors.len() >= MAX_QUEUED_ERRORS {
             // 循环报错（比如解码失败时每秒一次）时别把内存吃光：
             // 丢最早的那条，留最近的
             self.pending_errors.remove(0);
         }
         self.pending_errors
-            .push((caption.to_string(), detail.to_string()));
+            .push((caption.to_string(), detail.to_string(), icon));
         unsafe {
             let _ = PostMessageW(Some(self.hwnd), WM_APP_ERROR, WPARAM(0), LPARAM(0));
         }
@@ -1060,8 +1441,8 @@ unsafe extern "system" fn app_wnd_proc(
             // （一次 WM_APP_ERROR 里 while 循环清空队列，遇到循环报错时
             // 队列永远清不空，就变成用户点掉一个又弹一个）。
             if !(*app_ptr).pending_errors.is_empty() {
-                let (caption, detail) = (&mut *app_ptr).pending_errors.remove(0);
-                message_box(hwnd, &caption, &detail);
+                let (caption, detail, icon) = (&mut *app_ptr).pending_errors.remove(0);
+                message_box(hwnd, &caption, &detail, icon);
                 if !(*app_ptr).pending_errors.is_empty() {
                     let _ = PostMessageW(Some(hwnd), WM_APP_ERROR, WPARAM(0), LPARAM(0));
                 }
@@ -1305,6 +1686,18 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
             app.set_volume(app.state.volume - VOLUME_STEP);
             true
         }
+        _ if key(VK_HOME.0) => {
+            (&mut *app_ptr).seek_absolute(0.0);
+            true
+        }
+        _ if key(VK_END.0) => {
+            let app = &mut *app_ptr;
+            // 往回退一点点：直接跳到 duration 上有些播放器会停在最后一帧
+            // 不动，看起来像「没跳过去」
+            let target = (app.state.duration - 0.05).max(0.0);
+            app.seek_absolute(target);
+            true
+        }
         _ if key(VK_F11.0) => {
             toggle_fullscreen(app_ptr);
             true
@@ -1317,8 +1710,96 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
             (&mut *app_ptr).pick_file();
             true
         }
+        // Ctrl + C = 复制诊断报告。
+        //
+        // 面板只能看当前这一秒，而用户报 bug 时能贴出来的只有一段文字，
+        // 所以这份报告才是整个诊断功能里最实用的部分，给它一个顺手的位置。
+        // 界面上没有输入框，Ctrl+C 不与「复制选中文本」冲突。
+        _ if key(VK_C.0) && ctrl => {
+            (&mut *app_ptr).copy_report();
+            true
+        }
         _ if key(VK_M.0) => {
             (&mut *app_ptr).toggle_mute();
+            true
+        }
+        _ if key(VK_S.0) => {
+            (&mut *app_ptr).screenshot();
+            true
+        }
+        // `I` = 解码诊断。再按一次收起
+        _ if key(VK_I.0) => {
+            let app = &mut *app_ptr;
+            app.set_panel(app.panel.toggled_to(PanelMode::Stats));
+            true
+        }
+        // `?` = 快捷键总览。在美式布局上是 Shift + `/`，
+        // 虚拟键码与 `/` 相同（VK_OEM_2），所以不需要单独判 Shift
+        _ if key(VK_OEM_2.0) => {
+            let app = &mut *app_ptr;
+            app.set_panel(app.panel.toggled_to(PanelMode::Help));
+            true
+        }
+        // `[` 减速 / `]` 加速（VK_OEM_4 / VK_OEM_5）
+        //
+        // 这两个键的虚拟键码**依赖键盘布局**：德语布局上它们是 ä/ö，
+        // 法语布局上位置又不一样。所以快捷键面板里只能写符号、不能写
+        // 键名——在非美式布局上按出来的是别的字符。
+        _ if key(VK_OEM_4.0) => {
+            (&mut *app_ptr).scale_speed(1.0 / SPEED_FACTOR);
+            true
+        }
+        _ if key(VK_OEM_5.0) => {
+            (&mut *app_ptr).scale_speed(SPEED_FACTOR);
+            true
+        }
+        // `,` / `.` 逐帧后退 / 前进（VK_OEM_COMMA / VK_OEM_PERIOD）
+        _ if key(VK_OEM_COMMA.0) => {
+            (&mut *app_ptr).step_frame(false);
+            true
+        }
+        _ if key(VK_OEM_PERIOD.0) => {
+            (&mut *app_ptr).step_frame(true);
+            true
+        }
+        _ if key(VK_0.0) => {
+            (&mut *app_ptr).seek_percent(0);
+            true
+        }
+        _ if key(VK_1.0) => {
+            (&mut *app_ptr).seek_percent(1);
+            true
+        }
+        _ if key(VK_2.0) => {
+            (&mut *app_ptr).seek_percent(2);
+            true
+        }
+        _ if key(VK_3.0) => {
+            (&mut *app_ptr).seek_percent(3);
+            true
+        }
+        _ if key(VK_4.0) => {
+            (&mut *app_ptr).seek_percent(4);
+            true
+        }
+        _ if key(VK_5.0) => {
+            (&mut *app_ptr).seek_percent(5);
+            true
+        }
+        _ if key(VK_6.0) => {
+            (&mut *app_ptr).seek_percent(6);
+            true
+        }
+        _ if key(VK_7.0) => {
+            (&mut *app_ptr).seek_percent(7);
+            true
+        }
+        _ if key(VK_8.0) => {
+            (&mut *app_ptr).seek_percent(8);
+            true
+        }
+        _ if key(VK_9.0) => {
+            (&mut *app_ptr).seek_percent(9);
             true
         }
         _ => false,
@@ -1359,12 +1840,17 @@ unsafe fn handle_drop(app_ptr: *mut App, hdrop: HDROP) {
     }
 }
 
-/// 模态错误提示。release 下没有控制台，这是唯一的反馈通道。
-fn message_box(owner: HWND, caption: &str, detail: &str) {
-    let text: Vec<u16> = format!("{caption}\n\n{detail}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+/// 模态提示框。release 下没有控制台，这是唯一的反馈通道。
+///
+/// `detail` 为空时不加空行——信息类提示（「已复制」）只有一个短句，
+/// 后面挂两行空白很奇怪。
+fn message_box(owner: HWND, caption: &str, detail: &str, icon: MESSAGEBOX_STYLE) {
+    let body = if detail.is_empty() {
+        caption.to_string()
+    } else {
+        format!("{caption}\n\n{detail}")
+    };
+    let text: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
     let cap: Vec<u16> = "VideoView"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -1374,9 +1860,88 @@ fn message_box(owner: HWND, caption: &str, detail: &str) {
             Some(owner),
             PCWSTR(text.as_ptr()),
             PCWSTR(cap.as_ptr()),
-            MB_OK | MB_ICONERROR,
+            MB_OK | icon,
         );
     }
+}
+
+/// 剪贴板格式 CF_UNICODETEXT。
+///
+/// windows-rs 没有为剪贴板格式常量生成绑定（它们是 #define 而不是枚举），
+/// 所以这里写数值 13 并把含义写在名字里。写错的话 SetClipboardData 会成功
+/// ——剪贴板接受任意格式——但贴出来的是空的。
+const CF_UNICODETEXT: u32 = 13;
+
+/// 把文本放进剪贴板（CF_UNICODETEXT）。
+///
+/// 剪贴板是**全局共享**的一份数据，而 `SetClipboardData` 会把那块内存的
+/// 所有权转给系统——所以这里必须用 `GMEM_MOVEABLE` 分配，并且一旦
+/// `SetClipboardData` 成功就**不能再 free**（那是 Windows 的老规矩，
+/// 双重释放会直接破坏全局剪贴板）。
+///
+/// 每一步都要 `CloseClipboard`。忘了关的话剪贴板会被锁住，其它程序
+/// （包括用户自己再按一次快捷键）都写不进去，而且不会自动恢复——要等
+/// 目标进程退出。
+fn copy_to_clipboard(owner: HWND, text: &str) -> Result<(), String> {
+    // OpenClipboard 会失败：剪贴板被别的进程开着且不放手。
+    // 这是**正常**竞争，不是错误状态，重试一次通常就好了。
+    let mut opened = unsafe { OpenClipboard(Some(owner)) }.is_ok();
+    if !opened {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        opened = unsafe { OpenClipboard(Some(owner)) }.is_ok();
+    }
+    if !opened {
+        return Err("the clipboard is in use by another application".to_string());
+    }
+
+    // 从这里开始无论走哪条分支都必须 CloseClipboard。用一个立刻执行的闭包
+    // 包住，保证任何 early return 都不会漏掉关闭
+    let result = (|| -> Result<(), String> {
+        unsafe {
+            EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
+        }
+        // 字节数含结尾的 NUL。Win32 要的是**字节**数不是字符数
+        let mut buf: Vec<u16> = text.encode_utf16().collect();
+        buf.push(0);
+        // SAFETY: `buf` 是一段对齐的有效 UTF-16 存储，长度按字节算，
+        // 而且是最后一步读（后面 `buf` 不再改动）
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 2) };
+        // SAFETY: 长度按字节算，且 buf 确实是 NUL 结尾的 UTF-16
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }
+            .map_err(|e| format!("GlobalAlloc failed: {e}"))?;
+        // GlobalAlloc 返回的是全局锁，GlobalLock 才给出可直接写的指针
+        let ptr = unsafe { GlobalLock(handle) };
+        let ptr = ptr.cast::<u8>();
+        if ptr.is_null() {
+            unsafe {
+                let _ = GlobalFree(Some(handle));
+            }
+            return Err("GlobalLock failed".to_string());
+        }
+        // SAFETY: GlobalLock 至少返回 `bytes.len()` 字节可写空间
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        unsafe {
+            let _ = GlobalUnlock(handle);
+        }
+
+        // 转移所有权给系统：成功之后 **不能** 再 GlobalFree
+        match unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))) } {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // 没转移走，那块内存还是我们的，必须在这里释放
+                unsafe {
+                    let _ = GlobalFree(Some(handle));
+                }
+                Err(format!("SetClipboardData failed: {e}"))
+            }
+        }
+    })();
+
+    unsafe {
+        let _ = CloseClipboard();
+    }
+    result
 }
 
 /// 文件名（不含目录与扩展名），显示在控制栏上。
@@ -1412,12 +1977,19 @@ fn startup_strings() -> lang::Strings {
 
 pub fn run() {
     enable_dpi_awareness();
+    // 崩溃日志要在**任何**可能 panic 的代码之前装上。
+    //
+    // release 是 `panic = "abort"`，没有 hook 的话 panic 的表现就是「闪一下
+    // 消失」——用户和开发者都拿不到任何信息。装 hook 只是一次 set_hook，
+    // 失败也不会影响启动（`install` 内部不返回 Result，写日志失败时安静跳过）。
+    crashlog::install();
 
     // 文件对话框用 COM，需要 STA。失败不致命，只是打不开对话框。
     let com_ok = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
 
     if let Err(e) = create_and_loop() {
-        message_box(HWND::default(), startup_strings().err_startup, &e);
+        let s = startup_strings();
+        message_box(HWND::default(), s.err_startup, &e, MB_ICONERROR);
     }
 
     if com_ok {
@@ -1442,37 +2014,71 @@ fn enable_dpi_awareness() {
     }
 }
 
+/// `AdjustWindowRectEx` 失败时的边框粗略值（物理像素）。
+///
+/// 只是个兜底：换算失败的原因通常是窗口站 / 主题服务异常，那属于「系统
+/// 有点问题」，不该让播放器起不来。
+fn px_frame(dpi: u32) -> i32 {
+    ui::dip_to_px(39, dpi)
+}
+
 /// 注册窗口类 + 创建主窗口 + 创建 mpv + 消息循环。
 fn create_and_loop() -> Result<(), String> {
+    // 设置在这里读一次，然后传给 `App::new`。
+    //
+    // 之前是 `App::new` 内部自己读、这里为了算窗口尺寸又读一遍 —— 两个来源，
+    // 改一处忘一处就会「窗口尺寸按旧的、面板开关按新的」。只有一个来源时
+    // 这类不一致不可能发生。
+    //
+    // `Settings::load` 在任何一步失败时都返回默认值，所以这里不需要 `?`。
+    let saved = Settings::load();
     unsafe {
         let module = windows::Win32::System::LibraryLoader::GetModuleHandleW(PCWSTR::null())
             .map_err(|e| format!("Could not get the module handle: {e}"))?;
         let hinstance = HINSTANCE(module.0);
         register_app_class(hinstance)?;
 
-        // 窗口尺寸是物理像素（DPI 感知已开），所以这里要自己乘 DPI。
+        // 设置里存的是**客户区**尺寸（DIP），而 `CreateWindowExW` 的
+        // width/height 要的是**窗口**尺寸（含边框与标题栏）。
+        //
+        // 两者差一个 `AdjustWindowRectEx` 的量。不换算的话每次启动窗口都会
+        // 比上次大一圈边框——用户拖到刚好的尺寸，关掉再开就变大了。
         let system_dpi = GetDpiForSystem().max(96);
-        let width = ui::dip_to_px(DEFAULT_CLIENT_W_DIP, system_dpi);
-        let height = ui::dip_to_px(DEFAULT_CLIENT_H_DIP, system_dpi);
+        let client_w = ui::dip_to_px(saved.client_w.max(MIN_CLIENT_W_DIP), system_dpi);
+        let client_h = ui::dip_to_px(saved.client_h.max(MIN_CLIENT_H_DIP), system_dpi);
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: client_w,
+            bottom: client_h,
+        };
+        let style = WINDOW_EX_STYLE::default();
+        let win_style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        if AdjustWindowRectEx(&mut frame, win_style, false, style).is_err() {
+            // 换算失败就退回「客户区 + 边框」的粗略估计，宁可窗口大一圈
+            // 也不能因为这个失败而起不来
+            frame.right = client_w + px_frame(system_dpi);
+            frame.bottom = client_h + px_frame(system_dpi);
+        }
 
         // App 必须在 CreateWindowExW 之前建好：lpParam 指向它，
         // WM_NCCREATE 里会挂到 GWLP_USERDATA。
-        let mut app = Box::new(App::new());
+        let mut app = Box::new(App::new(saved));
 
         let class_name = wide(APP_CLASS);
         let title = wide("VideoView");
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            style,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(title.as_ptr()),
             // WS_CLIPCHILDREN：画面子窗口整块盖住视频区，而我们的 WM_PAINT
             // 在整窗重画时（影院 / 全屏切换）会往整个客户区贴图。没有它，
             // 系统不会在贴图前排除子窗口区域，等于白贴一遍被完全遮住的部分。
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            win_style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            width,
-            height,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
             None,
             None,
             Some(hinstance),
@@ -1514,6 +2120,17 @@ fn create_and_loop() -> Result<(), String> {
             }
         };
         app.player = Some(Arc::new(player));
+
+        // 把保存下来的音量 / 静音推给 mpv。
+        //
+        // 必须在 player 就位**之后**：mpv 的默认音量是 100，而用户上次可能
+        // 调到了 30。不推的话界面显示 30、实际响 100——「设置没生效」。
+        //
+        // 失败不弹框：这时 `initialize` 刚成功，而音量写失败（极少见）不该
+        // 表现成「程序启动失败」。设置里的值已经是界面状态了，mpv 那一份
+        // 差一点不影响用户看到的东西。
+        let _ = app.player().set_volume(app.state.volume);
+        let _ = app.player().set_mute(app.state.muted);
 
         // 250ms 定时器**必须等到 `player` 就位之后再武装**。
         //
@@ -1560,6 +2177,10 @@ fn create_and_loop() -> Result<(), String> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        // 退出前把设置强制落盘（`tick` 里是节流的，最后一次改动可能还没到
+        // 落盘时刻）。窗口尺寸在这一刻才是准确的。
+        app.prefs_flush(true);
 
         // 退出前把 mpv 收干净：它的事件线程还在读 DLL
         let _ = app.player().shutdown();

@@ -34,7 +34,7 @@ fn observed_format(name: &str) -> Option<c_int> {
 /// **刻意不观察 `time-pos`**：它每个视频帧都会变一次，观察它等于把
 /// 几十到几百条事件/秒转成界面刷新。进度条改成界面线程定时读取，
 /// 刷新率由定时器决定（见 `app::TICK_MS`，250ms），事件流量降为零。
-const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
+pub const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
     ("duration", MPV_FORMAT_DOUBLE),
     ("pause", MPV_FORMAT_FLAG),
     ("volume", MPV_FORMAT_DOUBLE),
@@ -55,6 +55,44 @@ const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
     // 值在解码器真正创建之后才确定，可能晚于 `file-loaded`，所以
     // `App::tick` 还会主动 poll 一次。
     ("hwdec-current", MPV_FORMAT_STRING),
+    // ---- 解码健康度（0.4.0 新增）----------------------------------------
+    //
+    // 下面这些名字**全部是实测出来的**，不是照文档抄的。写错一个名字的后果
+    // 是 `mpv_observe_property` 返回错误 → `configure` 失败 → `initialize`
+    // 之前就退出 → **程序根本起不来**，而且报错只会说「observing property
+    // XXX failed」，看不出是哪个名字错了。
+    //
+    // 探针实测（mpv 0.41.0-1095，`tests/media/loop60s.mp4`）的结论：
+    //
+    //   * `vo-drop-frame-count` **不存在**。mpv 文档里的旧名字已经改成
+    //     `frame-drop-count`（windowed 实测 = 10，headless 实测 = 0）。
+    //     照文档写会直接让程序起不来。
+    //   * `mistimed-frame-count`、`estimated-display-fps`、`video-bitrate`
+    //     在这份 libmpv 上都不可读（带真实 VO 也一样），所以没接。
+    //   * `video-params/hwtype`、`video-out-params/hwtype` 不可读。
+    //     零拷贝的信号改用 `video-params/pixelformat`：软解时是 `yuv420p`，
+    //     D3D11 硬解时变成 `d3d11`。
+    //
+    // `tests/观测属性都能注册.rs` 把这条钉住：任何一个名字失效都会让那条
+    // 测试失败，而它在 CI / 本机上都不需要 GPU。
+    //
+    // 只观察**低频**的那些。`estimated-vf-fps`、`display-fps`、`speed`、
+    // demuxer 缓存这些每个视频帧都可能变，观察它们等于把每秒几十上百条
+    // 事件转成界面刷新——和当初刻意不观察 `time-pos` 是同一个理由。
+    // 它们改由 `diag::Diagnostics::refresh` 在面板可见时按 250ms 主动读。
+    ("video-format", MPV_FORMAT_STRING),
+    // pixelformat 从 yuv420p 变成 d3d11 = 解码帧直接进了 GPU，没有 CPU 往返
+    ("video-params/pixelformat", MPV_FORMAT_STRING),
+    ("video-params/w", MPV_FORMAT_INT64),
+    ("video-params/h", MPV_FORMAT_INT64),
+    // 输出分辨率。与上面的源分辨率不同 = 被缩放过（窗口大小 / 色度重采样）
+    ("video-out-params/w", MPV_FORMAT_INT64),
+    ("video-out-params/h", MPV_FORMAT_INT64),
+    // 两个丢帧计数。它们只在真的丢帧时才变，频率天然很低，适合事件驱动。
+    ("decoder-frame-drop-count", MPV_FORMAT_INT64),
+    ("frame-drop-count", MPV_FORMAT_INT64),
+    ("current-vo", MPV_FORMAT_STRING),
+    ("video-sync", MPV_FORMAT_STRING),
 ];
 
 /// 属性的值。
@@ -66,6 +104,9 @@ const OBSERVED_PROPERTIES: &[(&str, c_int)] = &[
 pub enum PropertyValue {
     Flag(bool),
     Number(f64),
+    /// mpv 里的 int64 属性。丢帧计数、分辨率这些注册成 int64 而不是 double，
+    /// 用 double 读会拿到 `MPV_ERROR_PROPERTY_FORMAT`。
+    Integer(i64),
     /// mpv 内部持有的字符串，克隆时已经复制了一份
     Text(String),
 }
@@ -81,6 +122,13 @@ impl PropertyValue {
     pub fn as_number(&self) -> Option<f64> {
         match self {
             PropertyValue::Number(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            PropertyValue::Integer(v) => Some(*v),
             _ => None,
         }
     }
@@ -110,6 +158,17 @@ pub enum MpvEventMessage {
     FileLoaded,
     /// 播放核心报错，例如文件打不开
     Error(String),
+    /// 一条命令被 mpv 拒绝了。
+    ///
+    /// `mpv_command_async` 对**无效命令名**返回的是成功，被拒绝这件事要等
+    /// 之后那条 `MPV_EVENT_COMMAND_REPLY` 才送到（`error` 非零）。而事件
+    /// 循环原来只在收到回复时归还参数内存、把 `error` 整个丢掉，于是
+    /// 「命令名拼错了」和「命令执行完了」在调用方看来完全一样：按了键，
+    /// 什么都没发生，也没有任何日志。
+    ///
+    /// 0.4.0 加逐帧 / 变速 / 截图时踩的就是这个坑，所以补上这条通道。
+    /// 消息里是 mpv 的错误原文，界面上按 `err_command` 显示。
+    CommandError(String),
 }
 
 /// initialize 之前必须设好的选项。
@@ -154,9 +213,13 @@ pub struct MpvPlayer {
 ///
 /// `_ptrs` 指向 `_args` 自己的堆内存；两者一起 drop，所以只要结构还活着，
 /// 指针就一定指向有效内存。
+///
+/// `name` 是命令名（`args[0]`）。回复里只有 `reply_userdata`，拿不到命令名，
+/// 所以在这里存一份，才能在 mpv 拒绝命令时告诉用户**是哪一条命令**被拒了。
 struct PendingCommand {
     _args: Box<[CString]>,
     _ptrs: Box<[*const c_char]>,
+    name: String,
 }
 
 // SAFETY: 裸指针本身不是 Send，这里逐条说明为什么可以跨线程传递。
@@ -363,8 +426,26 @@ impl MpvPlayer {
                         MPV_EVENT_FILE_LOADED => on_event(MpvEventMessage::FileLoaded),
                         // 异步命令执行完毕，归还它在途期间占用的参数内存。
                         MPV_EVENT_COMMAND_REPLY => {
+                            let mut taken = None;
                             if let Ok(mut map) = pending.lock() {
-                                map.remove(&event.reply_userdata);
+                                taken = map.remove(&event.reply_userdata);
+                            }
+                            // `error` 非零 = mpv 拒绝了这个命令。命令名写错时
+                            // 这是**唯一**的信号：`command_async` 本身返回成功。
+                            //
+                            // `quit` 不上报：它是在 `shutdown()` 里发的，事件线程
+                            // 可能先收到 SHUTDOWN 而退出，回复压根不来；而如果来了，
+                            // 那也是正常的退出时序，报错只会让用户莫名其妙。
+                            if event.error != 0 {
+                                if let Some(cmd) = taken {
+                                    if cmd.name != "quit" {
+                                        on_event(MpvEventMessage::CommandError(format!(
+                                            "{}: {}",
+                                            cmd.name,
+                                            api.error_message(event.error)
+                                        )));
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -409,6 +490,29 @@ impl MpvPlayer {
                 self.handle,
                 cname.as_ptr(),
                 MPV_FORMAT_DOUBLE,
+                &mut out as *mut _ as *mut c_void,
+            )
+        };
+        if code < 0 {
+            Err(self.api.error_message(code))
+        } else {
+            Ok(out)
+        }
+    }
+
+    /// 读一个 64 位整数属性。
+    ///
+    /// 丢帧计数那几个观测项（`vo-drop-frame-count` 等）在 mpv 里注册的是
+    /// **int64** 而不是 double，所以必须按 int64 读：用 double 读会拿到
+    /// `MPV_ERROR_PROPERTY_FORMAT`。
+    pub fn get_int64_property(&self, name: &str) -> Result<i64, String> {
+        let cname = CString::new(name).map_err(|_| "属性名包含空字节".to_string())?;
+        let mut out: i64 = 0;
+        let code = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                cname.as_ptr(),
+                MPV_FORMAT_INT64,
                 &mut out as *mut _ as *mut c_void,
             )
         };
@@ -469,6 +573,13 @@ impl MpvPlayer {
                     .map_err(|_| format!("command argument {a:?} contains a NUL byte"))?,
             );
         }
+        // 命令名先拿出来存一份：`args` 随后会被 move 进 Box，而事件线程
+        // 需要在归还时知道是哪一条命令被拒了。
+        let name = owned
+            .first()
+            .and_then(|c| c.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let args: Box<[CString]> = owned.into_boxed_slice();
 
         let mut ptrs: Vec<*const c_char> = args.iter().map(|c| c.as_ptr()).collect();
@@ -489,6 +600,7 @@ impl MpvPlayer {
                 PendingCommand {
                     _args: args,
                     _ptrs: ptrs,
+                    name,
                 },
             );
 
@@ -611,6 +723,41 @@ impl MpvPlayer {
     /// 跳转到指定秒数。
     pub fn seek(&self, seconds: f64) -> Result<(), String> {
         self.set_double_property("time-pos", seconds)
+    }
+
+    /// 逐帧步进。
+    ///
+    /// 走 mpv 的 `frame-step` / `frame-back-step` 命令而不是自己算一帧的时长
+    /// 再 `seek`：可变帧率（VFR）素材里「一帧」不是固定的 1/fps，自己算会
+    /// 越走越偏。
+    pub fn frame_step(&self, forward: bool) -> Result<(), String> {
+        self.command(if forward {
+            &["frame-step"]
+        } else {
+            &["frame-back-step"]
+        })
+    }
+
+    /// 设置倍速。
+    ///
+    /// 走 `speed` 属性而不是 `speed <factor>` 命令：属性值可以随时读回来
+    /// 显示，而命令执行完就没了。
+    pub fn set_speed(&self, speed: f64) -> Result<(), String> {
+        self.set_double_property("speed", speed.clamp(0.0625, 16.0))
+    }
+
+    /// 把当前画面存成图片文件。
+    ///
+    /// 用 `screenshot-to-file` 而不是 `screenshot`：后者按 mpv 自己的命名规则
+    /// 写到工作目录，而从资源管理器启动时工作目录不确定，用户根本找不到。
+    ///
+    /// 第三个参数是 mpv 的截图 flag，显式给 `video`（只要画面、不要字幕）。
+    /// 不传的话默认值是 `subtitles`，行为会随 mpv 版本漂移。
+    pub fn screenshot_to_file(&self, path: &Path) -> Result<(), String> {
+        let Some(p) = path.to_str() else {
+            return Err("screenshot path is not valid Unicode".to_string());
+        };
+        self.command(&["screenshot-to-file", p, "video"])
     }
 
     /// 设置音量。mpv 允许 0~130，这里前端限制在 100。
@@ -757,6 +904,9 @@ fn decode_property(
         match format {
             MPV_FORMAT_FLAG => PropertyValue::Flag(unsafe { *(prop.data as *const c_int) != 0 }),
             MPV_FORMAT_DOUBLE => PropertyValue::Number(unsafe { *(prop.data as *const f64) }),
+            // `int64` 是 i64 而不是 c_int：丢帧计数用 int 存会在 2^31 帧之后
+            // 溢出（按 60fps 算是 414 天连续播放，理论上可能但不该靠它不出错）
+            MPV_FORMAT_INT64 => PropertyValue::Integer(unsafe { *(prop.data as *const i64) }),
             MPV_FORMAT_STRING => {
                 let ptr = unsafe { *(prop.data as *const *const c_char) };
                 if ptr.is_null() {

@@ -140,6 +140,197 @@ fn headless_player() -> MpvPlayer {
     .expect("创建 mpv 实例失败（libmpv-2.dll 是否就位？）")
 }
 
+/// 建一个带真实视频输出的实例，并返回它与事件通道。
+///
+/// `wid: 0` + `force-window=yes` 就能建出 VO（项目里 `有窗口时硬件解码生效或明确报告降级`
+/// 那条测试已经验证过这条路径）。**截图必须有真实 VO** —— `vo=null` 没有
+/// 画面可截，`screenshot-to-file` 会被拒绝。
+fn windowed_player() -> Option<(MpvPlayer, mpsc::Receiver<MpvEventMessage>)> {
+    let player = MpvPlayer::new(&InitOptions {
+        wid: 0,
+        headless: false,
+    })
+    .ok()?;
+    let (tx, rx) = mpsc::channel();
+    player.spawn_event_loop(Box::new(move |msg| {
+        let _ = tx.send(msg);
+    }));
+    Some((player, rx))
+}
+
+/// 收集一段时间内的全部事件。
+fn drain(rx: &mpsc::Receiver<MpvEventMessage>, ms: u64) -> Vec<MpvEventMessage> {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    let mut out = Vec::new();
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(m) => out.push(m),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    out
+}
+
+/// 事件里有没有被 mpv 拒绝的命令。
+fn rejected_commands(events: &[MpvEventMessage]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            MpvEventMessage::CommandError(msg) => Some(msg.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 逐帧与变速的命令名必须是 mpv 真认识的名字。
+///
+/// ## 这条测试为什么必须存在
+///
+/// `mpv_command_async` 对**无效命令名**返回的是成功，被拒绝这件事要等之后
+/// 那条 `MPV_EVENT_COMMAND_REPLY` 才送到。也就是说命令名拼错了，调用方看到的是
+/// 「返回 Ok」，界面表现是「按了键什么都没发生」，日志里一个字都没有——
+/// 项目代码里 `shutdown()` 的注释就记着 `cycle-pause` 曾经这样静默失效。
+///
+/// 命令名在 mpv 里随版本增删，不能靠记忆也不能靠文档（文档可能比 DLL 旧）。
+/// 所以每加一个命令就得配一条这样的测试。
+#[test]
+fn 逐帧与变速的命令名有效() {
+    let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/loop60s.mp4");
+    let player = headless_player();
+    let (tx, rx) = mpsc::channel();
+    player.spawn_event_loop(Box::new(move |msg| {
+        let _ = tx.send(msg);
+    }));
+    if player.load_file(&media).is_err() {
+        eprintln!("跳过：测试素材加载失败");
+        let _ = player.shutdown();
+        return;
+    }
+    // 等解码器建立，否则 frame-step 可能因为没有帧而被拒绝
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = drain(&rx, 300);
+
+    player.frame_step(true).expect("frame-step 命令应当被接受");
+    player
+        .frame_step(false)
+        .expect("frame-back-step 命令应当被接受");
+    player.set_speed(1.5).expect("speed 应当被接受");
+    player.set_speed(1.0).expect("speed 应当被接受");
+
+    let events = drain(&rx, 1200);
+    let rejected = rejected_commands(&events);
+    assert!(
+        rejected.is_empty(),
+        "这些命令被 mpv 拒绝了（命令名可能拼错）：\n  {}",
+        rejected.join("\n  ")
+    );
+    let _ = player.shutdown();
+}
+
+/// 变速之后 mpv 报的 `speed` 应当就是我们设的那个值。
+///
+/// 上一条只验证「命令没被拒」，这条验证「它真的生效了」——一个被接受但
+/// 什么都不做的命令同样满足上一条。
+#[test]
+fn 变速真的生效() {
+    let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/loop60s.mp4");
+    let player = headless_player();
+    if player.load_file(&media).is_err() {
+        eprintln!("跳过：测试素材加载失败");
+        let _ = player.shutdown();
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    player.set_speed(2.0).expect("设置倍速");
+    std::thread::sleep(Duration::from_millis(200));
+    let v = player.get_double_property("speed").expect("speed 属性可读");
+    assert!((v - 2.0).abs() < 1e-6, "speed 读回 {v}，期望 2.0");
+
+    let _ = player.shutdown();
+}
+
+/// 截图命令名有效，并且真的写出了文件。
+///
+/// 名字与参数都要验：`screenshot-to-file` 的第二个参数是文件名、第三个是截图
+/// flag（`video` / `subtitles` / `window`）。flag 拼错同样是被拒绝，而拒绝的
+/// 表现是「按 S 什么都不发生」。
+///
+/// 必须用带 VO 的实例：`vo=null` 没有画面可截。
+#[test]
+fn 截图命令有效且真的写出文件() {
+    let Some((player, rx)) = windowed_player() else {
+        eprintln!("跳过：无法创建带 wid 的 mpv 实例");
+        return;
+    };
+    let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/loop60s.mp4");
+    if player.load_file(&media).is_err() {
+        eprintln!("跳过：测试素材加载失败");
+        let _ = player.shutdown();
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let _ = drain(&rx, 300);
+
+    let out = std::env::temp_dir().join("vv-shot-test.png");
+    let _ = std::fs::remove_file(&out);
+    player
+        .screenshot_to_file(&out)
+        .expect("screenshot-to-file 命令应当被接受");
+
+    // 文件是异步写出的：命令只是提交，VO 在下一帧才真正落盘
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !out.exists() {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    let events = drain(&rx, 500);
+    let rejected = rejected_commands(&events);
+    assert!(
+        rejected.is_empty(),
+        "截图被 mpv 拒绝了（命令名或 flag 拼错）：\n  {}",
+        rejected.join("\n  ")
+    );
+    assert!(
+        out.exists(),
+        "命令被接受但没有文件落到 {} —— 说明命令名对、参数形状不对",
+        out.display()
+    );
+    assert!(
+        std::fs::metadata(&out)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false),
+        "截图文件是空的"
+    );
+    let _ = std::fs::remove_file(&out);
+    let _ = player.shutdown();
+}
+
+/// 丢帧计数读得到，而且是非负整数。
+///
+/// 这两个是诊断面板里最硬的指标（`frame-drop-count` 在实测里是 10，
+/// 说明启动瞬间确实丢过帧）。读不到的话面板会一直显示横线。
+#[test]
+fn 丢帧计数能读出来() {
+    let media = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/loop60s.mp4");
+    let player = headless_player();
+    if player.load_file(&media).is_err() {
+        eprintln!("跳过：测试素材加载失败");
+        let _ = player.shutdown();
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+
+    for name in ["decoder-frame-drop-count", "frame-drop-count"] {
+        match player.get_int64_property(name) {
+            Ok(v) => assert!(v >= 0, "{name} = {v}，不应为负"),
+            Err(e) => panic!("{name} 读不出来：{e}"),
+        }
+    }
+    let _ = player.shutdown();
+}
+
 #[test]
 fn 能加载_dll_并初始化() {
     let player = headless_player();

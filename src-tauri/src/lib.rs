@@ -3,6 +3,7 @@
 //! 组成：
 //!
 //! * [`mpv`] —— libmpv 的最小 FFI 封装（动态加载，无构建期 C 依赖）
+//! * [`diag`] —— 解码健康度：把 mpv 的观测项收成能下判断的数据
 //! * [`surface`] —— mpv 画面子窗口（纯 Win32）
 //! * [`ui`] —— 控制栏的布局 / 绘制 / 命中测试
 //! * `app` —— 主窗口与消息循环
@@ -12,8 +13,12 @@
 
 mod app;
 pub mod cpu;
+pub mod crashlog;
+pub mod diag;
+pub mod gpu;
 pub mod lang;
 pub mod mpv;
+pub mod settings;
 mod surface;
 mod ui;
 

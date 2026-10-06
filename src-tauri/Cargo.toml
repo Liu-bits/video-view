@@ -1,6 +1,6 @@
 [package]
 name = "video-view"
-version = "0.3.0"
+version = "0.4.0"
 description = "轻量级 Windows 桌面视频播放器，基于 libmpv 与原生 Win32 界面"
 authors = ["VideoView contributors"]
 license = "GPL-3.0-or-later"
@@ -23,20 +23,33 @@ libloading = "0.8"
 rfd = { version = "0.17", default-features = false }
 windows = { version = "0.62", features = [
   "Win32_Foundation",
+  # EnumDisplayDevicesW：诊断报告里要给出显卡名
   "Win32_Graphics_Gdi",
-  "Win32_System_Com",
-  "Win32_System_LibraryLoader",
-  "Win32_System_Ole",
   # 语言判定：读安装器写入的注册表值 + 系统界面语言（GetUserDefaultUILanguage）
   "Win32_Globalization",
+  # RegCreateKeyExW 的 SECURITY_ATTRIBUTES 参数类型在这里
+  "Win32_Security",
+  "Win32_System_Com",
+  # 复制诊断报告到剪贴板
+  "Win32_System_DataExchange",
+  # GlobalAlloc / GlobalLock：剪贴板数据的跨进程内存
+  "Win32_System_Memory",
+  # 崩溃日志：SetUnhandledExceptionFilter / EXCEPTION_POINTERS
+  # 注意 SetUnhandledExceptionFilter 本身被 gate 在 Win32_System_Kernel 后面
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Kernel",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
   "Win32_System_Registry",
   # GetLogicalProcessorInformationEx：按物理核枚举，取物理核数
   # （注意它不在 SystemServices 里，那是常量的聚集地）
   "Win32_System_SystemInformation",
   "Win32_System_SystemServices",
+  # 日志目录：CreateDirectoryW / GetFileAttributesW
+  "Win32_Storage_FileSystem",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
-  # HDROP / DragAcceptFiles / DragQueryFileW 所在模块
+  # HDROP / DragAcceptFiles / DragQueryFileW / SHGetKnownFolderPath（图片目录）
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

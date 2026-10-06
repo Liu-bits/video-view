@@ -71,6 +71,8 @@ public class VV {
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);
+  // 面板那节用它直接发按键（keybd_event 送不进字母键，见 Send-KeyMsg 的说明）
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
@@ -170,6 +172,25 @@ function Send-Key($vk) {
     [VV]::keybd_event($vk, 0, 0, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 60
     [VV]::keybd_event($vk, 0, 2, [IntPtr]::Zero)
+}
+
+# 直接发 WM_KEYDOWN / WM_KEYUP，不走键盘注入这一层。
+#
+# ## 为什么不统一用 Send-Key
+#
+# `keybd_event` 在这台机器上**送不进字母键**：实测 0x49（I）和 0x46（F）
+# 按下去主窗口完全收不到，而 0xBF（VK_OEM_2）、0x1B、0x20、方向键、F11
+# 都正常。程序侧没有问题——同一个 0x49 用 SendMessage 发进去，面板正常
+# 打开。这是注入路径的问题（`bScan = 0` 时系统要按当前键盘布局把虚拟键码
+# 反查成扫描码），不是应用的键盘处理有问题。
+#
+# 所以面板这一节用 SendMessage：它测的正是我们要验的东西（`WM_KEYDOWN`
+# 处理分支），而且不依赖注入是否可靠。其余小节继续用 `Send-Key`，保持
+# 原来的行为不变。
+function Send-KeyMsg($h, $vk) {
+    [VV]::SendMessageW($h, 0x0100, [IntPtr]$vk, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 60
+    [VV]::SendMessageW($h, 0x0101, [IntPtr]$vk, [IntPtr]::Zero) | Out-Null
 }
 
 function Click($x, $y) {
@@ -511,6 +532,105 @@ try {
     $wr = Get-Rect $main
     Add-Result "fsOff" (($wr.Right - $wr.Left) -eq 1100) `
         ("F11 -> {0}x{1}" -f ($wr.Right - $wr.Left), ($wr.Bottom - $wr.Top))
+
+    # ---- 面板 ----------------------------------------------------------------
+    #
+    # 面板是 0.4.0 加的。它**不是**浮在画面上，而是在控制栏上方占一块、
+    # 把画面区顶矮（见 ui::Layout::new 的注释：mpv 的画面是原生子窗口，
+    # 浮层盖不住它）。
+    #
+    # 所以验的是「画面子窗口变矮」而不是「窗口变高」——后者是浮层实现下
+    # 才会出现的现象，写反了这条测试就验错了东西。控制栏自己不动。
+    #
+    # 按键走 `Send-KeyMsg`（直接发 WM_KEYDOWN）而不是 `Send-Key`
+    # （keybd_event）：后者在这台机器上送不进字母键，理由见那个函数的注释。
+    Write-Host ""
+    Write-Host "[panel]"
+    $bmpPanelBefore = Grab $main
+    # 基准必须在按键**之前**读。读成按键之后的两次，两次都是面板打开后的
+    # 高度，`statsPanelShifts` 就永远比不出来（第一版就是这么写错的）
+    $vr0 = VideoRect
+    Force-Foreground $main
+    Start-Sleep -Milliseconds 400
+
+    # I = 解码诊断
+    Send-KeyMsg $main 0x49
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpStats = Grab $main
+    $vr1 = VideoRect
+
+    # 面板区域应当和控制栏区域明显不同（一个是画画面，一个是画文字的面板）
+    $statsBand = [math]::Max(0, $vr0.vh - (DipPx 130))
+    $diff = PixDiff $bmpPanelBefore $bmpStats $ox $statsBand $cw (DipPx 100) 3
+    Add-Result "statsPanelShows" ($diff -gt 20) `
+        ("I 之后画面区下沿那一条变化 {0}%" -f $diff)
+
+    # 画面区变矮（控制栏不动）
+    Add-Result "statsPanelShifts" ($vr1.vh -lt $vr0.vh) `
+        ("画面高 {0} -> {1}（面板吃掉画面区，控制栏不动）" -f $vr0.vh, $vr1.vh)
+
+    # ? = 快捷键总览（VK_OEM_2）
+    Send-KeyMsg $main 0xBF
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpHelp = Grab $main
+    $vr2 = VideoRect
+    Add-Result "helpPanelTaller" ($vr2.vh -lt $vr1.vh) `
+        ("画面高 {0} -> {1}（15 行比 7 行更高）" -f $vr1.vh, $vr2.vh)
+    $diffHelp = PixDiff $bmpStats $bmpHelp $ox ([math]::Max(0, $vr2.vh - (DipPx 200))) $cw (DipPx 180) 3
+    Add-Result "helpPanelDiffers" ($diffHelp -gt 20) `
+        ("诊断面板与快捷键面板内容差异 {0}%" -f $diffHelp)
+
+    # 再按 I 切回诊断（两种模式互斥，不会同时显示）
+    Send-KeyMsg $main 0x49
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $vr3 = VideoRect
+    Add-Result "panelSwitchBack" ($vr3.vh -gt $vr2.vh) `
+        ("画面高 {0} -> {1}（切回 7 行）" -f $vr2.vh, $vr3.vh)
+
+    # 再按 I 收起
+    Send-KeyMsg $main 0x49
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $vr4 = VideoRect
+    Add-Result "panelCollapses" ($vr4.vh -gt $vr3.vh) `
+        ("画面高 {0} -> {1}（面板收起）" -f $vr3.vh, $vr4.vh)
+
+    # 影院模式下按 I 应当**完全没有反应**。
+    #
+    # 面板在影院模式里是看不见的（`Layout::new` 里 theatre 时高度为 0）。
+    # 如果这时仍然改状态，用户按了 `I` 什么都没看到，退出影院后面板却
+    # 自己冒出来——「按了没反应、过一会儿自己出现」比「按了确实没反应」
+    # 难解释得多。所以 `App::set_panel` 在影院模式下直接返回。
+    #
+    # 验法是「退出影院之后仍然没有面板」：只比影院模式下的两次读数会漏掉
+    # 「状态被改了但当时看不见」这种情形（第一版就漏了，测出来 673 vs 424）。
+    Send-KeyMsg $main 0x46
+    Start-Sleep -Seconds 2
+    $vr5 = VideoRect
+    Send-KeyMsg $main 0x49
+    Start-Sleep -Seconds 2
+    $vrInTheatre = VideoRect
+    Send-KeyMsg $main 0x1B
+    Start-Sleep -Seconds 2
+    $vr6 = VideoRect
+    Add-Result "noPanelInTheatre" (($vr5.vh -eq $vrInTheatre.vh) -and ($vr6.vh -eq $vr0.vh)) `
+        ("影院 {0} -> 按 I 后 {1} -> 退出后 {2}（基准 {3}）" -f $vr5.vh, $vrInTheatre.vh, $vr6.vh, $vr0.vh)
+
+    # 把面板状态落成截图，人工看一眼内容对不对
+    Send-KeyMsg $main 0x49
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $shotDir = Join-Path $PSScriptRoot "..\artifacts\ui-shots"
+    New-Item -ItemType Directory -Path $shotDir -Force | Out-Null
+    foreach ($pair in @(@("stats", $bmpStats), @("help", $bmpHelp))) {
+        $f = Join-Path $shotDir ("panel-{0}.png" -f $pair[0])
+        $pair[1].Save($f, [System.Drawing.Imaging.ImageFormat]::Png)
+        $pair[1].Dispose()
+    }
+    Write-Host ("  screenshots -> {0}" -f (Resolve-Path $shotDir))
 
 } catch {
     # 记下来，不直接抛。

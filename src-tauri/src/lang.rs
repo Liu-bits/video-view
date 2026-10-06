@@ -221,6 +221,58 @@ pub struct Strings {
     // ---- 启动阶段的致命错误 ----
     pub err_read_target: &'static str,
     pub err_register_class: &'static str,
+
+    // ---- 解码诊断面板的标签（一列，逐行对齐）----
+    //
+    // 标签列的宽度差异要交给 `ui::Metrics` 实测，不能靠等宽字体的空格去凑：
+    // 中英文混排时宽度根本不是整数倍。取值统一由 `diag_labels()` 提供，
+    // 免得绘制那边和测量那边各写一份、改一处忘一处。
+    pub diag_hwdec: &'static str,
+    pub diag_video: &'static str,
+    pub diag_fps: &'static str,
+    pub diag_dropped: &'static str,
+    pub diag_cache: &'static str,
+    pub diag_speed: &'static str,
+    pub diag_verdict: &'static str,
+
+    // ---- 解码诊断面板的取值与结论 ----
+    /// 「拿不到」，用来与「确实是 0」区分开
+    pub diag_unknown: &'static str,
+    pub diag_healthy: &'static str,
+    pub diag_zero_copy: &'static str,
+    /// 面板里 hwdec 一栏在降级时显示的短词
+    pub diag_software_short: &'static str,
+    pub diag_software_decode: &'static str,
+    pub diag_no_decoder: &'static str,
+    pub diag_no_zero_copy: &'static str,
+    pub diag_decoder_drops: &'static str,
+    pub diag_vo_drops: &'static str,
+    pub diag_fps_behind: &'static str,
+
+    // ---- mpv 拒绝了一条命令 ----
+    pub err_command: &'static str,
+
+    // ---- 截图 / 诊断报告 ----
+    pub err_screenshot: &'static str,
+    pub err_report: &'static str,
+    pub info_report_copied: &'static str,
+
+    // ---- 快捷键总览 ----
+    pub help_play_pause: &'static str,
+    pub help_seek: &'static str,
+    pub help_volume: &'static str,
+    pub help_percent: &'static str,
+    pub help_frame_step: &'static str,
+    pub help_speed: &'static str,
+    pub help_jump: &'static str,
+    pub help_mute: &'static str,
+    pub help_theatre: &'static str,
+    pub help_fullscreen: &'static str,
+    pub help_screenshot: &'static str,
+    pub help_diag: &'static str,
+    pub help_open: &'static str,
+    pub help_copy: &'static str,
+    pub help_help: &'static str,
 }
 
 impl Strings {
@@ -259,6 +311,42 @@ impl Strings {
             err_not_a_file: "What was dropped is not a file.",
             err_read_target: "Could not read the startup target: {e}",
             err_register_class: "Could not register the window class: {e}",
+            diag_hwdec: "Decode",
+            diag_video: "Video",
+            diag_fps: "FPS",
+            diag_dropped: "Dropped",
+            diag_cache: "Cache",
+            diag_speed: "Speed",
+            diag_verdict: "Verdict",
+            diag_unknown: "—",
+            diag_healthy: "looks healthy",
+            diag_zero_copy: "zero-copy",
+            diag_software_short: "software",
+            diag_software_decode: "hardware decoding is OFF — mpv fell back to software decoding",
+            diag_no_decoder: "no decoder running yet",
+            diag_no_zero_copy: "hardware decoding is on but frames still cross the CPU",
+            diag_decoder_drops: "decoder dropped frames",
+            diag_vo_drops: "output dropped frames",
+            diag_fps_behind: "actual FPS is below the file's",
+            err_command: "The playback engine rejected a command",
+            err_screenshot: "Could not save the screenshot",
+            err_report: "Could not copy the diagnostics report",
+            info_report_copied: "Diagnostics copied to the clipboard.",
+            help_play_pause: "Play / pause",
+            help_seek: "Seek 10 seconds",
+            help_volume: "Volume up / down",
+            help_percent: "Jump to 0%–90%",
+            help_frame_step: "Step one frame",
+            help_speed: "Slower / faster",
+            help_jump: "Jump to start / end",
+            help_mute: "Mute",
+            help_theatre: "Theatre mode",
+            help_fullscreen: "Full screen",
+            help_screenshot: "Save a screenshot",
+            help_diag: "Decode diagnostics",
+            help_open: "Open a file",
+            help_copy: "Copy the diagnostics report",
+            help_help: "This list",
         }
     }
 
@@ -288,9 +376,94 @@ impl Strings {
             err_not_a_file: "拖进来的不是文件。",
             err_read_target: "读取启动目标失败：{e}",
             err_register_class: "注册窗口类失败：{e}",
+            diag_hwdec: "解码",
+            diag_video: "视频",
+            diag_fps: "帧率",
+            diag_dropped: "丢帧",
+            diag_cache: "缓存",
+            diag_speed: "倍速",
+            diag_verdict: "结论",
+            diag_unknown: "—",
+            diag_healthy: "一切正常",
+            diag_zero_copy: "零拷贝",
+            diag_software_short: "软解",
+            diag_software_decode: "硬件解码未生效，mpv 已静默退回软件解码",
+            diag_no_decoder: "解码器还没建立",
+            diag_no_zero_copy: "硬解生效，但画面仍要经过 CPU",
+            diag_decoder_drops: "解码器丢了帧",
+            diag_vo_drops: "显示端丢了帧",
+            diag_fps_behind: "实际帧率低于文件标称",
+            err_command: "播放核心拒绝了一条命令",
+            err_screenshot: "截图保存失败",
+            err_report: "复制诊断信息失败",
+            info_report_copied: "诊断信息已复制到剪贴板。",
+            help_play_pause: "播放 / 暂停",
+            help_seek: "快退 / 快进 10 秒",
+            help_volume: "音量增 / 减",
+            help_percent: "跳到 0%–90%",
+            help_frame_step: "逐帧后退 / 前进",
+            help_speed: "减速 / 加速",
+            help_jump: "跳到开头 / 结尾",
+            help_mute: "静音",
+            help_theatre: "影院模式",
+            help_fullscreen: "全屏",
+            help_screenshot: "保存截图",
+            help_diag: "解码诊断",
+            help_open: "打开文件",
+            help_copy: "复制诊断报告",
+            help_help: "这一页",
         }
     }
+
+    /// 诊断面板的标签列，顺序与 `diag::Diagnostics::rows` 里那几行一致。
+    ///
+    /// 单独抽出来是因为 `ui::Metrics` 要按它实测最大宽度来定标签列宽度，
+    /// 而 `rows()` 给的是 `(标签, 值)` 的成对数据。顺序或长度对不上，
+    /// 面板就会整列错位——所以两边必须共用这一个来源。
+    pub fn diag_labels(&self) -> [&'static str; 7] {
+        [
+            self.diag_hwdec,
+            self.diag_video,
+            self.diag_fps,
+            self.diag_dropped,
+            self.diag_cache,
+            self.diag_speed,
+            self.diag_verdict,
+        ]
+    }
+
+    /// 快捷键总览的每一行：`(按键, 说明)`。
+    ///
+    /// 按键写法语言中立（两种语言共用同一套键），只有右边的说明要翻译。
+    /// 两种语言的**行数必须一致** —— `快捷键总览两种语言行数一致` 那条
+    /// 测试盯着这件事，面板高度就是按行数算的。
+    pub fn help_rows(&self) -> [(&'static str, &'static str); HELP_ROWS] {
+        [
+            ("Space", self.help_play_pause),
+            ("← / →", self.help_seek),
+            ("↑ / ↓", self.help_volume),
+            ("0 … 9", self.help_percent),
+            (", / .", self.help_frame_step),
+            ("[ / ]", self.help_speed),
+            ("Home / End", self.help_jump),
+            ("M", self.help_mute),
+            ("F", self.help_theatre),
+            ("F11", self.help_fullscreen),
+            ("S", self.help_screenshot),
+            ("I", self.help_diag),
+            ("Ctrl + O", self.help_open),
+            ("Ctrl + C", self.help_copy),
+            ("?", self.help_help),
+        ]
+    }
 }
+
+/// 快捷键总览的行数。面板高度按它算，所以两种语言必须一致
+/// （`快捷键总览两种语言行数一致` 那条测试盯着）。
+pub const HELP_ROWS: usize = 15;
+
+/// 解码诊断面板的行数。标签来自 `Strings::diag_labels()`，长度固定。
+pub const DIAG_ROWS: usize = 7;
 
 #[cfg(test)]
 mod tests {

@@ -26,9 +26,9 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, FrameRect, GetDC,
     GetMonitorInfoW, GetTextExtentPoint32W, GetTextMetricsW, IntersectClipRect, MonitorFromWindow,
     ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FF_DONTCARE, FW_NORMAL, GDI_REGION_TYPE, HBRUSH, HDC, HFONT, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, GDI_REGION_TYPE, HBRUSH, HDC, HFONT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -80,6 +80,17 @@ const TIME_W_DIP: i32 = 52;
 const VOL_W_DIP: i32 = 96;
 const SLIDER_THICK_DIP: i32 = 3;
 const THUMB_DIP: i32 = 11;
+
+/// 诊断 / 快捷键面板的排版常量。
+///
+/// 面板沿用控制栏的硬边风格：无渐变、无圆角、无半透明。GDI 的 `FillRect`
+/// 本来也没有 alpha 通道，硬色块反而和 `C_LINE` 边框、`C_DIM` 文字这套
+/// 语言是一致的。
+const PANEL_PAD_X_DIP: i32 = 14;
+/// 面板上下各留一点，不让第一行/最后一行贴着边框。
+const PANEL_PAD_Y_DIP: i32 = 4;
+/// 面板里标签列与值列之间的间距。
+const PANEL_COL_GAP_DIP: i32 = 14;
 
 /// 字体大小（DIP）。比旧版网页界面的 11/12/13px 略放大一档：
 /// 旧版在 125% 缩放下时间码只有 13.75 物理像素高，窗口拉大后很难看清。
@@ -138,6 +149,13 @@ pub fn dpi_for_window(hwnd: HWND) -> u32 {
 #[derive(Debug, Clone, Copy)]
 pub struct Layout {
     pub controls: RECT,
+    /// 诊断 / 快捷键面板的区域。没有面板时是一个零高度的矩形（top == bottom）。
+    pub panel: RECT,
+    /// 面板 + 控制栏的并集（两者上下相邻，所以是一个矩形）。
+    ///
+    /// 上层把脏区裁到这里，而 `paint` 把这块整体填成面板色——两边必须用
+    /// 同一个矩形，见 `paint` 里关于「有文件在播时」的说明。
+    pub chrome: RECT,
     pub time_current: RECT,
     pub time_duration: RECT,
     pub seek: RECT,
@@ -160,15 +178,69 @@ impl Layout {
     /// `m` 是当前语言 + DPI 下量出来的文字尺寸，**所有控件宽度都由它算出**，
     /// 不再有写死的 DIP 常量。这样中文两字与英文单词都恰好放下，
     /// 切换语言不需要另一套布局。
-    pub fn new(client_w: i32, client_h: i32, dpi: u32, theatre: bool, m: &Metrics) -> Self {
+    ///
+    /// `panel_rows` 是面板要显示多少行，0 表示不显示。面板画在控制栏**上面**，
+    /// 所以控制栏（以及 mpv 的画面子窗口）整体上移这么多——画面区随之变矮。
+    ///
+    /// ## 为什么面板是「把控制栏顶上去」而不是浮在画面上
+    ///
+    /// mpv 的画面是一个**原生子窗口**，它整个盖在视频区上，而我们在主窗口的
+    /// `WM_PAINT` 里画的东西全在它**下面**。想让浮层盖住画面就得再开一个
+    /// 置顶的子窗口并自己管 Z 序（resize / 影院 / 全屏切换都得重排，还要
+    /// 处理鼠标穿透），那是几十行容易出 z 序 bug 的窗口代码。
+    ///
+    /// 让控制栏长高一截则是零风险：布局、脏区裁剪、画面子窗口尺寸全都走
+    /// 现成的那条路径（`relayout` 里本来就是同一个函数在算），而且面板只在
+    /// 用户主动打开时存在，代价是那段时间画面矮一点。诊断面板本来就是
+    /// 「暂停下来看一眼」的东西，这个取舍划算。
+    pub fn new(
+        client_w: i32,
+        client_h: i32,
+        dpi: u32,
+        theatre: bool,
+        panel_rows: usize,
+        m: &Metrics,
+    ) -> Self {
         let pad_x = px(PAD_X_DIP, dpi);
         let gap = px(GAP_DIP, dpi);
         let cluster_gap = px(CLUSTER_GAP_DIP, dpi);
         let ctrl_h = if theatre { 0 } else { px(CTRL_H_DIP, dpi) };
 
+        // 控制栏**永远**贴着客户区底部，面板在它上面。
+        //
+        // 这一点很容易写反：把 `controls.top` 设成「底部减去控制栏再减去面板」
+        // 会让 `controls` 这个矩形把面板那一段也包进去，于是
+        // `controls.bottom - controls.top` 变成「控制栏 + 面板」，
+        // 按钮的位置也跟着偏到面板里去（实测：控制栏高度从 78 变成 247，
+        // 播放键画到了面板那一行）。面板是独立的一块，两块相邻而不是包含。
+        let controls_top = (client_h - ctrl_h).max(0);
+
+        // 影院模式下不显示面板：影院模式的定义就是「什么都没有」
+        let panel_h = if theatre {
+            0
+        } else {
+            // 客户区不够高时夹住，否则面板会把控制栏顶到屏幕外
+            panel_height(panel_rows, m, dpi).min(controls_top)
+        };
+        let panel_top = (controls_top - panel_h).max(0);
+
         let mut controls = RECT {
             left: 0,
-            top: (client_h - ctrl_h).max(0),
+            top: controls_top,
+            right: client_w,
+            bottom: client_h,
+        };
+        // 面板紧贴控制栏上方
+        let panel = RECT {
+            left: 0,
+            top: panel_top,
+            right: client_w,
+            bottom: controls_top,
+        };
+        // 面板与控制栏上下相邻，并集就是从 panel.top 到客户区底的一条
+        let chrome = RECT {
+            left: 0,
+            top: panel_top,
             right: client_w,
             bottom: client_h,
         };
@@ -233,6 +305,8 @@ impl Layout {
 
         Self {
             controls,
+            panel,
+            chrome,
             time_current,
             time_duration,
             seek,
@@ -249,6 +323,11 @@ impl Layout {
     /// 命中测试。坐标是相对客户区的物理像素。
     pub fn hit(&self, x: i32, y: i32) -> Hit {
         if self.theatre {
+            return Hit::Video;
+        }
+        // 面板区域不是控件，点在上面的效果等同于点画面（单击切播放/暂停）。
+        // 不这么归类的话 `Hit::None` 会让光标变成箭头、单击什么也不做。
+        if contains(&self.panel, x, y) {
             return Hit::Video;
         }
         if !contains(&self.controls, x, y) {
@@ -298,6 +377,31 @@ pub enum Hit {
     Mute,
 }
 
+// ---------------------------------------------------------------- 面板
+
+/// 控制栏上方那块可选区域的内容。
+///
+/// 两种形态都是「左列 + 右列」，区别只在左列是什么：诊断面板左列是标签
+/// （本地化），快捷键面板左列是按键（语言中立）。列宽都取 `Metrics` 里实测的
+/// 最大值，所以中英文都不会挤在一起。
+#[derive(Debug, Clone, Copy)]
+pub enum Panel<'a> {
+    /// 解码诊断：`diag::Diagnostics::rows` 给出的 `(标签, 值)`
+    Stats(&'a [(String, String)]),
+    /// 快捷键总览
+    Help(&'a [(&'static str, &'static str)]),
+}
+
+impl Panel<'_> {
+    /// 这一行是不是诊断面板的结论行。
+    ///
+    /// 结论行用强调色，是为了让「正常 / 有问题」在一屏字里第一眼就被看到。
+    /// 快捷键面板没有结论行。
+    fn is_stats_last(&self, i: usize) -> bool {
+        matches!(self, Panel::Stats(rows) if i + 1 == rows.len())
+    }
+}
+
 // ---------------------------------------------------------------- 绘制状态
 
 /// 当前语言 + 当前 DPI 下，各段文字的**实测**尺寸（物理像素）。
@@ -328,6 +432,15 @@ pub struct Metrics {
     pub ui_h: i32,
     /// 时间码列宽，按最坏情况 `88:88:88` 量。
     pub time_w: i32,
+    /// 面板里标签列的宽度：取所有诊断标签里最宽的那个。
+    ///
+    /// 必须实测：中文「丢帧」两字和英文 `Dropped` 差一倍多，写死任何一个
+    /// 都会让另一边要么被截、要么和值之间多出一大截空隙。
+    pub diag_label_w: i32,
+    /// 快捷键面板里按键列的宽度，取所有按键里最宽的。
+    pub help_key_w: i32,
+    /// 面板一行的高度（等宽字体行高 + 上下各一点留白）。
+    pub row_h: i32,
 }
 
 impl Metrics {
@@ -343,6 +456,37 @@ impl Metrics {
     pub fn mute_w(&self) -> i32 {
         self.mute_on.max(self.mute_off)
     }
+}
+
+/// 面板里一行的高度（物理像素）。
+///
+/// **布局与绘制必须用同一个函数。** 原来这里算一遍（`m.row_h` 为 0 时退回
+/// `px(FONT_MONO_DIP + 6, 96)`——DPI 写死成 96），`draw_panel` 里又用
+/// `m.row_h.max(px(FONT_MONO_DIP, dpi))` 算一遍。两个表达式不等：150% 缩放下
+/// 布局算出的面板比绘制需要的高 2 像素，最后一行文字的下沿被面板下沿切掉。
+/// 这类「同一个量在两个地方各算一次」的错只有把两处收敛成一个函数才根治。
+fn row_height(m: &Metrics, dpi: u32) -> i32 {
+    let floor = px(FONT_MONO_DIP + 4, dpi);
+    if m.row_h > 0 {
+        m.row_h.max(floor)
+    } else {
+        floor
+    }
+}
+
+/// 面板总高度（物理像素）。
+///
+/// 行数乘行高，加上上下各一点内边距。没有面板时返回 0。
+pub fn panel_height(rows: usize, m: &Metrics, dpi: u32) -> i32 {
+    if rows == 0 {
+        return 0;
+    }
+    rows as i32 * row_height(m, dpi) + 2 * px(PANEL_PAD_Y_DIP, dpi)
+}
+
+/// 面板里两列之间的间距。
+fn panel_col_gap(dpi: u32) -> i32 {
+    px(PANEL_COL_GAP_DIP, dpi)
 }
 
 /// 量一段文字在 `font` 下的宽度（物理像素）。
@@ -414,6 +558,8 @@ pub struct PaintState<'a> {
     pub hover: Hit,
     /// 当前语言的文案。
     pub strings: &'a lang::Strings,
+    /// 要显示的面板。`None` = 不显示（这时控制栏顶到客户区底部）。
+    pub panel: Option<Panel<'a>>,
 }
 
 /// 当前 DPI 下的字体集合。DPI 变化时整套重建。
@@ -470,6 +616,9 @@ fn measure_metrics(fonts: &Fonts, strings: &lang::Strings) -> Metrics {
             mute_off: 0,
             ui_h: 0,
             time_w: 0,
+            diag_label_w: 0,
+            help_key_w: 0,
+            row_h: 0,
         };
     };
     let ui = fonts.ui;
@@ -484,6 +633,22 @@ fn measure_metrics(fonts: &Fonts, strings: &lang::Strings) -> Metrics {
         ui_h: measure_h(hdc, ui),
         // h:mm:ss 是最坏情况，按它量一列的宽度：短的不会浪费，长的不会被切
         time_w: measure_w(hdc, mono, "88:88:88"),
+        // 标签列 / 按键列取各自行里最宽的那个。`max()` 起点是 0（度量失败），
+        // 绘制侧对 0 有兜底，不会塌成一列贴左边
+        diag_label_w: strings
+            .diag_labels()
+            .iter()
+            .map(|t| measure_w(hdc, ui, t))
+            .max()
+            .unwrap_or(0),
+        help_key_w: strings
+            .help_rows()
+            .iter()
+            .map(|(k, _)| measure_w(hdc, mono, k))
+            .max()
+            .unwrap_or(0),
+        // 行高按等宽字体量 + 一点上下留白，值列与标签列用同一个字体
+        row_h: measure_h(hdc, mono) + 4,
     };
     unsafe {
         let _ = ReleaseDC(None, hdc);
@@ -754,8 +919,9 @@ pub fn paint(
         // 3840x2160 = 830 万次写像素，每次 `WM_PAINT` 都做一遍；同时它还把这
         // 8.3MB 区域的每一页都摸成驻留，WorkingSet 里凭空多出几十 MB。
         //
-        // `App::paint` 同时把脏区夹到控制栏，所以这里跳过的区域也不会被
-        // BitBlt 贴出去——两边必须一起改，只改一个会让屏幕上出现旧画面。
+        // `App::paint` 同时把脏区夹到 `layout.chrome`（面板 + 控制栏），
+        // 所以这里跳过的区域也不会被 BitBlt 贴出去——两边必须一起改，
+        // 只改一个会让屏幕上出现旧画面。
         if !s.loaded {
             fill(
                 hdc,
@@ -773,19 +939,28 @@ pub fn paint(
             return;
         }
 
-        fill(hdc, theme, &layout.controls, C_PANEL);
-        // 控制栏顶边
+        // 面板与控制栏一起填。分两次填看着也行，但面板与控制栏之间那条缝
+        // 在某些缩放下会露出后备位图里的旧像素（两次 FillRect 的边界各自
+        // 取整，中间的 1px 谁都不画）。一次填掉就没这个问题。
+        fill(hdc, theme, &layout.chrome, C_PANEL);
+        // 整块 chrome 的顶边。有面板时这条线是面板的上沿，没有面板时
+        // 就是控制栏的上沿——所以永远画在 chrome.top
         fill(
             hdc,
             theme,
             &RECT {
-                left: layout.controls.left,
-                top: layout.controls.top,
-                right: layout.controls.right,
-                bottom: layout.controls.top + 1,
+                left: layout.chrome.left,
+                top: layout.chrome.top,
+                right: layout.chrome.right,
+                bottom: layout.chrome.top + 1,
             },
             C_LINE,
         );
+
+        // ---- 面板（诊断 / 快捷键）----
+        if let Some(panel) = s.panel {
+            draw_panel(hdc, theme, layout, panel);
+        }
 
         // ---- 第一行：当前时间 / 进度条 / 总时长 ----
         let shown = if s.dragging_seek {
@@ -947,6 +1122,77 @@ fn stage_rect(client_w: i32, layout: &Layout) -> RECT {
 unsafe fn fill(hdc: HDC, theme: &mut Theme, rect: &RECT, color: COLORREF) {
     let brush = theme.brush(color);
     FillRect(hdc, rect, brush.h());
+}
+
+/// 画面板的内容（底色与顶边由 `paint` 统一填）。
+///
+/// 行高来自 `Metrics::row_h`（等宽字体行高 + 一点留白），左列宽度来自
+/// `diag_label_w` / `help_key_w`，两者都是**实测**的——这与控制栏里按钮宽度
+/// 按实测文字宽度算是同一条原则：文案长度会变（两种语言），写死必然有一边
+/// 被截或留一大截空隙。
+///
+/// 值列允许放不下就省略号截断，不换行、不缩放字号：诊断信息被切掉一半
+/// 比字号小一号更难读，而省略号至少让用户知道右边还有东西。
+unsafe fn draw_panel(hdc: HDC, theme: &mut Theme, layout: &Layout, panel: Panel<'_>) {
+    let dpi = theme.dpi();
+    let pad_x = px(PANEL_PAD_X_DIP, dpi);
+    let gap = panel_col_gap(dpi);
+    let row_h = row_height(&theme.metrics, dpi);
+    let top = layout.panel.top + px(PANEL_PAD_Y_DIP, dpi);
+
+    let (col1, rows): (i32, Vec<(&str, &str)>) = match panel {
+        Panel::Stats(rows) => (
+            theme.metrics.diag_label_w.max(px(48, dpi)),
+            rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
+        ),
+        Panel::Help(rows) => (
+            theme.metrics.help_key_w.max(px(64, dpi)),
+            rows.iter().map(|(k, v)| (*k, *v)).collect(),
+        ),
+    };
+
+    let mut y = top;
+    for (i, (key, value)) in rows.iter().enumerate() {
+        if y >= layout.controls.top {
+            break;
+        }
+        let line = RECT {
+            left: pad_x,
+            top: y,
+            // 值列右边界就是客户区右边缘减去内边距
+            right: (layout.panel.right - pad_x).max(pad_x),
+            bottom: y + row_h,
+        };
+        // 左列画标签色、右列画正文色：一眼能分清哪半边是键、哪半边是值
+        text_in(
+            hdc,
+            theme.fonts.mono,
+            C_DIM,
+            key,
+            &RECT {
+                right: pad_x + col1,
+                ..line
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        text_in(
+            hdc,
+            theme.fonts.mono,
+            // 最后一行是结论，正常时用强调色标出来
+            if panel.is_stats_last(i) {
+                C_ACCENT
+            } else {
+                C_TEXT
+            },
+            value,
+            &RECT {
+                left: pad_x + col1 + gap,
+                ..line
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        y += row_h;
+    }
 }
 
 /// 用 `color` 对应的缓存画笔画 1px 边框。
@@ -1164,8 +1410,195 @@ mod tests {
             client_h,
             120,
             theatre,
+            0,
             &metrics_for(lang::Lang::ZhCn),
         )
+    }
+
+    /// 带面板的布局。
+    fn layout_with_panel(client_w: i32, client_h: i32, rows: usize) -> Layout {
+        Layout::new(
+            client_w,
+            client_h,
+            120,
+            false,
+            rows,
+            &metrics_for(lang::Lang::ZhCn),
+        )
+    }
+
+    // ---- 面板（0.4.0）----------------------------------------------------
+
+    /// 面板行数为 0 时，布局与没有面板时**完全一样**。
+    ///
+    /// 这是「面板是可选的」这个约定的回归保护：0 行不能因为多乘了个 0
+    /// 就让控制栏偏掉 1 像素（那种偏移在截图里看不出来，但会让整窗重画的
+    /// 判定出现一条缝）。
+    #[test]
+    fn 零行面板等于没有面板() {
+        let a = layout_for(1375, 900, false);
+        let b = layout_with_panel(1375, 900, 0);
+        assert_eq!(a.controls, b.controls);
+        assert_eq!(a.panel, b.panel, "没有面板时 panel 应当是零高度");
+        assert_eq!(a.chrome, b.chrome);
+    }
+
+    /// 面板吃掉的是**画面区**，控制栏自己一动不动。
+    ///
+    /// 这条约定有两个方向，缺一个都会出可见的问题：
+    ///
+    /// * 控制栏矩形不能包含面板（写成 `client_h - ctrl_h - panel_h` 就会
+    ///   把面板那一段包进 `controls`，按钮跟着偏到面板那一行——实测控制栏
+    ///   高度从 78 变成 247）。
+    /// * 控制栏**也不该**上移。它永远贴着客户区底部，面板在它上面；
+    ///   变矮的是画面区。所以 `controls` 两个版本必须逐字段相等。
+    #[test]
+    fn 面板只吃画面区_控制栏逐字段不变() {
+        let plain = layout_for(1375, 900, false);
+        let with = layout_with_panel(1375, 900, lang::DIAG_ROWS);
+
+        assert_eq!(
+            with.controls, plain.controls,
+            "控制栏矩形必须与没有面板时完全一致"
+        );
+        // 画面区的下沿 = 面板的上沿。`App::relayout` 就是拿这个值去摆
+        // mpv 的画面子窗口的，所以它必须真的比控制栏顶边高
+        assert!(
+            with.panel.top < with.controls.top,
+            "面板应当占掉画面区的一部分：panel.top={} controls.top={}",
+            with.panel.top,
+            with.controls.top
+        );
+        assert_eq!(
+            with.panel.top,
+            with.controls.top - panel_height(lang::DIAG_ROWS, &metrics_for(lang::Lang::ZhCn), 120),
+            "画面区下沿应当正好是「控制栏顶边减去面板高度」"
+        );
+    }
+
+    /// 面板紧贴控制栏上方，中间不留缝。
+    #[test]
+    fn 面板紧贴控制栏() {
+        let with = layout_with_panel(1375, 900, lang::DIAG_ROWS);
+        assert_eq!(with.panel.bottom, with.controls.top, "面板与控制栏之间有缝");
+        assert_eq!(with.panel.left, 0);
+        assert_eq!(with.panel.right, 1375);
+        assert!(with.panel.top < with.panel.bottom, "面板高度必须是正的");
+    }
+
+    /// chrome 是面板与控制栏的并集 —— 上层把脏区裁到这里，绘制填到这里。
+    #[test]
+    fn chrome_覆盖面板与控制栏() {
+        let with = layout_with_panel(1375, 900, lang::DIAG_ROWS);
+        assert_eq!(with.chrome.top, with.panel.top);
+        assert_eq!(with.chrome.bottom, with.controls.bottom);
+        // chrome 必须在 panel 与 controls 之外都够大：夹脏区时两块都要留住
+        assert!(with.chrome.top <= with.panel.top);
+        assert!(with.chrome.bottom >= with.controls.bottom);
+    }
+
+    /// 行数越多面板越高；两个面板的行数都是编译期常量且不相等。
+    #[test]
+    fn 面板高度随行数增长() {
+        let stats = layout_with_panel(1375, 900, lang::DIAG_ROWS);
+        let help = layout_with_panel(1375, 900, lang::HELP_ROWS);
+        assert!(
+            help.panel.bottom - help.panel.top > stats.panel.bottom - stats.panel.top,
+            "快捷键 {} 行应当比诊断 {} 行更高",
+            lang::HELP_ROWS,
+            lang::DIAG_ROWS
+        );
+        // 高度正好等于行数 × 行高（面板上下内边距各留一点）
+        let m = metrics_for(lang::Lang::ZhCn);
+        let expected = panel_height(lang::HELP_ROWS, &m, 120);
+        assert_eq!(help.panel.bottom - help.panel.top, expected);
+    }
+
+    /// 客户区不够高时，面板不能把控制栏顶到屏幕外。
+    ///
+    /// 客户区比「控制栏 + 面板」还矮时（窗口拖得很小），面板高度必须被夹住，
+    /// 否则 `controls.top` 会变成负数、按钮画到客户区外面。
+    #[test]
+    fn 客户区很矮时面板被夹住() {
+        let m = metrics_for(lang::Lang::ZhCn);
+        // 比「控制栏 + 满面板」还矮一点
+        let tight_h = px(CTRL_H_DIP, 120) + px(20, 120);
+        let l = Layout::new(480, tight_h, 120, false, lang::HELP_ROWS, &m);
+        assert!(l.controls.top >= 0, "controls.top 不能为负");
+        assert_eq!(l.panel.bottom, l.controls.top, "面板下沿就是控制栏顶边");
+        assert!(
+            l.panel.bottom - l.panel.top <= tight_h,
+            "面板高度 {0} 超过客户区 {1}",
+            l.panel.bottom - l.panel.top,
+            tight_h
+        );
+        // 画面区下沿不能跑到客户区外面去
+        assert!(l.panel.top >= 0);
+        assert!(l.panel.top <= l.controls.top);
+    }
+
+    /// 影院模式下不显示面板。
+    #[test]
+    fn 影院模式下没有面板() {
+        let l = Layout::new(
+            1375,
+            900,
+            120,
+            true,
+            lang::HELP_ROWS,
+            &metrics_for(lang::Lang::ZhCn),
+        );
+        assert_eq!(l.panel.top, l.panel.bottom, "影院模式下面板应当是零高度");
+        assert_eq!(l.controls.top, 900, "影院模式控制栏收起，画面占满");
+    }
+
+    /// 点在面板上的效果等同于点画面（切播放/暂停），不是「什么都不做」。
+    #[test]
+    fn 面板区域的命中是画面() {
+        let l = layout_with_panel(1375, 900, lang::DIAG_ROWS);
+        let cx = (l.panel.left + l.panel.right) / 2;
+        let cy = (l.panel.top + l.panel.bottom) / 2;
+        assert_eq!(l.hit(cx, cy), Hit::Video);
+        // 控制栏里的按钮仍然是按钮
+        let bx = (l.btn_play.left + l.btn_play.right) / 2;
+        let by = (l.btn_play.top + l.btn_play.bottom) / 2;
+        assert_eq!(l.hit(bx, by), Hit::Play);
+    }
+
+    /// 两种语言的标签列宽度都必须量出来，且为正。
+    ///
+    /// 面板的两列是对齐的，标签列宽度取自实测——如果某一门语言量出 0
+    /// （度量失败），值列就会贴着左边缘。
+    #[test]
+    fn 两种语言的标签列都量得出来() {
+        for l in [lang::Lang::ZhCn, lang::Lang::En] {
+            let m = metrics_for(l);
+            assert!(m.diag_label_w > 0, "{l:?} 的诊断标签列宽度是 0");
+            assert!(m.help_key_w > 0, "{l:?} 的快捷键按键列宽度是 0");
+            assert!(m.row_h > 0, "{l:?} 的行高是 0");
+        }
+    }
+
+    /// 诊断标签的数量必须与 `DIAG_ROWS` 一致。
+    ///
+    /// 面板高度是按 `DIAG_ROWS`（编译期常量）算的，而标签是
+    /// `Strings::diag_labels()` 给的。两者对不上就会「布局按 7 行算、
+    /// 绘制画 6 行」或反过来——最后一行画到控制栏里，或者多出一段空白。
+    #[test]
+    fn 诊断标签数与行数常量一致() {
+        for l in [lang::Lang::ZhCn, lang::Lang::En] {
+            let s = lang::Strings::new(l);
+            assert_eq!(
+                s.diag_labels().len(),
+                lang::DIAG_ROWS,
+                "{l:?} 的标签数与 DIAG_ROWS 不一致"
+            );
+            assert_eq!(
+                s.help_rows().len(),
+                lang::HELP_ROWS,
+                "{l:?} 的快捷键行数与 HELP_ROWS 不一致"
+            );
+        }
     }
 
     /// 单量一段文字的宽度，测试里断言「按钮装得下文字」时用。
@@ -1244,7 +1677,7 @@ mod tests {
     #[test]
     fn 窄窗口下也不越界() {
         // 最小宽度 480 DIP * 96 = 480 物理像素（100% 缩放）
-        let l = Layout::new(480, 320, 96, false, &metrics_for(lang::Lang::ZhCn));
+        let l = Layout::new(480, 320, 96, false, 0, &metrics_for(lang::Lang::ZhCn));
         assert!(l.volume.right <= 480, "volume.right={}", l.volume.right);
         assert!(l.btn_stop.right < 480);
         // 文件名区域宽度可能为 0，但不应为负（rect 已经夹过）
@@ -1268,7 +1701,14 @@ mod tests {
                 let fonts = Fonts::new(dpi);
                 let m = measure_metrics(&fonts, &s);
                 let w_px = |dip: i32| px(dip, dpi);
-                let l = Layout::new(w_px(1375 * 96 / 120), w_px(900 * 96 / 120), dpi, false, &m);
+                let l = Layout::new(
+                    w_px(1375 * 96 / 120),
+                    w_px(900 * 96 / 120),
+                    dpi,
+                    false,
+                    0,
+                    &m,
+                );
                 let pad = w_px(BTN_PAD_X_DIP);
 
                 let cases: [(&str, &str, &RECT); 4] = [
@@ -1325,8 +1765,8 @@ mod tests {
                 "{lang:?} 的 mute_w 小于其中之一"
             );
             // 布局用的是 max 值，所以两种状态下的矩形完全一致
-            let a = Layout::new(1375, 900, 120, false, &m);
-            let b = Layout::new(1375, 900, 120, false, &m);
+            let a = Layout::new(1375, 900, 120, false, 0, &m);
+            let b = Layout::new(1375, 900, 120, false, 0, &m);
             assert_eq!(
                 (a.btn_play.left, a.btn_play.right),
                 (b.btn_play.left, b.btn_play.right)
@@ -1344,7 +1784,7 @@ mod tests {
     #[test]
     fn 三组控件分布均匀且不重叠() {
         for lang in [lang::Lang::ZhCn, lang::Lang::En] {
-            let l = Layout::new(1375, 900, 120, false, &metrics_for(lang));
+            let l = Layout::new(1375, 900, 120, false, 0, &metrics_for(lang));
             let gap = px(CLUSTER_GAP_DIP, 120);
             let small = px(GAP_DIP, 120);
 
