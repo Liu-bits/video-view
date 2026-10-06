@@ -619,13 +619,82 @@ try {
     Add-Result "noPanelInTheatre" (($vr5.vh -eq $vrInTheatre.vh) -and ($vr6.vh -eq $vr0.vh)) `
         ("影院 {0} -> 按 I 后 {1} -> 退出后 {2}（基准 {3}）" -f $vr5.vh, $vrInTheatre.vh, $vr6.vh, $vr0.vh)
 
-    # 把面板状态落成截图，人工看一眼内容对不对
-    Send-KeyMsg $main 0x49
+    # T = 轨道菜单
+    #
+    # 验的是「菜单把画面区顶矮」而不是「浮层出现」—— 和上面诊断面板同一
+    # 条判据（`VideoRect` 读的是 mpv 画面子窗口的高度）。
+    #
+    # 测试素材 `loop60s.mp4` 实测是 1 视频 + 1 音频、**没有字幕轨**
+    # （`sbtl` / `text` 这些 box type 在文件里一个都没有），所以菜单是
+    # 2 行：「音频」标题 + 1 条音轨。行数是运行期的（每个文件的轨数不同），
+    # 所以这里不断言具体行数，只断言「比没有面板时矮」和「内容与别的面板不同」。
+    Send-KeyMsg $main 0x54   # T
     Start-Sleep -Seconds 2
     Force-Foreground $main
+    $bmpTracks = Grab $main
+    $vrT1 = VideoRect
+    Add-Result "trackMenuShifts" ($vrT1.vh -lt $vr4.vh) `
+        ("画面高 {0} -> {1}（轨道菜单吃掉画面区）" -f $vr4.vh, $vrT1.vh)
+
+    $diffTracks = PixDiff $bmpHelp $bmpTracks $ox ([math]::Max(0, $vrT1.vh - (DipPx 120))) $cw (DipPx 100) 3
+    Add-Result "trackMenuDiffers" ($diffTracks -gt 20) `
+        ("轨道菜单与快捷键面板内容差异 {0}%" -f $diffTracks)
+
+    # 菜单期间方向键归菜单：`↑` 不该改音量、该移动光标。
+    #
+    # 这条**只能证明「菜单没被 ↑ 关掉、画面没变形」** —— 音量变了画面高度
+    # 本来也不变，所以从截图上分不出「↑ 调了音量」还是「↑ 移了光标」。
+    # 要真正验「↑ 移了光标」得比对菜单区域的高亮位置，那需要像素级定位
+    # 光标行，超出这个脚本的能力范围。这里的价值是回归保护：万一哪天
+    # `handle_key` 里的菜单前置分支被删掉、`↑` 落到音量路径上，
+    # 这条仍会过，但下面 `escClosesTrackMenu` 那条会因为状态错乱而失败。
+    Send-KeyMsg $main 0x26   # VK_UP
+    Start-Sleep -Milliseconds 600
+    $vrT2 = VideoRect
+    Add-Result "arrowStaysInMenu" ($vrT2.vh -eq $vrT1.vh) `
+        ("按 ↑ 之后画面高 {0} -> {1}（菜单仍然开着）" -f $vrT1.vh, $vrT2.vh)
+
+    # Esc 应当先关菜单，而不是去退影院 / 全屏
+    Send-KeyMsg $main 0x1B
+    Start-Sleep -Seconds 2
+    $vrT3 = VideoRect
+    Add-Result "escClosesTrackMenu" ($vrT3.vh -eq $vr4.vh) `
+        ("Esc 之后画面高 {0} -> {1}（回到无面板基准 {2}）" -f $vrT1.vh, $vrT3.vh, $vr4.vh)
+
+    # ---- Esc 死锁回归 ----------------------------------------------------
+    #
+    # 曾经的 bug：`Esc` 的第一层是「关掉面板」，而影院模式里 `set_panel` 会
+    # 早返回（面板在那里看不见）。于是「按过面板键 -> 进影院 -> Esc」会走进
+    # `set_panel(None)` -> 早返回 -> 什么都没发生 -> Esc 被吃掉，**按多少次
+    # 都出不去影院**，只能按 F。
+    #
+    # 修法是两层的：进影院时清掉面板状态（`toggle_theatre`），并且 Esc 的
+    # 判断顺序改成「影院 -> 全屏 -> 面板」。这里验的是修好之后的行为：
+    # 先按 `I` 让面板状态非空，再进影院，此时按 Esc 必须一步退出影院。
+    #
+    # 只按一次 Esc 就够 —— 如果死锁还在，按一次之后仍在影院，画面高度会
+    # 停在影院值（673）而不是回到 595。
+    Send-KeyMsg $main 0x49   # I，面板开着
+    Start-Sleep -Seconds 1
+    Send-KeyMsg $main 0x46   # F，进影院（进影院时面板状态被清掉）
+    Start-Sleep -Seconds 2
+    $vrD0 = VideoRect
+    Send-KeyMsg $main 0x1B   # Esc，必须一步退出影院
+    Start-Sleep -Seconds 2
+    $vrD1 = VideoRect
+    Add-Result "escEscapesTheatreAfterPanel" ($vrD0.vh -gt $vrD1.vh) `
+        ("影院 {0} -> Esc 一次 -> {1}（应当退出影院；死锁时这里会相等）" -f $vrD0.vh, $vrD1.vh)
+
+    # 把面板状态落成截图，人工看一眼内容对不对
+    Send-KeyMsg $main 0x54
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpTracks2 = Grab $main
+    Send-KeyMsg $main 0x1B
+    Start-Sleep -Seconds 2
     $shotDir = Join-Path $PSScriptRoot "..\artifacts\ui-shots"
     New-Item -ItemType Directory -Path $shotDir -Force | Out-Null
-    foreach ($pair in @(@("stats", $bmpStats), @("help", $bmpHelp))) {
+    foreach ($pair in @(@("stats", $bmpStats), @("help", $bmpHelp), @("tracks", $bmpTracks2))) {
         $f = Join-Path $shotDir ("panel-{0}.png" -f $pair[0])
         $pair[1].Save($f, [System.Drawing.Imaging.ImageFormat]::Png)
         $pair[1].Dispose()

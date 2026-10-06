@@ -273,6 +273,33 @@ pub struct Strings {
     pub help_open: &'static str,
     pub help_copy: &'static str,
     pub help_help: &'static str,
+    pub help_tracks: &'static str,
+    pub help_next_sub: &'static str,
+    pub help_next_audio: &'static str,
+
+    // ---- 轨道菜单 ----
+    pub track_audio: &'static str,
+    pub track_sub: &'static str,
+    /// 「关闭字幕」那一行
+    pub track_off: &'static str,
+    /// 外挂字幕的标记
+    pub track_external: &'static str,
+    /// 声道数的单位
+    pub track_unit_channels: &'static str,
+    /// 一条什么信息都没有的轨道
+    pub track_unknown: &'static str,
+    /// 一条可选轨都没有时菜单里那一行
+    pub track_none: &'static str,
+    /// 音频轨一行的结尾提示（菜单底部）
+    pub track_hint: &'static str,
+
+    // ---- 字幕 / 切轨 ----
+    /// 切轨失败。mpv 给的原文作为详情一起显示。
+    pub err_switch_track: &'static str,
+    pub err_add_subtitle: &'static str,
+    /// 没有媒体可挂时给用户的提示（挂字幕需要一个正在播的视频）
+    pub err_no_media_for_sub: &'static str,
+    pub info_subtitle_added: &'static str,
 }
 
 impl Strings {
@@ -334,7 +361,7 @@ impl Strings {
             info_report_copied: "Diagnostics copied to the clipboard.",
             help_play_pause: "Play / pause",
             help_seek: "Seek 10 seconds",
-            help_volume: "Volume up / down",
+            help_volume: "Volume up / down (moves the menu cursor when the track menu is open)",
             help_percent: "Jump to 0%–90%",
             help_frame_step: "Step one frame",
             help_speed: "Slower / faster",
@@ -347,6 +374,21 @@ impl Strings {
             help_open: "Open a file",
             help_copy: "Copy the diagnostics report",
             help_help: "This list",
+            help_tracks: "Audio / subtitle tracks",
+            help_next_sub: "Previous / next subtitle track",
+            help_next_audio: "Next audio track",
+            track_audio: "Audio",
+            track_sub: "Subtitles",
+            track_off: "Off",
+            track_external: "external",
+            track_unit_channels: "ch",
+            track_unknown: "(unnamed track)",
+            track_none: "No audio or subtitle tracks in this file.",
+            track_hint: "Enter selects · Esc closes · drag a .srt to add subtitles",
+            err_switch_track: "Could not switch track",
+            err_add_subtitle: "Could not load the subtitle file",
+            err_no_media_for_sub: "Open a video first, then add the subtitle to it.",
+            info_subtitle_added: "Subtitle loaded.",
         }
     }
 
@@ -399,7 +441,7 @@ impl Strings {
             info_report_copied: "诊断信息已复制到剪贴板。",
             help_play_pause: "播放 / 暂停",
             help_seek: "快退 / 快进 10 秒",
-            help_volume: "音量增 / 减",
+            help_volume: "音量增 / 减（轨道菜单打开时改为移动光标）",
             help_percent: "跳到 0%–90%",
             help_frame_step: "逐帧后退 / 前进",
             help_speed: "减速 / 加速",
@@ -412,6 +454,21 @@ impl Strings {
             help_open: "打开文件",
             help_copy: "复制诊断报告",
             help_help: "这一页",
+            help_tracks: "音轨 / 字幕轨",
+            help_next_sub: "上一条 / 下一条字幕轨",
+            help_next_audio: "下一条音轨",
+            track_audio: "音频",
+            track_sub: "字幕",
+            track_off: "关闭",
+            track_external: "外挂",
+            track_unit_channels: "声道",
+            track_unknown: "（未命名轨道）",
+            track_none: "这个文件没有可选的音轨或字幕轨。",
+            track_hint: "回车选中 · Esc 关闭 · 拖入 .srt 可外挂字幕",
+            err_switch_track: "切轨失败",
+            err_add_subtitle: "外挂字幕加载失败",
+            err_no_media_for_sub: "请先打开一个视频，再挂字幕。",
+            info_subtitle_added: "字幕已加载。",
         }
     }
 
@@ -447,6 +504,9 @@ impl Strings {
             ("[ / ]", self.help_speed),
             ("Home / End", self.help_jump),
             ("M", self.help_mute),
+            ("T", self.help_tracks),
+            ("J / L", self.help_next_sub),
+            ("A", self.help_next_audio),
             ("F", self.help_theatre),
             ("F11", self.help_fullscreen),
             ("S", self.help_screenshot),
@@ -460,7 +520,7 @@ impl Strings {
 
 /// 快捷键总览的行数。面板高度按它算，所以两种语言必须一致
 /// （`快捷键总览两种语言行数一致` 那条测试盯着）。
-pub const HELP_ROWS: usize = 15;
+pub const HELP_ROWS: usize = 18;
 
 /// 解码诊断面板的行数。标签来自 `Strings::diag_labels()`，长度固定。
 pub const DIAG_ROWS: usize = 7;

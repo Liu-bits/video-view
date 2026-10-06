@@ -1,7 +1,7 @@
 ; VideoView 安装包脚本
 ;
 ; 由 scripts/package.ps1 调用：
-;   makensis /INPUTCHARSET UTF8 -DVERSION=0.4.0 installer.nsi
+;   makensis /INPUTCHARSET UTF8 -DVERSION=0.5.0 installer.nsi
 ;
 ; 产物是一个零外部依赖的安装程序：播放核心 libmpv-2.dll 会装到 $INSTDIR，
 ; 播放器 exe 与它同目录、运行时按同目录查找。对方的机器上不需要装
@@ -13,7 +13,7 @@
 ; 版本号由 scripts/package.ps1 用 -DVERSION 传进来，保证和 Cargo.toml 一致。
 ; 这里保留的默认值只是为了让脚本能被手工执行时也能跑起来。
 !ifndef VERSION
-  !define VERSION "0.4.0"
+  !define VERSION "0.5.0"
 !endif
 !define OUT_FILE "..\artifacts\VideoView-Setup-${VERSION}.exe"
 ; 暂存目录：由 scripts/package.ps1 铺好，里面只有要装进 $INSTDIR 的文件

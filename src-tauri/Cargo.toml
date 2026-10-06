@@ -1,6 +1,6 @@
 [package]
 name = "video-view"
-version = "0.4.0"
+version = "0.5.0"
 description = "轻量级 Windows 桌面视频播放器，基于 libmpv 与原生 Win32 界面"
 authors = ["VideoView contributors"]
 license = "GPL-3.0-or-later"

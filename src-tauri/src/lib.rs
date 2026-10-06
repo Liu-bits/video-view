@@ -20,6 +20,7 @@ pub mod lang;
 pub mod mpv;
 pub mod settings;
 mod surface;
+pub mod track;
 mod ui;
 
 pub use app::run;

@@ -20,6 +20,7 @@
 //! 英文单词长度差很多，写死必然有一边被截断或另一边空一大块。
 
 use crate::lang;
+use crate::track::TrackRow;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
@@ -43,6 +44,12 @@ const C_ACCENT: COLORREF = rgb(0xff, 0x9f, 0x1c);
 const C_BTN: COLORREF = rgb(0x22, 0x26, 0x2a);
 const C_BTN_HOVER: COLORREF = rgb(0x2c, 0x31, 0x36);
 const C_BTN_EDGE: COLORREF = rgb(0x3c, 0x43, 0x4a);
+/// 轨道菜单：光标所在行。比悬停更深，两者要能一眼分开。
+const C_ROW_HI: COLORREF = rgb(0x33, 0x3a, 0x41);
+/// 轨道菜单：鼠标悬停行。
+const C_ROW_HOVER: COLORREF = rgb(0x26, 0x2b, 0x31);
+/// 轨道菜单：分组标题的底色，比面板底色略深，段落感来自这里。
+const C_PANEL_DEEP: COLORREF = rgb(0x10, 0x12, 0x15);
 
 /// 控制栏高度（同时也是视频区与控制栏的分界线）。
 pub const CTRL_H_DIP: i32 = 62;
@@ -167,6 +174,24 @@ pub struct Layout {
     pub volume: RECT,
     /// 影院模式下控制栏高度为 0，视频区占满整个客户区。
     pub theatre: bool,
+
+    // ---- 面板行的几何（轨道菜单的命中测试要用）----
+    //
+    // 这三个值在 `Layout::new` 里算好存下来，而不是让 `hit` 现场重算：
+    // `row_height` 依赖 `Metrics` 与 dpi，而 `hit` 只有坐标。重算的话要么
+    // 把 Metrics 也塞进 Layout（布局对象开始背着字体度量，职责变味），
+    // 要么在 `hit` 里用常数行高（和绘制用的行高差几个像素，点中的行会偏）。
+    //
+    /// 面板里**第一行**的顶边（与 `draw_panel` 里那个 `top` 同一个值）
+    pub panel_row_top: i32,
+    /// 一行的高度（`draw_panel` 与命中测试必须用同一个）
+    pub panel_row_h: i32,
+    /// 真正画出来的行数。
+    ///
+    /// **不一定**等于 `panel_rows`：面板高度被 `min(controls_top)` 夹过时
+    /// 底部几行会被截掉。用 `panel_rows` 判界的话，用户能点到一条画在
+    /// 屏幕外（被控制栏盖住）的轨道，选中之后界面上却看不到变化。
+    pub panel_drawn_rows: usize,
 }
 
 impl Layout {
@@ -303,6 +328,27 @@ impl Layout {
             };
         }
 
+        // 面板行的几何。`row_top` 必须和 `draw_panel` 里的 `top` 是同一个
+        // 表达式，否则命中测试会整体偏一个内边距（实测差 PANEL_PAD_Y_DIP）。
+        let row_h = row_height(m, dpi);
+        let row_top = panel_top + px(PANEL_PAD_Y_DIP, dpi);
+        // 画几行：与 `draw_panel` 的循环条件（`y < controls.top`）逐字对应，
+        // 再**夹到真实行数**。
+        //
+        // 那个 `min` 不能省：面板没被夹住时高度正好是
+        // `rows * row_h + 2 * pad_y`，于是 `avail = rows * row_h + pad_y`，
+        // `ceil(avail / row_h)` 会算出 `rows + 1` —— 底部那半个内边距被
+        // 当成了第 `rows + 1` 行。命中测试就会在面板最下面那一条内边距里
+        // 报出一个根本不存在的行号（`Hit::TrackRow(rows)`）。
+        let drawn_rows = if row_h > 0 && controls_top > row_top {
+            let avail = controls_top - row_top;
+            // 整数向上取整：最后一行只露出一半也算一行（与绘制行为一致）
+            let fits = ((avail + row_h - 1) / row_h).max(0) as usize;
+            fits.min(panel_rows)
+        } else {
+            0
+        };
+
         Self {
             controls,
             panel,
@@ -317,6 +363,35 @@ impl Layout {
             mute,
             volume,
             theatre,
+            panel_row_top: row_top,
+            panel_row_h: row_h,
+            panel_drawn_rows: drawn_rows,
+        }
+    }
+
+    /// 坐标落在面板的第几行。
+    ///
+    /// 与 `hit` 分开是因为鼠标移动也要用它（悬停高亮），而 `hit` 是
+    /// 点击用的。共用一份实现免得两边的边界条件慢慢长歪。
+    ///
+    /// **上下内边距都不属于任何行。** `panel_row_top` 比 `panel.top` 低一个
+    /// `PANEL_PAD_Y_DIP`，所以 `contains` 会把顶部那条留白也算进面板；不加
+    /// 显式判断的话 `y - panel_row_top` 是负数，Rust 的整数除法向 0 截断
+    /// （`-3 / 20 == 0`），顶部留白会被判成第 0 行 —— 于是「点面板最上面
+    /// 那条空白」会选中第一条轨。底部的留白本来就靠
+    /// `i < panel_drawn_rows` 挡住了，这里让两边一致。
+    pub fn panel_row_at(&self, x: i32, y: i32) -> Option<usize> {
+        if self.theatre || self.panel_drawn_rows == 0 || self.panel_row_h <= 0 {
+            return None;
+        }
+        if !contains(&self.panel, x, y) || y < self.panel_row_top {
+            return None;
+        }
+        let i = ((y - self.panel_row_top) / self.panel_row_h).max(0) as usize;
+        if i < self.panel_drawn_rows {
+            Some(i)
+        } else {
+            None
         }
     }
 
@@ -327,7 +402,14 @@ impl Layout {
         }
         // 面板区域不是控件，点在上面的效果等同于点画面（单击切播放/暂停）。
         // 不这么归类的话 `Hit::None` 会让光标变成箭头、单击什么也不做。
+        //
+        // 轨道菜单例外：那里面每一行都是可点的，所以先问一次落在第几行。
+        // 注意 `hit` 只报几何、不管语义 —— 面板不是菜单时上层会忽略这个
+        // `Hit::TrackRow`（诊断/快捷键面板里点行仍然是「点画面」）。
         if contains(&self.panel, x, y) {
+            if let Some(row) = self.panel_row_at(x, y) {
+                return Hit::TrackRow(row);
+            }
             return Hit::Video;
         }
         if !contains(&self.controls, x, y) {
@@ -375,6 +457,8 @@ pub enum Hit {
     Seek,
     Volume,
     Mute,
+    /// 轨道菜单的第几行（**行**下标，含分组标题）
+    TrackRow(usize),
 }
 
 // ---------------------------------------------------------------- 面板
@@ -390,13 +474,20 @@ pub enum Panel<'a> {
     Stats(&'a [(String, String)]),
     /// 快捷键总览
     Help(&'a [(&'static str, &'static str)]),
+    /// 音轨 / 字幕轨菜单
+    Tracks {
+        rows: &'a [TrackRow],
+        /// 光标停在第几行（含不可选的分组标题行，所以是**行**下标不是
+        /// 「可选行」下标 —— 这样 ↑↓ 与鼠标点击用的是同一套坐标）
+        cursor: usize,
+    },
 }
 
 impl Panel<'_> {
     /// 这一行是不是诊断面板的结论行。
     ///
     /// 结论行用强调色，是为了让「正常 / 有问题」在一屏字里第一眼就被看到。
-    /// 快捷键面板没有结论行。
+    /// 快捷键面板与轨道菜单没有结论行。
     fn is_stats_last(&self, i: usize) -> bool {
         matches!(self, Panel::Stats(rows) if i + 1 == rows.len())
     }
@@ -556,6 +647,8 @@ pub struct PaintState<'a> {
     pub idle: bool,
     /// 鼠标当前停在哪个控件上，用于按钮高亮。
     pub hover: Hit,
+    /// 轨道菜单：鼠标停在第几行（用于「悬停即选中」的预览高亮）。
+    pub hover_row: Option<usize>,
     /// 当前语言的文案。
     pub strings: &'a lang::Strings,
     /// 要显示的面板。`None` = 不显示（这时控制栏顶到客户区底部）。
@@ -957,9 +1050,9 @@ pub fn paint(
             C_LINE,
         );
 
-        // ---- 面板（诊断 / 快捷键）----
+        // ---- 面板（诊断 / 快捷键 / 轨道菜单）----
         if let Some(panel) = s.panel {
-            draw_panel(hdc, theme, layout, panel);
+            draw_panel(hdc, theme, layout, panel, s.hover_row, s.strings);
         }
 
         // ---- 第一行：当前时间 / 进度条 / 总时长 ----
@@ -1133,12 +1226,107 @@ unsafe fn fill(hdc: HDC, theme: &mut Theme, rect: &RECT, color: COLORREF) {
 ///
 /// 值列允许放不下就省略号截断，不换行、不缩放字号：诊断信息被切掉一半
 /// 比字号小一号更难读，而省略号至少让用户知道右边还有东西。
-unsafe fn draw_panel(hdc: HDC, theme: &mut Theme, layout: &Layout, panel: Panel<'_>) {
+unsafe fn draw_panel(
+    hdc: HDC,
+    theme: &mut Theme,
+    layout: &Layout,
+    panel: Panel<'_>,
+    hover_row: Option<usize>,
+    strings: &lang::Strings,
+) {
     let dpi = theme.dpi();
     let pad_x = px(PANEL_PAD_X_DIP, dpi);
     let gap = panel_col_gap(dpi);
     let row_h = row_height(&theme.metrics, dpi);
     let top = layout.panel.top + px(PANEL_PAD_Y_DIP, dpi);
+    let full_width = (layout.panel.right - pad_x).max(pad_x);
+
+    // 轨道菜单是**整行**形态：左边是标记（当前在用的 / 默认的），
+    // 右边铺满。不走两列 —— 菜单项的文字长度差别很大（「中文 · 2 声道 aac」
+    // 与「关闭」），按两列对齐反而会在标记列上留一大片空白。
+    if let Panel::Tracks { rows, cursor } = panel {
+        let mut y = top;
+        for (i, row) in rows.iter().enumerate() {
+            if y >= layout.controls.top {
+                break;
+            }
+            let line = RECT {
+                left: pad_x,
+                top: y,
+                right: full_width,
+                bottom: y + row_h,
+            };
+            match row {
+                TrackRow::Heading(title) => {
+                    // 分组标题：整行填成略深的底色，一眼分得开段落
+                    fill(
+                        hdc,
+                        theme,
+                        &RECT {
+                            left: pad_x - px(4, dpi),
+                            right: full_width,
+                            ..line
+                        },
+                        C_PANEL_DEEP,
+                    );
+                    text_in(
+                        hdc,
+                        theme.fonts.mono,
+                        C_ACCENT,
+                        title,
+                        &line,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    );
+                }
+                TrackRow::Note(text) => {
+                    // 说明行：不可选，所以用 dim 色（选中色会让人以为能点）
+                    text_in(
+                        hdc,
+                        theme.fonts.mono,
+                        C_DIM,
+                        text,
+                        &line,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    );
+                }
+                TrackRow::OffSubtitle { active } => {
+                    let mark = if *active { "●" } else { "" };
+                    draw_track_row(
+                        hdc,
+                        theme,
+                        &line,
+                        i,
+                        strings.track_off,
+                        *active,
+                        mark,
+                        dpi,
+                        hover_row,
+                        cursor,
+                    );
+                }
+                TrackRow::Item {
+                    label,
+                    active,
+                    is_default,
+                    ..
+                } => {
+                    // 标记放在最左：● = 正在用，▸ = 文件默认轨。两个可以同时成立
+                    // （默认轨正在放），所以那种情况两个都画
+                    let mark = match (*active, *is_default) {
+                        (true, true) => "●▸",
+                        (true, false) => "●",
+                        (false, true) => "▸",
+                        (false, false) => "",
+                    };
+                    draw_track_row(
+                        hdc, theme, &line, i, label, *active, mark, dpi, hover_row, cursor,
+                    );
+                }
+            }
+            y += row_h;
+        }
+        return;
+    }
 
     let (col1, rows): (i32, Vec<(&str, &str)>) = match panel {
         Panel::Stats(rows) => (
@@ -1149,6 +1337,12 @@ unsafe fn draw_panel(hdc: HDC, theme: &mut Theme, layout: &Layout, panel: Panel<
             theme.metrics.help_key_w.max(px(64, dpi)),
             rows.iter().map(|(k, v)| (*k, *v)).collect(),
         ),
+        // 上面那个 `if let` 命中就 `return` 了，所以这里走不到。写成兜底的
+        // 空列表而不是 `unreachable!()`：本项目的 release profile 是
+        // `panic = "abort"`，`unreachable!()` 等于整个进程直接消失、没有
+        // MessageBox（`clamp_to_client` 的注释专门论证过这一点）。为一个
+        // 逻辑上不可达的分支承担「用户在界面上什么都看不到」的风险不划算。
+        Panel::Tracks { .. } => (px(48, dpi), Vec::new()),
     };
 
     let mut y = top;
@@ -1160,7 +1354,7 @@ unsafe fn draw_panel(hdc: HDC, theme: &mut Theme, layout: &Layout, panel: Panel<
             left: pad_x,
             top: y,
             // 值列右边界就是客户区右边缘减去内边距
-            right: (layout.panel.right - pad_x).max(pad_x),
+            right: full_width,
             bottom: y + row_h,
         };
         // 左列画标签色、右列画正文色：一眼能分清哪半边是键、哪半边是值
@@ -1193,6 +1387,58 @@ unsafe fn draw_panel(hdc: HDC, theme: &mut Theme, layout: &Layout, panel: Panel<
         );
         y += row_h;
     }
+}
+
+/// 画轨道菜单里的一行（标记 + 文字 + 高亮）。
+///
+/// 高亮有三级，视觉上必须能分开：光标所在行（最亮，用户按 ↑↓ 移动的就是它）、
+/// 鼠标悬停行（次亮）、正在使用的那条（文字用强调色）。三者可以重合，
+/// 所以底色与文字色是两套独立信号，不能只靠其中一个。
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_track_row(
+    hdc: HDC,
+    theme: &mut Theme,
+    line: &RECT,
+    index: usize,
+    label: &str,
+    active: bool,
+    mark: &str,
+    dpi: u32,
+    hover_row: Option<usize>,
+    cursor: usize,
+) {
+    // 光标与悬停用**不同深浅**的两级底色。用户按住 ↑↓ 连续移动时，
+    // 光标在下面走；如果和悬停同色，「我现在选的是哪一行」就看不出来了。
+    if index == cursor {
+        fill(hdc, theme, line, C_ROW_HI);
+    } else if hover_row == Some(index) {
+        fill(hdc, theme, line, C_ROW_HOVER);
+    }
+    let mark_w = px(26, dpi);
+    if !mark.is_empty() {
+        text_in(
+            hdc,
+            theme.fonts.mono,
+            C_ACCENT,
+            mark,
+            &RECT {
+                right: line.left + mark_w,
+                ..*line
+            },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
+    text_in(
+        hdc,
+        theme.fonts.mono,
+        if active { C_ACCENT } else { C_TEXT },
+        label,
+        &RECT {
+            left: line.left + mark_w,
+            ..*line
+        },
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
 }
 
 /// 用 `color` 对应的缓存画笔画 1px 边框。
@@ -1552,17 +1798,133 @@ mod tests {
         assert_eq!(l.controls.top, 900, "影院模式控制栏收起，画面占满");
     }
 
-    /// 点在面板上的效果等同于点画面（切播放/暂停），不是「什么都不做」。
+    /// 面板区域的命中。
+    ///
+    /// 契约是「`Layout` 只报几何、不管语义」：面板里有行的时候命中给出行号，
+    /// **上层**（`app.rs`）看当前面板是不是菜单来决定这一行能不能点。所以这里
+    /// 断言的是「行号算得对」，而不是「面板不可点」。
+    ///
+    /// 之前这个测试断言 `Hit::Video`，那是单一面板形态下的行为；加了轨道
+    /// 菜单之后它不再成立 —— 硬留着会让菜单的点不中，或者逼着 `Layout`
+    /// 背上「当前是什么面板」的知识。
     #[test]
-    fn 面板区域的命中是画面() {
+    fn 面板区域的命中给出行号() {
         let l = layout_with_panel(1375, 900, lang::DIAG_ROWS);
         let cx = (l.panel.left + l.panel.right) / 2;
-        let cy = (l.panel.top + l.panel.bottom) / 2;
-        assert_eq!(l.hit(cx, cy), Hit::Video);
+
+        // 第一行的中点 → 第 0 行
+        let y0 = l.panel_row_top + l.panel_row_h / 2;
+        assert_eq!(l.hit(cx, y0), Hit::TrackRow(0));
+        // 最后一行（面板高度被行数整除时正好贴住底边）
+        let last = l.panel_drawn_rows as i32 - 1;
+        let yn = l.panel_row_top + last * l.panel_row_h + l.panel_row_h / 2;
+        assert_eq!(l.hit(cx, yn), Hit::TrackRow(last as usize));
+
+        // 行与行之间不该有「哪行都不属于」的缝：整数除法向下取整，
+        // 点在行顶边沿上应该算本行、点在本行最后一像素仍算本行
+        for row in 0..l.panel_drawn_rows as i32 {
+            let top = l.panel_row_top + row * l.panel_row_h;
+            assert_eq!(
+                l.panel_row_at(cx, top),
+                Some(row as usize),
+                "第 {row} 行顶边"
+            );
+            assert_eq!(
+                l.panel_row_at(cx, top + l.panel_row_h - 1),
+                Some(row as usize),
+                "第 {row} 行底边"
+            );
+        }
+
         // 控制栏里的按钮仍然是按钮
         let bx = (l.btn_play.left + l.btn_play.right) / 2;
         let by = (l.btn_play.top + l.btn_play.bottom) / 2;
         assert_eq!(l.hit(bx, by), Hit::Play);
+    }
+
+    /// 面板上方那一像素不属于任何行（那是画面）。
+    #[test]
+    fn 面板上边缘之外不是行() {
+        let l = layout_with_panel(1375, 900, lang::DIAG_ROWS);
+        let cx = (l.panel.left + l.panel.right) / 2;
+        assert_eq!(l.panel_row_at(cx, l.panel.top - 1), None);
+        // 面板底边之下是控制栏，也不是行
+        assert_eq!(l.panel_row_at(cx, l.panel.bottom), None);
+    }
+
+    /// 影院模式 / 没有面板时，任何坐标都不该命中行。
+    #[test]
+    fn 没有菜单就没有行可命中() {
+        let m = metrics_for(lang::Lang::ZhCn);
+        let none = Layout::new(1375, 900, 120, false, 0, &m);
+        assert_eq!(none.panel_drawn_rows, 0);
+        let cx = (none.panel.left + none.panel.right) / 2;
+        assert_eq!(none.panel_row_at(cx, 100), None);
+
+        let theatre = Layout::new(1375, 900, 120, true, lang::HELP_ROWS, &m);
+        assert_eq!(theatre.panel_drawn_rows, 0, "影院模式没有面板");
+        assert_eq!(theatre.panel_row_at(cx, 100), None);
+    }
+
+    /// 窗口太矮时，画不出来的行**不该**被命中。
+    ///
+    /// 面板高度被 `min(controls_top)` 夹住时底部几行画不出来（`draw_panel`
+    /// 里 `y >= controls.top` 就 `break`）。如果这时还能点到那些行，用户会
+    /// 选中一条界面上完全看不见的轨 —— 菜单看起来「点了没反应」。
+    #[test]
+    fn 被夹掉的面板行不可命中() {
+        // 客户区只够放得下 2 行整（第 2 行正好贴住控制栏顶边）
+        let m = metrics_for(lang::Lang::ZhCn);
+        let row_h = row_height(&m, 120);
+        let ctrl_h = px(CTRL_H_DIP, 120);
+        let pad_y = px(PANEL_PAD_Y_DIP, 120);
+        let tight = ctrl_h + 2 * row_h + pad_y;
+        let l = Layout::new(1375, tight, 120, false, lang::HELP_ROWS, &m);
+        assert_eq!(
+            l.panel_drawn_rows, 2,
+            "只够画 2 行（实得 {}）",
+            l.panel_drawn_rows
+        );
+        let cx = (l.panel.left + l.panel.right) / 2;
+
+        // 画出来的那两行都要能点：第 2 行的底边就是 `panel.bottom`，
+        // 面板最下面那一像素仍然属于第 2 行（点它是合法的）
+        for row in 0..l.panel_drawn_rows as i32 {
+            let top = l.panel_row_top + row * row_h;
+            assert_eq!(l.panel_row_at(cx, top), Some(row as usize));
+            assert_eq!(
+                l.panel_row_at(cx, top + row_h - 1),
+                Some(row as usize),
+                "第 {row} 行最后一个像素"
+            );
+        }
+
+        // 第 3 行开始就是控制栏，不是面板
+        assert_eq!(l.panel_row_at(cx, l.panel.bottom), None);
+        assert_eq!(l.panel_row_at(cx, l.panel.bottom + row_h), None);
+    }
+
+    /// 面板没被夹住时，`panel_drawn_rows` 必须**正好**等于行数。
+    ///
+    /// 这条盯的是 `drawn_rows` 那个 `min(panel_rows)`：少了它，底部内边距
+    /// 会被算成多出来的一行，命中测试就会报出一个不存在的行号。
+    #[test]
+    fn 没被夹住时行数正好等于真实行数() {
+        // 900px 客户区在 120 DPI 下大概放得下 36 行，取几组肯定放得下的。
+        // 放不下的那种由 `被夹掉的面板行不可命中` 覆盖。
+        for rows in [1usize, 2, lang::DIAG_ROWS, lang::HELP_ROWS, 30] {
+            let l = layout_with_panel(1375, 900, rows);
+            assert_eq!(
+                l.panel_drawn_rows, rows,
+                "{rows} 行时 drawn_rows 应该是 {rows}（实得 {}）",
+                l.panel_drawn_rows
+            );
+            // 最后一行也要点得到
+            let cx = (l.panel.left + l.panel.right) / 2;
+            let last = rows as i32 - 1;
+            let y = l.panel_row_top + last * l.panel_row_h + l.panel_row_h - 1;
+            assert_eq!(l.panel_row_at(cx, y), Some(last as usize));
+        }
     }
 
     /// 两种语言的标签列宽度都必须量出来，且为正。

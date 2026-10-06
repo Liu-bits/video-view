@@ -25,6 +25,10 @@ use crate::diag::{self, Diagnostics};
 use crate::gpu;
 use crate::lang;
 use crate::settings::{self, Settings};
+use crate::track::{
+    build_rows, cursor_for, group_list, group_of_row, row_id, step_index, RowId, TrackKind,
+    TrackRow, TrackSet,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     GetLastError, GlobalFree, ERROR_CLASS_ALREADY_EXISTS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
@@ -45,9 +49,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6,
-    VK_7, VK_8, VK_9, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11, VK_HOME, VK_I,
-    VK_LEFT, VK_M, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5, VK_OEM_COMMA, VK_OEM_PERIOD, VK_RIGHT, VK_S,
-    VK_SPACE, VK_UP,
+    VK_7, VK_8, VK_9, VK_A, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11, VK_HOME,
+    VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5, VK_OEM_COMMA,
+    VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -169,18 +173,24 @@ enum PanelMode {
     Stats,
     /// 快捷键总览
     Help,
+    /// 音轨 / 字幕轨菜单
+    Tracks,
 }
 
 impl PanelMode {
     /// 显示这个面板时会占几行。`Layout` 靠它算高度。
     ///
-    /// 两种语言下都取**编译期常量**的行数，不去 `Vec::len()`：布局在
-    /// 绘制之前算好，行数必须是能免费拿到的常量，否则每帧一次堆分配。
+    /// 固定行数的两种面板都取**编译期常量**的行数，不去 `Vec::len()`：
+    /// 布局在绘制之前算好，行数必须是能免费拿到的常量，否则每帧一次堆分配。
+    ///
+    /// 轨道菜单的行数是**运行期才知道**的（有几条轨就几行），所以这里给 0，
+    /// 真正要用的地方走 `App::panel_row_count()`。
     fn rows(self) -> usize {
         match self {
             PanelMode::None => 0,
             PanelMode::Stats => lang::DIAG_ROWS,
             PanelMode::Help => lang::HELP_ROWS,
+            PanelMode::Tracks => 0,
         }
     }
 
@@ -370,6 +380,32 @@ struct App {
     /// 而 `PaintState` 里放的是引用，每帧重新构造一个临时数组再借出去
     /// 是过不了的（返回引用局部临时值）。
     help_rows: [(&'static str, &'static str); lang::HELP_ROWS],
+
+    // ---- 轨道（音轨 / 字幕轨）----
+    ///
+    /// 当前媒体的轨道，来自 `track-list` 节点树。
+    ///
+    /// **不在打开菜单时才读**：读一次要走 `mpv_get_property` + 复制整棵树
+    /// （几十个节点、每个字符串一次分配），而菜单是随手就开的。所以只在
+    /// 三个时机刷新：`FileLoaded`、切轨之后、打开菜单时。
+    tracks: TrackSet,
+    /// 轨道菜单的行（含分组标题）。由 `tracks` 编出来，只在 `tracks`
+    /// 变化时重建，不每帧重编。
+    track_rows: Vec<TrackRow>,
+    /// 菜单光标停在 `track_rows` 的第几行。
+    ///
+    /// 是**行**下标不是「可选行」下标：分组标题占一行但不可选，用行下标
+    /// 才能让 ↑↓ 与鼠标点击用同一套坐标（`Hit::TrackRow` 给的也是行下标）。
+    /// `move_cursor` 负责跳过不可选的行。
+    track_cursor: usize,
+    /// 鼠标在客户区里的位置（物理像素）。
+    ///
+    /// 单独存一份而不是每次现算：`WM_MOUSEMOVE` 给的是客户区坐标，
+    /// 而 `paint` 里算悬停行时未必有消息可依（定时重画时也会走 paint）。
+    /// 有了它，250ms 一次的定时重画也能把悬停高亮画对。
+    hover_x: i32,
+    hover_y: i32,
+
     /// 用户设置。启动时读一次，之后改动只置 `prefs_dirty`。
     prefs: Settings,
     prefs_dirty: bool,
@@ -436,6 +472,11 @@ impl App {
             panel,
             panel_rows: Vec::new(),
             help_rows,
+            tracks: TrackSet::default(),
+            track_rows: Vec::new(),
+            track_cursor: 0,
+            hover_x: 0,
+            hover_y: 0,
             prefs,
             prefs_dirty: false,
             prefs_last_flush: std::time::Instant::now(),
@@ -479,7 +520,7 @@ impl App {
             self.client_h,
             self.dpi,
             self.theatre,
-            self.panel.rows(),
+            self.panel_row_count(),
             &self.theme.metrics,
         );
 
@@ -526,6 +567,12 @@ impl App {
         if self.theatre {
             return;
         }
+        // 轨道菜单的行数是运行期才知道的，所以切到菜单时**先**把轨道读回来。
+        // 顺序反了的话会先按 0 行布局（画面不矮）、再改行数（画面矮），
+        // 中间那一帧用户看到的是菜单凭空出现。
+        if mode == PanelMode::Tracks {
+            self.refresh_tracks();
+        }
         self.panel = mode;
         // 诊断面板的行数据每帧都要 `format!`，只在面板打开时重建
         self.panel_rows = match mode {
@@ -535,6 +582,264 @@ impl App {
         self.prefs_touch();
         self.relayout();
         self.invalidate_all();
+    }
+
+    /// 面板显示几行。轨道菜单的行数是运行期的，所以要问实例而不是问枚举。
+    fn panel_row_count(&self) -> usize {
+        match self.panel {
+            PanelMode::Tracks => self.track_rows.len(),
+            other => other.rows(),
+        }
+    }
+
+    /// 鼠标当前悬停在菜单的第几行。只有菜单打开时才有值。
+    fn hover_row_now(&self) -> Option<usize> {
+        if self.panel != PanelMode::Tracks {
+            return None;
+        }
+        self.layout.panel_row_at(self.hover_x, self.hover_y)
+    }
+
+    // ------------------------------------------------------------ 轨道
+
+    /// 从 mpv 重新读一遍 `track-list`，并把菜单行重建出来。
+    ///
+    /// 调用时机只有三处：`FileLoaded`、切轨之后、打开菜单时。
+    /// 刻意**不观察** `track-list`：它是 mpv 内部每次换轨都重建的树，
+    /// 观察它等于每次切轨都在事件线程上复制几十个字符串，而切轨是用户
+    /// 主动按出来的低频动作 —— 主动读三次的开销可以忽略。
+    fn refresh_tracks(&mut self) {
+        let set = match self.player.as_ref() {
+            Some(p) => match p.get_node_tree("track-list") {
+                Ok(root) => TrackSet::from_node(&root),
+                // 读不到不是错误：没加载文件时 mpv 对 `track-list` 返回的是
+                // `property unavailable`，而「没文件」是完全正常的状态
+                Err(_) => TrackSet::default(),
+            },
+            // 还没建 player（启动早期）或已经关了。菜单这时是空的
+            None => TrackSet::default(),
+        };
+        self.replace_tracks(set);
+    }
+
+    /// 换掉轨道集并重建菜单行，把光标放回**原来那条**轨上。
+    ///
+    /// 「原来那条」必须在**替换之前**算出来，而且要用**旧的** `track_rows`
+    /// 配**旧的** `tracks`：`row_id` 里要把行内编号（组内下标）翻译成轨道
+    /// id，而那个下标只在旧的那一对里才有意义。分开两步写（先 `row_id`
+    /// 再赋值）会拿到「新 tracks + 旧 rows」的错配 —— 现在靠 mpv 的
+    /// id 单调递增、只往末尾追加，碰巧不出错；一旦 mpv 改了 id 分配或插入
+    /// 位置，光标就会静默跳到别的轨上。
+    fn replace_tracks(&mut self, set: TrackSet) {
+        let keep = row_id(
+            &self.track_rows,
+            &self.tracks,
+            &self.strings,
+            self.track_cursor,
+        );
+        self.tracks = set;
+        self.track_rows = build_rows(&self.tracks, &self.strings);
+        self.track_cursor = cursor_for(&self.track_rows, &self.tracks, &self.strings, keep);
+    }
+
+    /// 移动光标，跳过不可选的分组标题。到两端就停住（不循环）。
+    ///
+    /// 不循环：菜单两端有明确的「到这里为止」。循环会让用户想「往下看最后
+    /// 一条」时突然回到第一条，得再按一次才知道自己在哪。
+    fn move_cursor(&mut self, delta: isize) {
+        let n = self.track_rows.len();
+        if n == 0 || !self.track_rows.iter().any(|r| r.selectable()) {
+            return;
+        }
+        let mut i = self.track_cursor as isize;
+        let mut moved = 0;
+        // 上限取 n：最多扫一圈，扫不到可选行就说明没有，停下来
+        while moved < n {
+            let next = (i + delta).clamp(0, n as isize - 1);
+            if next == i {
+                break; // 顶到端了
+            }
+            i = next;
+            moved += 1;
+            if self.track_rows[i as usize].selectable() {
+                break;
+            }
+        }
+        let i = i.clamp(0, n as isize - 1) as usize;
+        if i != self.track_cursor {
+            self.track_cursor = i;
+            self.invalidate_controls();
+        }
+    }
+
+    /// 激活光标那一行（回车）。
+    fn activate_cursor(&mut self) {
+        if let Some(row) = self.track_rows.get(self.track_cursor).cloned() {
+            self.activate_row(self.track_cursor, &row);
+        }
+    }
+
+    /// 激活第 `i` 行（回车 / 鼠标点击）。
+    fn activate_row(&mut self, i: usize, row: &TrackRow) {
+        match row {
+            // 分组标题与说明行都不可选。点它们也不该有副作用
+            TrackRow::Heading(_) | TrackRow::Note(_) => {}
+            TrackRow::OffSubtitle { .. } => {
+                // mpv 用 `sid = no` 关字幕
+                if let Some(p) = self.player.as_ref() {
+                    if let Err(e) = p.disable_subtitles() {
+                        self.report_error(self.strings.err_switch_track, &e);
+                    }
+                }
+            }
+            TrackRow::Item { index, .. } => {
+                let Some(kind) = group_of_row(&self.track_rows, &self.strings, i) else {
+                    return;
+                };
+                let Some(t) = group_list(&self.tracks, kind).get(*index) else {
+                    return;
+                };
+                let Some(prop) = t.kind.property() else {
+                    return;
+                };
+                let id = t.id;
+                if let Some(p) = self.player.as_ref() {
+                    if let Err(e) = p.select_track(prop, id) {
+                        self.report_error(self.strings.err_switch_track, &e);
+                        return;
+                    }
+                }
+            }
+        }
+        // 切完之后 mpv 侧的 `selected` 变了。重读一次菜单里的 ● 才对得上，
+        // 而且 `rebuild_track_rows` 会把光标收回到刚选的那条
+        self.refresh_tracks();
+        if self.panel == PanelMode::Tracks {
+            self.relayout();
+        }
+        self.invalidate_all();
+    }
+
+    /// 在同类轨道之间移动一格（`J` / `L` / `A` 快捷键）。
+    ///
+    /// `step` 是方向：`1` 往下一条，`-1` 往上一条，**两端都绕回**。
+    /// 绕回是故意的：字幕轨经常有两条以上，`J` 连按三次回到第一条是
+    /// 用户预期的「循环」；不绕回的话按过头就停住，用户以为漏了一条。
+    ///
+    /// 「只有一条轨」是正常结果（按了等于没按），所以**不报错**，
+    /// 菜单里的 ● 也不动。
+    fn cycle_track(&mut self, kind: TrackKind, step: isize) {
+        // 没有媒体时 `tracks` 是空的，而 mpv 侧的 `aid` / `sid` 也没有可写的
+        // 值 —— 直接返回，不要去写一个必然失败的属性然后弹「切轨失败」。
+        // （`stop` / `EndFile` 之后 `tracks` 会被清空，见 `clear_tracks`。）
+        if !self.state.has_file {
+            return;
+        }
+        let (list, prop) = match kind {
+            TrackKind::Audio => (&self.tracks.audio, "aid"),
+            TrackKind::Sub => (&self.tracks.sub, "sid"),
+            TrackKind::Video => return,
+        };
+        // 字幕一条都没选中时，`J` / `L` **打开**字幕而不是什么都不做。
+        //
+        // 不这样的话，用户在菜单里选了「关闭」之后 `J` / `L` 就永久失灵了
+        // ——「关掉字幕之后快捷键就废了」是很容易被当成 bug 报回来的行为。
+        // 打开时挑 `default` 的那条（文件自己声明的那条），没有就挑第一条。
+        let current = list.iter().find(|t| t.selected);
+        let Some(current) = current else {
+            if kind == TrackKind::Sub {
+                let pick = list.iter().find(|t| t.default).or_else(|| list.first());
+                if let Some(t) = pick {
+                    let id = t.id;
+                    if let Some(p) = self.player.as_ref() {
+                        if let Err(e) = p.select_track(prop, id) {
+                            self.report_error(self.strings.err_switch_track, &e);
+                            return;
+                        }
+                    }
+                    self.after_track_switch(kind, id);
+                }
+            }
+            return;
+        };
+        let n = list.len();
+        let Some(pos) = list.iter().position(|t| t.id == current.id) else {
+            return;
+        };
+        let Some(next_idx) = step_index(n, pos, step) else {
+            return;
+        };
+        let Some(next) = list.get(next_idx) else {
+            return;
+        };
+        // 就一条、且正在用它 —— 按了等于没按，早点回来
+        if next.id == current.id {
+            return;
+        }
+        let id = next.id;
+        if let Some(p) = self.player.as_ref() {
+            if let Err(e) = p.select_track(prop, id) {
+                self.report_error(self.strings.err_switch_track, &e);
+                return;
+            }
+        }
+        self.after_track_switch(kind, id);
+    }
+
+    /// 切轨成功之后：重读轨道表、必要时重排、把光标收到刚切的那条。
+    ///
+    /// 抽出来是因为「打开字幕」和「切到下一条」两条路径要做的后半段
+    /// 完全一样，重复一遍的话以后改一处忘一处。
+    fn after_track_switch(&mut self, kind: TrackKind, id: i64) {
+        self.refresh_tracks();
+        if self.panel == PanelMode::Tracks {
+            // 光标跟着切过去：按 `A` 之后按回车，选中的应该是刚切的那条
+            self.track_cursor = cursor_for(
+                &self.track_rows,
+                &self.tracks,
+                &self.strings,
+                Some(RowId::Track(kind, id)),
+            );
+            self.relayout();
+        }
+        self.invalidate_all();
+    }
+
+    /// 把一个外挂字幕文件加载进来（拖放 / 文件对话框）。
+    fn add_subtitle(&mut self, path: &std::path::Path) {
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        if let Err(e) = p.add_subtitle(path) {
+            self.report_error(self.strings.err_add_subtitle, &e);
+            return;
+        }
+        // **不弹「字幕已加载」的框。** `sub-add` 是异步的：命令发出即返回，
+        // 此刻 mpv 那边还没开始建轨，所以成功提示既可能太早（随后又来一个
+        // `CommandError` 说失败），也来不及反映真实结果（菜单里看不到新轨）。
+        //
+        // 真正的反馈是**看得见的**：字幕立刻出现在画面上，菜单里多一行带
+        // `●` 的条目。失败时 mpv 会抛 `CommandError`，那一条走对话框。
+        // 「成功靠画面、失败靠弹窗」这个不对称比每次拖字幕都弹一个模态框好 ——
+        // 连拖五个字幕就是五个要挨个关掉的框。
+        self.refresh_tracks();
+        // `track_rows` 变了，行数可能变，**必须重排**：不重排的话布局里的
+        // `panel` 矩形、`panel_drawn_rows`、视频子窗口 bounds 全是旧的，
+        // 新行既画不出来（`draw_panel` 撞 `controls.top` 提前 break）
+        // 也点不到（`panel_row_at` 按旧行数判界）。
+        if self.panel == PanelMode::Tracks {
+            self.relayout();
+        }
+        self.invalidate_all();
+    }
+
+    /// 清空轨道状态。
+    ///
+    /// `stop` / `EndFile` 之后必须调：`tracks` 里留着上一个文件的轨，
+    /// 用户按 `A` / `J` / `L` 就会拿着已经不存在的 id 去写属性，弹一个
+    /// 没有上下文的「切轨失败」。
+    fn clear_tracks(&mut self) {
+        self.replace_tracks(TrackSet::default());
     }
 
     /// 面板内容，供 `paint` 用。
@@ -584,6 +889,23 @@ impl App {
 
     /// 打开一个文件。路径校验由 `load_file` 做。
     fn open(&mut self, path: &Path) {
+        // 字幕文件走到这里时**不是**当视频播，而是给当前视频外挂上去。
+        //
+        // 不这么做的话「打开文件」对话框里选一个 `.srt` 会走进 `load_file`，
+        // 让 mpv 把它当视频播、然后失败弹一个「打不开」—— 而拖放同一个
+        // 文件却是正常外挂字幕。同一个扩展名两条入口两种行为，说不通。
+        if is_subtitle_path(path) {
+            if !self.state.has_file {
+                // 没有媒体可挂。给一句说人话的提示，而不是让 mpv 去报错
+                self.report_error(
+                    self.strings.err_add_subtitle,
+                    self.strings.err_no_media_for_sub,
+                );
+            } else {
+                self.add_subtitle(path);
+            }
+            return;
+        }
         // 换文件时先把界面归位，否则会短暂显示上一段视频的时间与时长
         self.state.has_file = true;
         self.state.idle = false;
@@ -656,6 +978,9 @@ impl App {
         self.state.position = 0.0;
         self.state.duration = 0.0;
         self.state.title.clear();
+        // 没有媒体了，轨道状态也不能留着：留着的话按 `A` / `J` / `L`
+        // 会拿着已经不存在的 id 去写属性，弹一个没有上下文的「切轨失败」
+        self.clear_tracks();
         // 画面窗口藏起来，露出欢迎提示
         surface::set_video_visible(self.video, false);
         self.invalidate_all();
@@ -824,6 +1149,19 @@ impl App {
     /// 影院模式：隐藏控制栏，画面占满整个客户区。
     fn toggle_theatre(&mut self) {
         self.theatre = !self.theatre;
+        // 进影院时把面板**状态**清掉，而不只是让它看不见。
+        //
+        // `set_panel` 在影院模式下直接返回（面板在那里看不见），所以如果这里
+        // 不清，状态就会留下一个看不见的面板：`Esc` 的第一步是「关掉面板」，
+        // 它会走进 `set_panel(None)` → 影院模式早返回 → 什么也没做 → `Esc`
+        // 被吃掉。用户按多少次 `Esc` 都出不去影院，只能按 `F`。
+        //
+        // 清掉之后 `Esc` 的第一层判断（面板非空）自然不成立，第二层
+        // 「退出影院」就正常生效了。
+        if self.theatre {
+            self.panel = PanelMode::None;
+            self.panel_rows.clear();
+        }
         self.relayout();
         self.invalidate_all();
     }
@@ -944,7 +1282,12 @@ impl App {
                     self.state.has_file = true;
                     self.state.idle = false;
                     surface::set_video_visible(self.video, true);
-                    layout_dirty = true;
+                    // 轨道这时才存在。菜单如果正开着，行数会变，必须重排；
+                    // 没开也要刷新，否则用户开菜单时读到的是上一个文件的轨
+                    self.refresh_tracks();
+                    if self.panel == PanelMode::Tracks {
+                        layout_dirty = true;
+                    }
                 }
                 MpvEventMessage::Error(msg) => {
                     layout_dirty |= self.enter_idle();
@@ -973,6 +1316,8 @@ impl App {
         self.state.idle = true;
         self.state.position = 0.0;
         self.state.duration = 0.0;
+        // 同 `stop`：播完之后不留上一段的轨道状态
+        self.clear_tracks();
         surface::set_video_visible(self.video, false);
         was_active
     }
@@ -1049,8 +1394,16 @@ impl App {
         let panel = match self.panel {
             PanelMode::Help => Some(Panel::Help(&self.help_rows)),
             PanelMode::Stats => Some(Panel::Stats(&self.panel_rows)),
+            PanelMode::Tracks => Some(Panel::Tracks {
+                rows: &self.track_rows,
+                cursor: self.track_cursor,
+            }),
             PanelMode::None => None,
         };
+        // 悬停行只有在菜单打开时才算：面板不是菜单时 `panel_row_at` 仍会
+        // 返回行号（`Layout` 只报几何不管语义），直接用会给快捷键面板
+        // 也点亮高亮。
+        let hover_row = self.hover_row_now();
         unsafe {
             ui::paint(
                 mem,
@@ -1071,6 +1424,7 @@ impl App {
                     theatre: self.theatre,
                     idle: self.state.idle,
                     hover: self.hover,
+                    hover_row,
                     strings: &self.strings,
                     panel,
                 },
@@ -1466,6 +1820,16 @@ unsafe extern "system" fn app_wnd_proc(
         WM_MOUSEMOVE => {
             let (x, y) = point_from_lparam(lparam);
             let app = &mut *app_ptr;
+            // 记位置：悬停行要用。拖动中也记 —— 拖完松手时鼠标停在滑块上，
+            // 不记的话菜单的悬停高亮会留在上一次移动的位置。
+            // 换行时重画：只在 `hit` 变化时失效是不够的，光标在同一个控件里
+            // 从一行移到另一行时 `hit` 完全一样。
+            let row_before = app.hover_row_now();
+            app.hover_x = x;
+            app.hover_y = y;
+            if app.hover_row_now() != row_before {
+                app.invalidate_controls();
+            }
             match app.dragging {
                 Dragging::Seek => {
                     app.drag_x = x;
@@ -1496,11 +1860,43 @@ unsafe extern "system" fn app_wnd_proc(
             let _ = SetFocus(Some(hwnd));
             let (x, y) = point_from_lparam(lparam);
             let app = &mut *app_ptr;
+            // 记下鼠标位置：点击后 `paint` 要靠它算悬停行（不点击只移动
+            // 也有 `WM_MOUSEMOVE` 更新，这里再记一次是为了「菜单在两次
+            // 移动之间被打开」时悬停行立刻是对的）
+            app.hover_x = x;
+            app.hover_y = y;
             match app.layout.hit(x, y) {
                 Hit::Open => app.pick_file(),
                 Hit::Play => app.toggle_pause(),
                 Hit::Stop => app.stop(),
                 Hit::Mute => app.toggle_mute(),
+                // `hit` 只报几何不管语义，面板是不是菜单由这里判断。
+                //
+                // 非菜单面板（诊断 / 快捷键）落到这里时**什么都不做**，
+                // 和 0.4.0 一致：`Hit::Video` 在主窗口的含义是「不处理」
+                // （画面点击由视频子窗口自己处理，主窗口不该收到），
+                // 而不是「切播放/暂停」。写成 `toggle_pause()` 会让
+                // 「点快捷键面板的任意一行」变成暂停/继续 —— 一个没人
+                // 会预期、也没人报出来的行为变化。
+                Hit::TrackRow(i) => {
+                    if app.panel != PanelMode::Tracks {
+                        return LRESULT(0);
+                    }
+                    // `i` 的上界是**布局里**的 `panel_drawn_rows`，而下标要落到
+                    // `track_rows`（数据）。拖放字幕之后如果没重排（见
+                    // `add_subtitle`），前者可能大于后者 —— 所以这里必须查，
+                    // 不能拿 `i` 直接写进 `track_cursor`。
+                    let Some(row) = app.track_rows.get(i).cloned() else {
+                        return LRESULT(0);
+                    };
+                    // 不可选的行（分组标题 / 说明行）点了不移动光标：
+                    // 移过去的话高亮会消失（那两种行不画光标底色），
+                    // 用户看到的是「点了一下什么都没发生，还把选中态弄没了」
+                    if row.selectable() {
+                        app.track_cursor = i;
+                        app.activate_row(i, &row);
+                    }
+                }
                 Hit::Seek => {
                     if app.state.has_file && app.state.duration > 0.0 {
                         app.dragging = Dragging::Seek;
@@ -1576,7 +1972,10 @@ unsafe extern "system" fn app_wnd_proc(
             let idc = match hit {
                 Hit::Open | Hit::Play | Hit::Stop | Hit::Mute => IDC_HAND,
                 Hit::Seek | Hit::Volume => IDC_HAND,
-                Hit::Video | Hit::None => IDC_ARROW,
+                // 菜单里每一行都是可点的，所以给手型光标。诊断/快捷键面板
+                // 虽然也返回 `TrackRow`，但那里点它等于点画面，用箭头更诚实
+                Hit::TrackRow(_) if matches!(app.panel, PanelMode::Tracks) => IDC_HAND,
+                Hit::TrackRow(_) | Hit::Video | Hit::None => IDC_ARROW,
             };
             if let Ok(cursor) = LoadCursorW(None, idc) {
                 let _ = SetCursor(Some(cursor));
@@ -1650,19 +2049,61 @@ fn pick_video_dialog(strings: &lang::Strings) -> Option<PathBuf> {
 unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
     let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
     let key = |k: u16| vk == k;
+
+    // ---- 轨道菜单打开时，方向键 / 回车 / Esc 归菜单 ----
+    //
+    // 这是标准菜单行为：菜单开着的时候 ↑↓ 是「选哪一条」而不是「调音量」。
+    // 不这样的话，用户在菜单里按 ↑ 会听到音量变，而高亮纹丝不动 ——
+    // 两件事同时发生、其中一件显然不是他要的，比「菜单只吃一部分键」
+    // 更让人困惑。
+    //
+    // 只吃这四个键。切轨（`J`/`L`/`A`）、截图（`S`）、诊断（`I`）这些
+    // 仍然照常工作 —— 菜单是叠在播放器上的，不是另一个模态界面。
+    if (*app_ptr).panel == PanelMode::Tracks && !ctrl {
+        match vk {
+            k if k == VK_UP.0 => {
+                (&mut *app_ptr).move_cursor(-1);
+                return true;
+            }
+            k if k == VK_DOWN.0 => {
+                (&mut *app_ptr).move_cursor(1);
+                return true;
+            }
+            k if k == VK_RETURN.0 => {
+                (&mut *app_ptr).activate_cursor();
+                return true;
+            }
+            k if k == VK_ESCAPE.0 => {
+                (&mut *app_ptr).set_panel(PanelMode::None);
+                return true;
+            }
+            _ => {}
+        }
+    }
+
     match vk {
         _ if key(VK_SPACE.0) => {
             (&mut *app_ptr).toggle_pause();
             true
         }
         _ if key(VK_ESCAPE.0) => {
-            // Esc 先退出影院模式，其次退出全屏
+            // Esc 的顺序：**影院 → 全屏 → 面板**。
+            //
+            // 影院排在最前是刻意的。影院模式里 `set_panel` 会早返回（面板在
+            // 那里看不见），所以面板如果排在前面，Esc 会走进
+            // `set_panel(None)` -> 早返回 -> 什么也没发生然后被吃掉：
+            // 用户按多少次 Esc 都出不去影院。正着排则影院永远一步退出，
+            // 不依赖「进影院时清了面板状态」那个约定。
+            //
+            // 面板排最后：从菜单里 Esc 出来，用户期待的是「回到视频」。
             let app = &mut *app_ptr;
             if app.theatre {
                 app.toggle_theatre();
             } else if app.fullscreen {
                 // 借用在这一句里就结束了：见 toggle_fullscreen 的注释
                 toggle_fullscreen(app_ptr);
+            } else if app.panel != PanelMode::None {
+                app.set_panel(PanelMode::None);
             }
             true
         }
@@ -1725,6 +2166,31 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
         }
         _ if key(VK_S.0) => {
             (&mut *app_ptr).screenshot();
+            true
+        }
+        // `T` = 轨道菜单。再按一次收起
+        _ if key(VK_T.0) => {
+            let app = &mut *app_ptr;
+            app.set_panel(app.panel.toggled_to(PanelMode::Tracks));
+            true
+        }
+        // `J` / `L` = 上一条 / 下一条字幕轨。
+        //
+        // 用 J/L 而不是 mpv 自己的 `cycle sub` 命令有两个原因：一是 `cycle`
+        // 把「关掉字幕」也算进循环里，按一下可能什么都看不见（用户以为
+        // 坏了），二是它只有一个入口，没法「往前」找。这里显式在**轨**之间
+        // 循环，「关闭字幕」仍然只在菜单里选。
+        _ if key(VK_J.0) => {
+            (&mut *app_ptr).cycle_track(TrackKind::Sub, -1);
+            true
+        }
+        _ if key(VK_L.0) => {
+            (&mut *app_ptr).cycle_track(TrackKind::Sub, 1);
+            true
+        }
+        // `A` = 下一条音轨
+        _ if key(VK_A.0) => {
+            (&mut *app_ptr).cycle_track(TrackKind::Audio, 1);
             true
         }
         // `I` = 解码诊断。再按一次收起
@@ -1833,11 +2299,35 @@ unsafe fn handle_drop(app_ptr: *mut App, hdrop: HDROP) {
         }
     };
     let path = PathBuf::from(units);
-    if path.is_file() {
-        (&mut *app_ptr).open(&path);
-    } else {
+    if !path.is_file() {
         (&mut *app_ptr).report_error(strings.err_open, strings.err_not_a_file);
+        return;
     }
+    // 字幕文件拖进来 = 给当前视频加外挂字幕，不替换媒体。
+    //
+    // 判据是扩展名。字幕格式太多（`.srt`/`.ass`/`.ssa`/`.vtt`/`.sub`/`.idx`
+    // ……），这里只认最常见的四种，遇到别的（`.mks` 之类）当媒体处理 ——
+    // 判错的后果不对称：把字幕当视频打开会失败并报错，把视频当字幕加载
+    // 则是一条不存在的外挂轨。
+    if is_subtitle_path(&path) {
+        (&mut *app_ptr).add_subtitle(&path);
+    } else {
+        (&mut *app_ptr).open(&path);
+    }
+}
+
+/// 这个扩展名是不是字幕文件。
+///
+/// 只认常见的四种，其余一律当媒体。理由见 `handle_drop` 里的注释。
+fn is_subtitle_path(p: &Path) -> bool {
+    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    // 扩展名大小写都算：`.SRT` 在 Windows 上很常见
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "srt" | "ass" | "ssa" | "vtt"
+    )
 }
 
 /// 模态提示框。release 下没有控制台，这是唯一的反馈通道。

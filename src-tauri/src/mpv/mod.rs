@@ -10,6 +10,7 @@ pub mod ffi;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -619,6 +620,39 @@ impl MpvPlayer {
         Ok(())
     }
 
+    /// 取一个 `MPV_FORMAT_NODE` 属性，遍历成 Rust 侧的值树。
+    ///
+    /// `track-list` 这类属性不是标量，而是 mpv 自己的节点树（对象 / 数组 /
+    /// 标量三种节点递归组成）。mpv 分配它、**由调用方释放**，所以这里
+    /// 用 `NodeGuard` 保证 `mpv_free_node_contents` 一定被调到 —— 漏掉
+    /// 就是泄漏，而「打开文件 → 切轨 → 关文件」这个循环会漏得很快。
+    ///
+    /// 遍历过程中把每个节点的字符串都**复制**成 Rust 的 `String` 之后
+    /// 才释放原树，所以返回值不借用任何 mpv 内存。
+    pub fn get_node_tree(&self, name: &str) -> Result<MpvValue, String> {
+        let cname = CString::new(name).map_err(|_| "属性名包含空字节".to_string())?;
+        let mut node = MaybeUninit::<ffi::MpvNode>::uninit();
+        let code = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                cname.as_ptr(),
+                MPV_FORMAT_NODE,
+                node.as_mut_ptr() as *mut c_void,
+            )
+        };
+        if code < 0 {
+            return Err(self.api.error_message(code));
+        }
+        // 从这里起 node 已初始化，且**必须**被释放
+        // SAFETY: mpv_get_property 返回 0 时按契约一定填好了这个结构
+        let node_init = unsafe { node.assume_init() };
+        let node = NodeGuard {
+            node: node_init,
+            free: self.api.free_node_contents,
+        };
+        Ok(convert_node(&node.node))
+    }
+
     fn set_double_property(&self, name: &str, value: f64) -> Result<(), String> {
         let cname = CString::new(name).map_err(|_| "属性名包含空字节".to_string())?;
         let mut v = value;
@@ -765,6 +799,119 @@ impl MpvPlayer {
         self.set_double_property("volume", volume)
     }
 
+    /// 设置一个 int64 属性（`scale` / `sub-delay` 等）。
+    ///
+    /// 注意：**不要**用它切轨。`sid` / `aid` 在 mpv 里是 choice 类型，
+    /// 传 int64 有时成功有时报 `MPV_ERROR_PROPERTY_FORMAT`（实测
+    /// `sid = 1` 返回 0、`sid = -1` 直接失败），行为不一致。
+    /// 切轨走 [`MpvPlayer::select_track`]。
+    pub fn set_int_property(&self, name: &str, value: i64) -> Result<(), String> {
+        let cname = CString::new(name).map_err(|_| "属性名包含空字节".to_string())?;
+        let mut v = value;
+        let code = unsafe {
+            (self.api.set_property)(
+                self.handle,
+                cname.as_ptr(),
+                MPV_FORMAT_INT64,
+                &mut v as *mut _ as *mut c_void,
+            )
+        };
+        check(&self.api, code, &format!("setting property {name}"))
+    }
+
+    /// 选中某条轨道。`prop` 是 `"aid"`（音轨）或 `"sid"`（字幕轨）。
+    ///
+    /// 走**字符串**而不是 int64：`aid` / `sid` 在 mpv 里是 choice 属性，
+    /// 官方给的写法就是字符串（`"1"`、`"auto"`、`"no"`）。实测传 int64 时
+    /// `sid = 1` 能过、`sid = -1` 报 `MPV_ERROR_PROPERTY_FORMAT` ——
+    /// 关字幕的 `-1` 正好是失败的那个，症状是「字幕关不掉」。
+    pub fn select_track(&self, prop: &str, id: i64) -> Result<(), String> {
+        self.set_string_property(prop, &id.to_string())
+    }
+
+    /// 关掉字幕（`sid = no`）。
+    pub fn disable_subtitles(&self) -> Result<(), String> {
+        self.set_string_property("sid", OFF_TRACK)
+    }
+
+    /// 设置一个字符串属性（`sid` / `aid` / `sub-encoding` …）。
+    ///
+    /// ## 必须走 `mpv_set_property_string`，不能走 `mpv_set_property` + STRING
+    ///
+    /// 同一份 libmpv（0.41）上实测：
+    ///
+    /// ```text
+    /// mpv_set_property(h, "volume", MPV_FORMAT_STRING, "50")  -> 0xC0000005 访问违例
+    /// mpv_set_property(h, "volume", MPV_FORMAT_DOUBLE, &50.0)  -> 返回 0，正常
+    /// mpv_set_property_string(h, "volume", "50")              -> 返回 0，正常
+    /// ```
+    ///
+    /// 崩的是 `MPV_FORMAT_STRING` 这**一种格式**，同一个函数换 DOUBLE 就好；
+    /// 同一份二进制、同一台机器、连续 10 轮每次都崩在同一处（`set_property`
+    /// 调用内部），而 `set_property_string` 10 轮全过且值确实写进去了。
+    /// 偶尔（同一次二进制、另一种调用顺序）它会返回 `-9`
+    /// （`MPV_ERROR_PROPERTY_FORMAT`）而不崩 —— 也就是说这条路径的行为
+    /// **本身就不确定**，不能靠「有时候不崩」来用它。
+    ///
+    /// libmpv 内部为什么这样没有定位到（不是我们这侧的 ABI 不匹配：同一个
+    /// 符号传 DOUBLE 正常、传 STRING 崩，而 `set_property_string` 是另一个
+    /// 独立符号）。所以这里的做法是**绕开它**，不是修它：
+    /// 字符串一律走 `mpv_set_property_string`，那个是 mpv 文档里给字符串
+    /// 用的正规入口，10/10 稳定。
+    ///
+    /// 这条注释别删：改回 `set_property` + STRING 不会编译失败、不会 clippy
+    /// 报警，只会在运行中崩 —— 而崩的是**整个进程**，界面上什么都看不到。
+    pub fn set_string_property(&self, name: &str, value: &str) -> Result<(), String> {
+        let cname = CString::new(name).map_err(|_| "属性名包含空字节".to_string())?;
+        let cval = CString::new(value).map_err(|_| format!("属性值包含空字节：{value:?}"))?;
+        let code =
+            unsafe { (self.api.set_property_string)(self.handle, cname.as_ptr(), cval.as_ptr()) };
+        check(&self.api, code, &format!("setting property {name}"))
+    }
+
+    /// 加载一个外挂字幕文件（`sub-add`），带自定义 flags。
+    ///
+    /// `flags` 只能填**一个**标志，填错时 mpv 返回 `invalid parameter`
+    /// —— 命令发不出去，字幕也不会加，但用户那边什么提示都没有。
+    /// 实测（mpv 0.41 + `probe.srt`）能接受的值：
+    ///
+    /// ```text
+    /// ""               -> 成功，加进去但不选中
+    /// "select"        -> 成功，加进去并选中
+    /// "default"       -> 成功，加进去并标成默认轨
+    /// "auto"          -> 成功
+    /// "yes"           -> 失败 invalid parameter
+    /// "no"            -> 失败 invalid parameter
+    /// "select,default"-> 失败 invalid parameter（不是逗号分隔的列表）
+    /// ```
+    ///
+    /// 所以「选中」是 `select` 这个**名词**，不是 `yes`。凭直觉写成 `yes`
+    /// 的话 mpv 会安静地拒绝，而界面表现是「拖了字幕没反应」。
+    pub fn add_subtitle_with_flags(&self, path: &Path, flags: &str) -> Result<(), String> {
+        // 与 `load_file` 同一道校验，不省。
+        //
+        // `sub-add` 的第一个参数和 `loadfile` 一样是 **URL**，mpv 会拿当前
+        // 用户的凭据去协商 SMB/NTLM。所以一个 `\\evil\share\x.srt` 走这条路
+        // 和走 `loadfile` 的攻击链完全一样。`load_file` 里那段「校验点只有
+        // 一个才不会漏」的论证在这里同样成立 —— 少一次校验就是漏。
+        reject_remote_path(path)?;
+        let Some(p) = path.to_str() else {
+            return Err("subtitle path is not valid Unicode".to_string());
+        };
+        self.command(&["sub-add", p, flags])
+    }
+
+    /// 加载一个外挂字幕文件并**当场选中**。
+    ///
+    /// 用 `sub-add` 而不是 `loadfile`：`loadfile` 会**替换**当前媒体，
+    /// 而拖一个 `.srt` 进来时用户想要的是「给这个视频加字幕」。
+    ///
+    /// `select` 让刚加进来的字幕立刻在放 —— 不然用户拖完什么也没发生，
+    /// 得再去菜单里手动选一次，那看起来就像「拖字幕不管用」。
+    pub fn add_subtitle(&self, path: &Path) -> Result<(), String> {
+        self.add_subtitle_with_flags(path, "select")
+    }
+
     pub fn set_mute(&self, muted: bool) -> Result<(), String> {
         self.set_flag_property("mute", muted)
     }
@@ -874,6 +1021,167 @@ fn reject_remote_path(path: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------- 事件解码
+
+/// 一棵从 mpv 复制出来的值树。
+///
+/// 之所以整个复制而不是借用：mpv 分配的那棵树必须立刻归还（它归
+/// `mpv_free_node_contents` 管），而界面要拿这些数据填好几层 UI、
+/// 还要在换文件时继续读上一份 —— 借用只能活一个瞬间。
+///
+/// 列表用 `Vec<(Option<String>, MpvValue)>` 而不是 map：mpv 的节点数组
+/// 既可以是「有序列表」（`keys == NULL`，比如 `chapters`）也可以是
+/// 「对象」（有 keys）。用 map 会把有序的那一半也排成哈希序，而字幕轨、
+/// 音轨的**顺序是有意义的**（默认轨就是数组里的第一个）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MpvValue {
+    Flag(bool),
+    Int(i64),
+    Double(f64),
+    Text(String),
+    List(Vec<(Option<String>, MpvValue)>),
+}
+
+impl MpvValue {
+    /// 按键取值。`keys == NULL` 的列表返回 `None`。
+    pub fn get(&self, key: &str) -> Option<&MpvValue> {
+        match self {
+            MpvValue::List(items) => items
+                .iter()
+                .find(|(k, _)| k.as_deref() == Some(key))
+                .map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// 取出子节点并按字符串解析，类型不符返回 `None`。
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        match self.get(key) {
+            Some(MpvValue::Text(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// 取出子节点并按整数解析。
+    pub fn get_int(&self, key: &str) -> Option<i64> {
+        match self.get(key) {
+            Some(MpvValue::Int(v)) => Some(*v),
+            // mpv 有时把整数报成 double（比如从 Lua 侧塞进去的），
+            // 宽松一点比「界面少一项」好
+            Some(MpvValue::Double(v)) => Some(*v as i64),
+            _ => None,
+        }
+    }
+
+    /// 取出子节点并按布尔解析。
+    pub fn get_flag(&self, key: &str) -> Option<bool> {
+        match self.get(key) {
+            Some(MpvValue::Flag(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// 子节点列表。
+    pub fn list(&self) -> Option<&[(Option<String>, MpvValue)]> {
+        match self {
+            MpvValue::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// 自己是不是字符串（用来区分「轨道的 title 可能是数字」这类情况）。
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            MpvValue::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// 保证 `mpv_free_node_contents` 被调用一次。
+///
+/// 不这么做的后果不是立刻崩溃而是**慢慢泄漏**：mpv 侧每个字符串、每个
+/// 数组都是单独分配的，`track-list` 一个文件就有几十个节点。
+struct NodeGuard {
+    node: ffi::MpvNode,
+    free: ffi::FnFreeNodeContents,
+}
+
+impl Drop for NodeGuard {
+    fn drop(&mut self) {
+        // SAFETY: `node` 由 `mpv_get_property` 填充、格式合法，
+        // `free` 是从 DLL 里取出的 `mpv_free_node_contents`。
+        // 只在 `get_node_tree` 里构造，构造点就在 `assume_init` 之后。
+        unsafe { (self.free)(&mut self.node) }
+    }
+}
+
+/// 递归复制一棵节点树。
+///
+/// 深度是**递归**的，而节点树来自 mpv 内部（不是用户输入），深度由 mpv
+//  决定、实测 `track-list` 是 3 层。这里不设人为上限：真出现环或超深结构时
+//  栈会溢出，而那属于「mpv 出了我们控制范围的问题」，加个深度计数只是把
+//  崩溃变成静默丢数据，反而更难查。
+fn convert_node(node: &ffi::MpvNode) -> MpvValue {
+    match node.format {
+        MPV_FORMAT_STRING => {
+            let p = unsafe { node.u.string };
+            if p.is_null() {
+                MpvValue::Text(String::new())
+            } else {
+                // SAFETY: format 是 STRING 时 `u.string` 是有效的 NUL 结尾
+                // UTF-8（mpv 保证），这里复制成 Rust 的 String 后不再借用它
+                MpvValue::Text(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+            }
+        }
+        MPV_FORMAT_FLAG => MpvValue::Flag(unsafe { node.u.flag != 0 }),
+        MPV_FORMAT_INT64 => MpvValue::Int(unsafe { node.u.int64 }),
+        MPV_FORMAT_DOUBLE => MpvValue::Double(unsafe { node.u.double_ }),
+        // 6 / 7 / 8 都是「类列表」：结构完全一样，区别只在语义
+        // （node / 数组 / 对象）。漏掉任何一个都会把整棵树静默变成空列表
+        // —— 见 `ffi.rs` 里那段实测记录。
+        MPV_FORMAT_NODE | MPV_FORMAT_NODE_ARRAY | MPV_FORMAT_NODE_MAP => {
+            let list = unsafe { node.u.list };
+            if list.is_null() {
+                return MpvValue::List(Vec::new());
+            }
+            // SAFETY: format 是 NODE 时 `u.list` 指向 mpv 分配、已由
+            // NodeGuard 保证在本函数返回后仍然有效的一份节点数组
+            let list = unsafe { &*list };
+            // `values` 也要查 null，不能只查 `keys`。
+            //
+            // mpv 的契约保证 `num > 0` 时 `values` 非空，所以这不是可利用的
+            // bug；但这一段里连 `CStr::from_ptr` 的可空性都考虑了，唯独
+            // `values.add(0)` 在 null 上是 UB，风格上不一致 —— 补上之后
+            // 「读到的形状不对」一律退化成空列表，而不是野指针。
+            if list.values.is_null() {
+                return MpvValue::List(Vec::new());
+            }
+            let has_keys = !list.keys.is_null();
+            let mut out = Vec::with_capacity(list.num.max(0) as usize);
+            for i in 0..list.num.max(0) as usize {
+                // `values` 与 `keys` 等长。keys 为 NULL 时 mpv 保证
+                // values 也非 NULL（空数组）。
+                let value = unsafe { convert_node(&*list.values.add(i)) };
+                let key = if has_keys {
+                    let k = unsafe { *list.keys.add(i) };
+                    Some(if k.is_null() {
+                        String::new()
+                    } else {
+                        // SAFETY: 同上，keys 是 NUL 结尾的 C 字符串
+                        unsafe { CStr::from_ptr(k) }.to_string_lossy().into_owned()
+                    })
+                } else {
+                    None
+                };
+                out.push((key, value));
+            }
+            MpvValue::List(out)
+        }
+        // BYTE_ARRAY / 未知 format：不是我们要的形状，当空列表而不是 panic。
+        // 见到它说明 mpv 加了新格式，那时候该显式处理。
+        _ => MpvValue::List(Vec::new()),
+    }
+}
 
 fn check(api: &MpvApi, code: c_int, what: &str) -> Result<(), String> {
     if code < 0 {
