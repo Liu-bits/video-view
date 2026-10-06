@@ -62,9 +62,43 @@ if (-not $VersionMatch.Success) {
 $Version = $VersionMatch.Groups[1].Value
 Write-Host "版本：$Version"
 
+# ---- 校验 app.manifest 的程序集版本与 Cargo.toml 一致 ------------------------
+# 这处和下面的 exe FileVersion 是**两个独立**的版本号，都能被外部看到：
+#
+#   * `assets/app.manifest` 的 `assemblyIdentity/@version` —— build.rs 不替换它，
+#     它是被 rc 原样嵌进 exe 的程序集清单版本。Windows 用它做程序集绑定，
+#     某些界面（安装器列表、事件查看器）读的是它。
+#   * `app.rc` 的 `FILEVERSION` / `FileVersion` —— 由 build.rs 从
+#     `CARGO_PKG_VERSION` 注入，文件属性和控制面板读的是它。
+#
+# 两者不一致时对外就是一个「文件名 0.3.0、程序集清单 0.2.0」的 exe，而
+# FileVersion 校验**抓不到**（它只看后者）。app.rc 的注释里写着「Cargo.toml
+# 和 rc 脚本各写一遍的必然结果是某次只改了一处」，manifest 正是第三个必须
+# 手动同步的地方，所以在这里补上检查。
+$Manifest = Join-Path $TauriDir "assets\app.manifest"
+if (-not (Test-Path -LiteralPath $Manifest)) {
+    throw "找不到 $Manifest"
+}
+$ManifestMatch = [regex]::Match(
+    [System.IO.File]::ReadAllText($Manifest),
+    'assemblyIdentity[\s\S]*?version="([^"]+)"')
+if (-not $ManifestMatch.Success) {
+    throw "无法从 $Manifest 里读出 assemblyIdentity/@version"
+}
+$ManifestVersion = $ManifestMatch.Groups[1].Value
+$ExpectedManifest = $Version + '.0'
+if ($ManifestVersion -ne $ExpectedManifest) {
+    throw @"
+app.manifest 的 assemblyIdentity/@version 是 $ManifestVersion，应为 $ExpectedManifest。
+build.rs 不会替换这个值，必须手动同步 src-tauri/assets/app.manifest。
+（它和 exe 的 FileVersion 是两个独立的版本号，只改一处不会被下面的检查发现。）
+"@
+}
+
 # ---- 校验嵌进 exe 的版本号与 Cargo.toml 一致 ---------------------------------
-# app.rc 里的 FILEVERSION / FileVersion 是手写的，忘了同步就会出现
-# 「控制面板显示 0.1.0、文件名却是 0.2.0」这种对外不一致，发布前必须挡住。
+# app.rc 的 FILEVERSION / FileVersion 由 build.rs 从 CARGO_PKG_VERSION 注入，
+# 所以这里不需要（也不该）去同步 app.rc —— 漏的是重新 build。症状是
+# 「控制面板还显示上一版、文件名已经是新版」。
 $Exe = Join-Path $TauriDir "target\release\video-view.exe"
 if (-not (Test-Path -LiteralPath $Exe)) {
     throw "找不到 $Exe（是否忘了 -SkipBuild？）"
@@ -73,8 +107,9 @@ $FileVer = (Get-Item -LiteralPath $Exe).VersionInfo.FileVersion
 if ($FileVer -notmatch ("^" + [regex]::Escape($Version) + "(\.|$)")) {
     throw @"
 exe 里的文件版本号是 $FileVer，与 Cargo.toml 的 $Version 不一致。
-请同步 src-tauri/assets/app.rc 里的 FILEVERSION / PRODUCTVERSION / FileVersion，
-改完重新 cargo build --release。
+FileVersion 由 build.rs 从 CARGO_PKG_VERSION 注入，所以要重新
+  cargo build --release
+（用了 -SkipBuild 时最容易漏这一步）。
 "@
 }
 

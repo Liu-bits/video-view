@@ -14,11 +14,11 @@ IDI_APP_ICON ICON "../icons/icon.ico"
 
 // 版本号由 build.rs 从 CARGO_PKG_VERSION 传进来（见 build.rs::embed_resources）。
 // 这里刻意不写死：Cargo.toml 和 rc 脚本各写一遍的必然结果是某次只改了一处，
-// 装出来的软件文件名写 0.3.0、文件属性里却显示 0.2.0。
+// 装出来的软件文件名写 0.4.0、文件属性里却显示 0.3.0。
 //
 // 手工用 rc.exe 验证本脚本时必须带上这两个宏（字符串那个的引号不能省，
-// 少了引号 rc 会把 0.2.0 当数字字面量解析，字段值静默变空）：
-//   rc.exe /nologo /fo test.res /dVV_FILEVERSION=0,2,0,0 "/dVV_VERSION=\"0.2.0\"" app.rc
+// 少了引号 rc 会把 0.3.0 当数字字面量解析，字段值静默变空）：
+//   rc.exe /nologo /fo test.res /dVV_FILEVERSION=0,3,0,0 "/dVV_VERSION=\"0.3.0\"" app.rc
 #ifndef VV_FILEVERSION
 #error VV_FILEVERSION is not defined; build.rs must pass it from CARGO_PKG_VERSION
 #endif

