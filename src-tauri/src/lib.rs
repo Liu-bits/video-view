@@ -4,6 +4,7 @@
 //!
 //! * [`mpv`] —— libmpv 的最小 FFI 封装（动态加载，无构建期 C 依赖）
 //! * [`diag`] —— 解码健康度：把 mpv 的观测项收成能下判断的数据
+//! * [`playlist`] —— 播放列表：拖一批文件进来、同名字幕自动挂载
 //! * [`surface`] —— mpv 画面子窗口（纯 Win32）
 //! * [`ui`] —— 控制栏的布局 / 绘制 / 命中测试
 //! * `app` —— 主窗口与消息循环
@@ -19,6 +20,7 @@ pub mod gpu;
 pub mod lang;
 pub mod menu;
 pub mod mpv;
+pub mod playlist;
 pub mod settings;
 mod surface;
 pub mod track;

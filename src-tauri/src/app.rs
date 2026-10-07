@@ -49,9 +49,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6,
-    VK_7, VK_8, VK_9, VK_A, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11, VK_HOME,
-    VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5, VK_OEM_COMMA,
-    VK_OEM_PERIOD, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_UP,
+    VK_7, VK_8, VK_9, VK_A, VK_B, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11,
+    VK_HOME, VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5,
+    VK_OEM_COMMA, VK_OEM_PERIOD, VK_P, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -71,6 +71,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::menu;
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
+use crate::playlist::{self, file_title, is_subtitle_path, Playlist, PlaylistRow};
 use crate::surface;
 use crate::ui::{self, Hit, Layout, PaintState, Panel};
 
@@ -166,6 +167,13 @@ struct UiState {
     sub_codepage: String,
     /// 当前字幕大小（mpv 的 `sub-scale`）。
     sub_scale: f64,
+    /// 高级模式开关。关着时 0.3.0 起的那些高级项在右键菜单里置灰，
+    /// 对应的快捷键（`I` / `T` / `P` / `Ctrl+C`）也不响应。
+    ///
+    /// 放在 `UiState` 而不是 `prefs` 里，因为 `UiState` 是「本窗口当前
+    /// 状态」，而这个开关要同时落盘 —— `prefs_touch` / `prefs_flush`
+    /// 机制读的就是它。
+    advanced: bool,
 }
 
 impl Default for UiState {
@@ -183,6 +191,8 @@ impl Default for UiState {
             speed: 1.0,
             sub_codepage: String::new(),
             sub_scale: 1.0,
+            // 默认由设置给出（`App::new` 里覆盖）
+            advanced: true,
         }
     }
 }
@@ -198,6 +208,8 @@ enum PanelMode {
     Help,
     /// 音轨 / 字幕轨菜单
     Tracks,
+    /// 播放列表
+    Playlist,
 }
 
 impl PanelMode {
@@ -214,6 +226,7 @@ impl PanelMode {
             PanelMode::Stats => lang::DIAG_ROWS,
             PanelMode::Help => lang::HELP_ROWS,
             PanelMode::Tracks => 0,
+            PanelMode::Playlist => 0,
         }
     }
 
@@ -421,6 +434,22 @@ struct App {
     /// 才能让 ↑↓ 与鼠标点击用同一套坐标（`Hit::TrackRow` 给的也是行下标）。
     /// `move_cursor` 负责跳过不可选的行。
     track_cursor: usize,
+    /// 播放列表。至少有一条（`Playlist` 的构造保证），单文件就是单条。
+    ///
+    /// 「有文件」这件事由 `state.has_file` 表达，列表恒非空 ——
+    /// 分成两处表达「没在播」会出现「`current` 指向一个不存在的文件」这种
+    /// 中间状态，而那种状态没法用断言钉住。
+    playlist: Playlist,
+    /// 播放列表面板的光标停在第几条。
+    playlist_cursor: usize,
+    /// 播放列表面板的行数据。由 `playlist` 编出来，只在这两者变化时重建。
+    playlist_rows: Vec<PlaylistRow>,
+    /// 刚拖进来、还没挂上的外挂字幕。
+    ///
+    /// 之所以要「暂存」而不是立刻挂：`open()` 里 mpv 还没有这个文件的轨道，
+    /// 这时 `sub-add` 加上去会失败。所以先存着，等 mpv 报 `FileLoaded`
+    /// 再挂 —— 见 `apply_pending_sidecars`。
+    pending_sidecars: Vec<PathBuf>,
     /// 鼠标在客户区里的位置（物理像素）。
     ///
     /// 单独存一份而不是每次现算：`WM_MOUSEMOVE` 给的是客户区坐标，
@@ -468,6 +497,10 @@ impl App {
             state: UiState {
                 volume: prefs.volume,
                 muted: prefs.muted,
+                // 高级模式从设置里取。默认 `true`，所以第一次启动（注册表里
+                // 没有这个键）的高级项全都是可用的 —— 装好之后按 `I`
+                // 没反应那不是简化，是功能坏了。
+                advanced: prefs.advanced,
                 ..UiState::default()
             },
             dragging: Dragging::None,
@@ -494,6 +527,10 @@ impl App {
             diag: Diagnostics::default(),
             panel,
             panel_rows: Vec::new(),
+            playlist: Playlist::single(PathBuf::new()),
+            playlist_cursor: 0,
+            playlist_rows: Vec::new(),
+            pending_sidecars: Vec::new(),
             help_rows,
             tracks: TrackSet::default(),
             track_rows: Vec::new(),
@@ -611,13 +648,16 @@ impl App {
     fn panel_row_count(&self) -> usize {
         match self.panel {
             PanelMode::Tracks => self.track_rows.len(),
+            PanelMode::Playlist => self.playlist_rows.len(),
             other => other.rows(),
         }
     }
 
     /// 鼠标当前悬停在菜单的第几行。只有菜单打开时才有值。
     fn hover_row_now(&self) -> Option<usize> {
-        if self.panel != PanelMode::Tracks {
+        // 只有「逐行可选」的两个面板才有悬停行。诊断面板与快捷键面板
+        // 是静态文本，不响应鼠标。
+        if !matches!(self.panel, PanelMode::Tracks | PanelMode::Playlist) {
             return None;
         }
         self.layout.panel_row_at(self.hover_x, self.hover_y)
@@ -669,12 +709,22 @@ impl App {
     ///
     /// 不循环：菜单两端有明确的「到这里为止」。循环会让用户想「往下看最后
     /// 一条」时突然回到第一条，得再按一次才知道自己在哪。
+    ///
+    /// 播放列表的每一行都可选，所以那里没有「跳过」这回事 ——
+    /// 但走的是同一个方法，因为「到两端停住」这个行为两边要一致。
     fn move_cursor(&mut self, delta: isize) {
-        let n = self.track_rows.len();
-        if n == 0 || !self.track_rows.iter().any(|r| r.selectable()) {
+        let (n, any_selectable) = match self.panel {
+            PanelMode::Tracks => (
+                self.track_rows.len(),
+                self.track_rows.iter().any(|r| r.selectable()),
+            ),
+            PanelMode::Playlist => (self.playlist_rows.len(), true),
+            _ => return,
+        };
+        if n == 0 || !any_selectable {
             return;
         }
-        let mut i = self.track_cursor as isize;
+        let mut i = self.cursor() as isize;
         let mut moved = 0;
         // 上限取 n：最多扫一圈，扫不到可选行就说明没有，停下来
         while moved < n {
@@ -684,21 +734,55 @@ impl App {
             }
             i = next;
             moved += 1;
-            if self.track_rows[i as usize].selectable() {
+            if self.row_selectable(i as usize) {
                 break;
             }
         }
         let i = i.clamp(0, n as isize - 1) as usize;
-        if i != self.track_cursor {
-            self.track_cursor = i;
-            self.invalidate_controls();
+        if i != self.cursor() {
+            self.set_cursor(i);
+        }
+    }
+
+    /// 当前面板的光标下标。
+    fn cursor(&self) -> usize {
+        match self.panel {
+            PanelMode::Tracks => self.track_cursor,
+            PanelMode::Playlist => self.playlist_cursor,
+            _ => 0,
+        }
+    }
+
+    /// 设置当前面板的光标下标。
+    fn set_cursor(&mut self, i: usize) {
+        match self.panel {
+            PanelMode::Tracks => self.track_cursor = i,
+            PanelMode::Playlist => self.playlist_cursor = i,
+            _ => {}
+        }
+        self.invalidate_controls();
+    }
+
+    /// 第 `i` 行可选吗。
+    fn row_selectable(&self, i: usize) -> bool {
+        match self.panel {
+            PanelMode::Tracks => self.track_rows.get(i).is_some_and(|r| r.selectable()),
+            // 播放列表每一行都是一首，都可选
+            PanelMode::Playlist => self.playlist_rows.get(i).is_some(),
+            _ => false,
         }
     }
 
     /// 激活光标那一行（回车）。
     fn activate_cursor(&mut self) {
-        if let Some(row) = self.track_rows.get(self.track_cursor).cloned() {
-            self.activate_row(self.track_cursor, &row);
+        match self.panel {
+            PanelMode::Tracks => {
+                if let Some(row) = self.track_rows.get(self.track_cursor).cloned() {
+                    self.activate_row(self.track_cursor, &row);
+                }
+            }
+            PanelMode::Playlist => self.play_index(self.playlist_cursor),
+            _ => {}
         }
     }
 
@@ -984,6 +1068,16 @@ impl App {
         }
         // 换文件时先把界面归位，否则会短暂显示上一段视频的时间与时长
         self.state.has_file = true;
+        // 从面板、快捷键、`Ctrl+O` 打开的文件**不一定**在列表里
+        // （比如在文件对话框里挑了一个别的目录的视频）。`ensure_contains`
+        // 负责：不在就变成一条的列表，并在就只同步下标。
+        //
+        // 这一句是**必须**的而不是锦上添花：列表初始是
+        // `Playlist::single(PathBuf::new())` —— 一个空路径的壳。
+        // 不在这里补上，`P` 面板就一行都不画（`rows()` 空 → 面板高度 0），
+        // 用户看到的是「按了 `P` 什么也没发生」。
+        self.playlist.ensure_contains(path);
+        self.playlist_rows = playlist::rows(&self.playlist);
         self.state.idle = false;
         self.state.position = 0.0;
         self.state.duration = 0.0;
@@ -1016,6 +1110,182 @@ impl App {
             self.relayout();
             self.invalidate_all();
         }
+    }
+
+    // ------------------------------------------------------------ 播放列表
+
+    /// 重建播放列表并开始放第 `index` 条。
+    ///
+    /// 拖一批文件进来时用。字幕先**存着**不立刻挂 —— `open()` 里 mpv 还没
+    /// 有这个文件的轨道，立刻 `sub-add` 会失败。等 `FileLoaded` 到了再挂，
+    /// 见 `apply_pending_sidecars`。
+    fn load_playlist(&mut self, mut pl: Playlist, index: usize, sidecars: Vec<PathBuf>) {
+        let _ = pl.select(index);
+        self.playlist = pl;
+        self.playlist_cursor = index;
+        self.playlist_rows = playlist::rows(&self.playlist);
+        self.pending_sidecars = sidecars;
+        let path = self.playlist.current_item().path.clone();
+        self.open(&path);
+    }
+
+    /// 拖放一批路径进来。
+    ///
+    /// 三种分派，与 `handle_drop` 的注释一起读：
+    ///
+    /// * **有视频**：整批视频进列表，第一个开始放；同名字幕跟着走。
+    /// * **只有字幕、当前有视频**：全部当作外挂字幕加到当前视频上。
+    /// * **只有字幕、当前没有视频**：报「先开个视频」，不给 mpv 去试。
+    fn drop_paths(&mut self, paths: Vec<PathBuf>) {
+        let (pl, loaded) = Playlist::from_paths(&paths);
+        if let (Some(pl), Some(l)) = (pl, loaded) {
+            self.load_playlist(pl, l.index, l.sidecars);
+            return;
+        }
+        // 一个视频都没有 —— 全是字幕。
+        let subs: Vec<PathBuf> = paths.into_iter().filter(|p| is_subtitle_path(p)).collect();
+        if subs.is_empty() {
+            self.report_error(self.strings.err_open, self.strings.err_not_a_file);
+            return;
+        }
+        if !self.state.has_file {
+            self.report_error(
+                self.strings.err_add_subtitle,
+                self.strings.err_no_media_for_sub,
+            );
+            return;
+        }
+        // 逐条加而不是只加第一条：拖进来三个字幕、用户想要三个都在
+        for s in subs {
+            self.add_subtitle(&s);
+        }
+    }
+
+    /// mpv 报 `FileLoaded` 时把暂存的外挂字幕挂上。
+    ///
+    /// 拖放一批文件进来时，字幕是在 `load_file` **之前**就知道的，
+    /// 但那时候 mpv 还没有这个文件的轨道 —— `sub-add` 会失败
+    /// （实测报 `track-list` 里还没有字幕轨）。所以先存着，
+    /// 等 mpv 自己说「文件加载完了」再挂。
+    fn apply_pending_sidecars(&mut self) {
+        if self.pending_sidecars.is_empty() {
+            return;
+        }
+        // 一次 `drain(..)` 拿走，避免重入（`add_subtitle` 不会重入这里，
+        // 但依赖这个不变式太脆弱了）
+        let subs: Vec<PathBuf> = std::mem::take(&mut self.pending_sidecars);
+        for s in subs {
+            self.add_subtitle(&s);
+        }
+    }
+
+    /// 切到列表里的第 `i` 条。
+    fn play_index(&mut self, i: usize) {
+        if !self.playlist.select(i) {
+            return;
+        }
+        self.open_current_item();
+    }
+
+    /// 打开列表当前指向的那一条，并把随它进来的外挂字幕暂存起来。
+    ///
+    /// 三处入口（面板点击、上一首/下一首、播完自动接下一个）都走这里，
+    /// 免得「暂存字幕 + 同步光标 + 重建行」这三步在三个地方各写一遍
+    /// —— 漏一处就会表现为「切到某个文件时它的字幕没挂上」。
+    fn open_current_item(&mut self) {
+        let path = self.playlist.current_item().path.clone();
+        let side = self
+            .playlist
+            .current_item()
+            .sidecar
+            .clone()
+            .into_iter()
+            .collect();
+        self.pending_sidecars = side;
+        self.playlist_cursor = self.playlist.current();
+        self.playlist_rows = playlist::rows(&self.playlist);
+        self.open(&path);
+        self.relayout();
+        self.invalidate_all();
+    }
+
+    /// 列表里的下一条 / 上一条。
+    fn step_playlist(&mut self, forward: bool) {
+        // 先问有没有，再动 `current`。到头 / 到尾就是「没有下一首」，
+        // 不是错误 —— 单文件列表上按「下一个」什么都不该发生，也不该报错。
+        let has = if forward {
+            self.playlist.current() + 1 < self.playlist.len()
+        } else {
+            self.playlist.current() > 0
+        };
+        if !has {
+            return;
+        }
+        if forward {
+            self.playlist.advance();
+        } else {
+            self.playlist.prev();
+        }
+        self.open_current_item();
+    }
+
+    /// 一个文件播完之后：接下一个。
+    ///
+    /// 返回 `false` 表示「没有下一个了」，调用方照常进入空闲态。
+    ///
+    /// ## 为什么不在 `next()` 里直接改 `current`
+    ///
+    /// 因为这里需要先知道「有没有下一个」再决定要不要清空界面。
+    /// `next()` 返回 `None` 时不动 `current`，播放器的进度条就还指着
+    /// 刚播完的那一条 —— 界面说的是「这一首听完了」而不是「列表空了」。
+    fn on_finished(&mut self) -> bool {
+        // 用户按了停止不算「播完了」，不该跳下一首
+        if !self.state.has_file {
+            return false;
+        }
+        if self.playlist.current() + 1 >= self.playlist.len() {
+            return false;
+        }
+        self.playlist.advance();
+        self.open_current_item();
+        true
+    }
+
+    // ------------------------------------------------------------ 高级模式
+
+    /// 切换高级模式。
+    ///
+    /// 关掉之后：右键菜单里解码诊断 / 快捷键总览 / 复制诊断报告 /
+    /// 字幕编码 / 字幕大小全部置灰，播放列表与轨道菜单不给开，
+    /// 对应的快捷键也不响应（见 `handle_key` 里各分支的 `advanced` 判断）。
+    ///
+    /// ## 默认是**开**，不是关
+    ///
+    /// 「高级模式关着」看起来像个开关的自然默认，但在这里它是错的：
+    /// 默认关掉等于「装好之后按 `I` / `T` 没反应」，而没有任何界面元素
+    /// 告诉用户「你得先去菜单里开一个开关」。第一次启动就把功能藏起来，
+    /// 收到的会是「功能坏了」的报告，而不是「有个开关要开」。
+    ///
+    /// 所以它的实际语义是「**简化模式**」：开着给全部，关掉给一个
+    /// 干净的基础界面。注册表里没有这个键时也按 `true` 处理 ——
+    /// 从旧版本升级上来的人不该因为多了个开关就发现功能不见了。
+    fn toggle_advanced(&mut self) {
+        let now = !self.state.advanced;
+        self.state.advanced = now;
+        // 关掉时把已经开着的面板收起来。否则会出现「菜单里的开关是灰的，
+        // 但屏幕上那个面板还开着、快捷键还在起作用」的不一致状态，
+        // 而用户没法解释它。
+        if !now && !matches!(self.panel, PanelMode::None) {
+            self.set_panel(PanelMode::None);
+        }
+        self.prefs.advanced = now;
+        self.prefs_touch();
+        self.invalidate_all();
+    }
+
+    /// 某个高级功能当前能不能用。
+    fn advanced_ok(&self) -> bool {
+        self.state.advanced
     }
 
     /// 诊断面板打开时重建行数据。
@@ -1352,11 +1622,26 @@ impl App {
                     _ => {}
                 },
                 MpvEventMessage::EndFile => {
-                    layout_dirty |= self.enter_idle();
+                    // 播完了：列表里还有下一个就接上去，没有就进空闲态。
+                    //
+                    // 顺序要紧：`on_finished` 里会调 `open()`，而 `open()` 会
+                    // 把 `state.has_file` 置回 `true`。所以**先**问
+                    // `has_file`（判断「这是播完了还是用户按了停止」），
+                    // 再决定要不要接下一个 —— 判断写在 `on_finished` 里面
+                    // 就是为了这个。
+                    if self.on_finished() {
+                        self.relayout();
+                    } else {
+                        layout_dirty |= self.enter_idle();
+                    }
                 }
                 MpvEventMessage::FileLoaded => {
                     self.state.has_file = true;
                     self.state.idle = false;
+                    // 拖放一批文件进来时，同名字幕是在 `load_file` **之前**
+                    // 就知道的，但那时 mpv 还没有这个文件的轨道，`sub-add`
+                    // 会失败。所以先暂存，等这里再挂。
+                    self.apply_pending_sidecars();
                     surface::set_video_visible(self.video, true);
                     // 轨道这时才存在。菜单如果正开着，行数会变，必须重排；
                     // 没开也要刷新，否则用户开菜单时读到的是上一个文件的轨
@@ -1473,6 +1758,10 @@ impl App {
             PanelMode::Tracks => Some(Panel::Tracks {
                 rows: &self.track_rows,
                 cursor: self.track_cursor,
+            }),
+            PanelMode::Playlist => Some(Panel::Playlist {
+                rows: &self.playlist_rows,
+                cursor: self.playlist_cursor,
             }),
             PanelMode::None => None,
         };
@@ -1959,22 +2248,28 @@ unsafe extern "system" fn app_wnd_proc(
                 // 「点快捷键面板的任意一行」变成暂停/继续 —— 一个没人
                 // 会预期、也没人报出来的行为变化。
                 Hit::TrackRow(i) => {
-                    if app.panel != PanelMode::Tracks {
-                        return LRESULT(0);
-                    }
-                    // `i` 的上界是**布局里**的 `panel_drawn_rows`，而下标要落到
-                    // `track_rows`（数据）。拖放字幕之后如果没重排（见
-                    // `add_subtitle`），前者可能大于后者 —— 所以这里必须查，
-                    // 不能拿 `i` 直接写进 `track_cursor`。
-                    let Some(row) = app.track_rows.get(i).cloned() else {
-                        return LRESULT(0);
-                    };
-                    // 不可选的行（分组标题 / 说明行）点了不移动光标：
-                    // 移过去的话高亮会消失（那两种行不画光标底色），
-                    // 用户看到的是「点了一下什么都没发生，还把选中态弄没了」
-                    if row.selectable() {
-                        app.track_cursor = i;
-                        app.activate_row(i, &row);
+                    // `i` 是左上角**行号**不是 `panel_drawn_rows`，下标要落到
+                    // 对应面板的数据上。越界的话说明用户点在了面板之外，
+                    // 而 `add_subtitle` 之前那条可能还存在（见注释），
+                    // 所以这里**不能**直接把 `i` 写进光标。
+                    match app.panel {
+                        PanelMode::Tracks => {
+                            let Some(row) = app.track_rows.get(i).cloned() else {
+                                return LRESULT(0);
+                            };
+                            // 分组标题、说明行不可选，点它们也不该动光标：
+                            // 点过去的话光标会消失（下一行没有选中色），
+                            // 用户会以为「菜单里什么都没选中」而状态其实没变
+                            if row.selectable() {
+                                app.track_cursor = i;
+                                app.activate_row(i, &row);
+                            }
+                        }
+                        PanelMode::Playlist => {
+                            // 每一行都可选，所以不用判 `selectable`
+                            app.play_index(i);
+                        }
+                        _ => return LRESULT(0),
                     }
                 }
                 Hit::Seek => {
@@ -2139,7 +2434,7 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
     //
     // 只吃这四个键。切轨（`J`/`L`/`A`）、截图（`S`）、诊断（`I`）这些
     // 仍然照常工作 —— 菜单是叠在播放器上的，不是另一个模态界面。
-    if (*app_ptr).panel == PanelMode::Tracks && !ctrl {
+    if matches!((*app_ptr).panel, PanelMode::Tracks | PanelMode::Playlist) && !ctrl {
         match vk {
             k if k == VK_UP.0 => {
                 (&mut *app_ptr).move_cursor(-1);
@@ -2236,7 +2531,7 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
         // 面板只能看当前这一秒，而用户报 bug 时能贴出来的只有一段文字，
         // 所以这份报告才是整个诊断功能里最实用的部分，给它一个顺手的位置。
         // 界面上没有输入框，Ctrl+C 不与「复制选中文本」冲突。
-        _ if key(VK_C.0) && ctrl => {
+        _ if key(VK_C.0) && ctrl && (*app_ptr).advanced_ok() => {
             (&mut *app_ptr).copy_report();
             true
         }
@@ -2249,9 +2544,31 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
             true
         }
         // `T` = 轨道菜单。再按一次收起
-        _ if key(VK_T.0) => {
+        _ if key(VK_T.0) && (*app_ptr).advanced_ok() => {
             let app = &mut *app_ptr;
             app.set_panel(app.panel.toggled_to(PanelMode::Tracks));
+            true
+        }
+        // `P` = 播放列表面板（再按一次收起）
+        _ if key(VK_P.0) && (*app_ptr).advanced_ok() => {
+            let app = &mut *app_ptr;
+            app.set_panel(app.panel.toggled_to(PanelMode::Playlist));
+            true
+        }
+        // `N` / `B` = 列表里的下一个 / 上一个。
+        //
+        // 用 `B`（back）而不是 `P`：`P` 已经被播放列表面板占了，
+        // 而 mpv 自己的 `P` 是「上一个」—— 这里把 `P` 让给面板，
+        // 用 `B` 补上「上一个」这个语义。两个键都不与现有快捷键冲突。
+        //
+        // 没有媒体、或者列表只有一条时按了什么都不发生（`step_playlist`
+        // 自己会判断），**不报错** —— 「按了没反应」比弹一个错误框好。
+        _ if key(VK_N.0) && (*app_ptr).advanced_ok() => {
+            (&mut *app_ptr).step_playlist(true);
+            true
+        }
+        _ if key(VK_B.0) && (*app_ptr).advanced_ok() => {
+            (&mut *app_ptr).step_playlist(false);
             true
         }
         // `J` / `L` = 上一条 / 下一条字幕轨。
@@ -2274,7 +2591,7 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
             true
         }
         // `I` = 解码诊断。再按一次收起
-        _ if key(VK_I.0) => {
+        _ if key(VK_I.0) && (*app_ptr).advanced_ok() => {
             let app = &mut *app_ptr;
             app.set_panel(app.panel.toggled_to(PanelMode::Stats));
             true
@@ -2354,60 +2671,68 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
 
 /// 处理拖放。只取第一个文件，忽略目录。
 unsafe fn handle_drop(app_ptr: *mut App, hdrop: HDROP) {
-    // 先把文案取出来（`Strings` 是 Copy）��下面要拿 `&mut App` 调
+    // 先把文案取出来（`Strings` 是 Copy）——下面要拿 `&mut App` 调
     // `report_error`，那时就不能再借 `app_ptr.strings` 了。
     let strings = (*app_ptr).strings;
-    let len = DragQueryFileW(hdrop, 0, None);
-    if len == 0 {
+    // `u32::MAX`（即 0xFFFF_FFFF）是 `DragQueryFileW` 的「返回个数而不是长度」
+    // 哨兵值。传 `0` 时它返回第 0 个文件的路径长度 —— 也就是**原来那行
+    // 只取第一个文件**的行为。取全部之前要先问一次个数。
+    let count = DragQueryFileW(hdrop, u32::MAX, None) as usize;
+    if count == 0 {
         DragFinish(hdrop);
         return;
     }
-    let mut buf = vec![0u16; len as usize + 1];
-    DragQueryFileW(hdrop, 0, Some(&mut buf));
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(count);
+    let mut bad_unicode = false;
+    for k in 0..count {
+        let len = DragQueryFileW(hdrop, k as u32, None);
+        if len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        DragQueryFileW(hdrop, k as u32, Some(&mut buf));
+        // 丢开 NUL 终止符再转：`DragQueryFileW` 返回的是长度，不含终止符。
+        // `String::from_utf16_lossy` 在遇到无法表示的字符（某些 emoji、
+        // 变体选择符）时会插 U+FFFD，拼出来的路径指向一个不存在的文件，
+        // 用户看到的却是「找不到文件」。所以这里用 `from_utf16` 严格解。
+        match String::from_utf16(&buf[..len as usize]) {
+            Ok(s) => paths.push(PathBuf::from(s)),
+            Err(_) => bad_unicode = true,
+        }
+    }
     // HDROP 是这次拖放唯一的句柄，处理完必须释放，否则会一直泄漏
     DragFinish(hdrop);
 
-    // 丢开 NUL 终止符再转：DragQueryFileW 返回的是长度，不含终止符。
-    // `String::from_utf16_lossy` 在遇到无法表示的字符（某些 emoji、变体
-    // 选择符）时会插 U+FFFD，拼出来的路径指向一个不存在的文件，用户看到的
-    // 却是「找不到文件」。
-    let units = match String::from_utf16(&buf[..len as usize]) {
-        Ok(s) => s,
-        Err(_) => {
-            (&mut *app_ptr).report_error(strings.err_open, strings.err_bad_unicode);
-            return;
-        }
-    };
-    let path = PathBuf::from(units);
-    if !path.is_file() {
-        (&mut *app_ptr).report_error(strings.err_open, strings.err_not_a_file);
+    if bad_unicode {
+        (&mut *app_ptr).report_error(strings.err_open, strings.err_bad_unicode);
         return;
     }
-    // 字幕文件拖进来 = 给当前视频加外挂字幕，不替换媒体。
-    //
-    // 判据是扩展名。字幕格式太多（`.srt`/`.ass`/`.ssa`/`.vtt`/`.sub`/`.idx`
-    // ……），这里只认最常见的四种，遇到别的（`.mks` 之类）当媒体处理 ——
-    // 判错的后果不对称：把字幕当视频打开会失败并报错，把视频当字幕加载
-    // 则是一条不存在的外挂轨。
-    if is_subtitle_path(&path) {
-        (&mut *app_ptr).add_subtitle(&path);
-    } else {
-        (&mut *app_ptr).open(&path);
+    // 目录不是文件。用户拖文件夹进来多半是想「打开这个目录下的视频」，
+    // 而我们不做目录枚举 —— 那要先决定「目录里的视频按什么顺序」，
+    // 按文件名还是按修改时间，两种做法都会有人不满意。给一句说人话的提示。
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(paths.len());
+    let mut had_dir = false;
+    for p in paths {
+        if p.is_file() {
+            kept.push(p);
+        } else {
+            had_dir = true;
+        }
     }
-}
-
-/// 这个扩展名是不是字幕文件。
-///
-/// 只认常见的四种，其余一律当媒体。理由见 `handle_drop` 里的注释。
-fn is_subtitle_path(p: &Path) -> bool {
-    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    // 扩展名大小写都算：`.SRT` 在 Windows 上很常见
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "srt" | "ass" | "ssa" | "vtt"
-    )
+    if kept.is_empty() {
+        (&mut *app_ptr).report_error(
+            strings.err_open,
+            if had_dir {
+                strings.err_not_a_file
+            } else {
+                strings.err_no_media_for_sub
+            },
+        );
+        return;
+    }
+    // 分派规则见 `App::drop_paths` 的注释：有视频就整批进列表并从第一个开始播，
+    // 只有字幕就当作给当前视频外挂（0.5.0 定的语义，不改）。
+    (&mut *app_ptr).drop_paths(kept);
 }
 
 /// 在鼠标位置弹出画面右键菜单，等用户选完再执行命令。
@@ -2452,6 +2777,7 @@ fn show_context_menu(app_ptr: *mut App) {
             theatre: app.theatre,
             fullscreen: app.fullscreen,
             diag_open: app.panel == PanelMode::Stats,
+            advanced: app.state.advanced,
             sub_codepage: &app.state.sub_codepage,
             sub_scale: app.state.sub_scale,
             tracks: &app.tracks,
@@ -2549,6 +2875,9 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
             app.set_panel(target);
         }
         id::COPY_REPORT => app.copy_report(),
+        id::NEXT => app.step_playlist(true),
+        id::PREV => app.step_playlist(false),
+        id::ADVANCED => app.toggle_advanced(),
         _ => {}
     }
 }
@@ -2681,22 +3010,30 @@ fn copy_to_clipboard(owner: HWND, text: &str) -> Result<(), String> {
     result
 }
 
-/// 文件名（不含目录与扩展名），显示在控制栏上。
-fn file_title(path: &Path) -> String {
-    path.file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// 命令行里要打开的文件。
 ///
 /// 只接受第一个存在的文件；不存在就忽略（不弹窗），因为资源管理器关联传进来
 /// 的路径可能已经失效。
-fn initial_file() -> Option<PathBuf> {
+/// 启动时要打开的文件。
+///
+/// **可以传多个**：`video-view.exe a.mp4 b.mp4 c.mp4` 会建一个三条的播放列表
+/// 并从第一个开始播。这是 Windows「打开方式」的常规用法（资源管理器里
+/// 多选几个文件、右键「打开」就会把路径全传进来），也是**唯一**能让
+/// 播放列表被自动化验证的入口 —— 拖放走的是 OLE，脚本模拟不了。
+///
+/// 只认**存在的**文件：路径不存在就跳过。理由与 `handle_drop` 里
+/// 「目录不是文件」那段一致 —— 用户给了一个不存在的路径时，
+/// 我们给的是「这不是一个文件」的提示，而不是让 mpv 去报错。
+///
+/// 字幕文件**不进列表**，与拖放的分派规则一致（`App::drop_paths`）：
+/// 命令行里给一个 `.srt` 时它会被当成「给当前视频外挂」，而启动时还没有
+/// 当前视频，所以报「先开个视频」。
+fn initial_files() -> Vec<PathBuf> {
     std::env::args_os()
         .skip(1)
         .map(PathBuf::from)
-        .find(|p| p.is_file())
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 // ---------------------------------------------------------------- 启动
@@ -2906,8 +3243,21 @@ fn create_and_loop() -> Result<(), String> {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
 
-        if let Some(path) = initial_file() {
-            app.open(&path);
+        // 启动时给的文件。**可以多个** —— 见 `initial_files` 的说明。
+        //
+        // 多个文件时走播放列表：第一个开始播，其余的留在列表里等
+        // 「下一个」或者播完自动接。单个文件时行为与以前完全一致
+        // （列表里只有一条，按「下一个」没反应）。
+        let files = initial_files();
+        match files.len() {
+            0 => {}
+            1 => app.open(&files[0]),
+            _ => {
+                let (pl, loaded) = Playlist::from_paths(&files);
+                if let (Some(pl), Some(l)) = (pl, loaded) {
+                    app.load_playlist(pl, l.index, l.sidecars);
+                }
+            }
         }
 
         let mut msg = MSG::default();

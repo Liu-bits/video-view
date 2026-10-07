@@ -57,6 +57,13 @@ pub struct Settings {
     /// 上次关闭时的客户区尺寸（DIP）
     pub client_w: i32,
     pub client_h: i32,
+    /// **高级模式**：开着才给 0.3.0 起的那些高级项（解码诊断、轨道菜单、
+    /// 播放列表、字幕编码/大小、复制诊断报告），关着它们在右键菜单里
+    /// **置灰**。
+    ///
+    /// 默认 `true`。理由见 `App::toggle_advanced` 的注释 ——
+    /// 默认关掉等于「装好之后按 `I` 没反应」，那不是简化，是功能坏了。
+    pub advanced: bool,
 }
 
 impl Default for Settings {
@@ -69,6 +76,7 @@ impl Default for Settings {
             // 与 app.rs 里的 DEFAULT_CLIENT_W/H_DIP 对齐
             client_w: 1100,
             client_h: 720,
+            advanced: true,
         }
     }
 }
@@ -105,6 +113,12 @@ impl Settings {
             if let Some(v) = read_dword(HKEY_CURRENT_USER, subkey, "ClientH") {
                 s.client_h = v as i32;
             }
+            // 注册表里没有这一项时**默认开着**。老版本升级上来的人
+            // 不该因为多了个开关就发现 `I` 没反应了 —— 那个键是这一版
+            // 才写的，读不到就等于「没关过」。
+            if let Some(v) = read_dword(HKEY_CURRENT_USER, subkey, "Advanced") {
+                s.advanced = v != 0;
+            }
         }
 
         s.sanitized()
@@ -132,6 +146,7 @@ impl Settings {
                 write_dword(hkey, "Muted", u32::from(s.muted))?;
                 write_dword(hkey, "ClientW", s.client_w as u32)?;
                 write_dword(hkey, "ClientH", s.client_h as u32)?;
+                write_dword(hkey, "Advanced", u32::from(s.advanced))?;
                 write_sz(hkey, "Volume", &format!("{:.2}", s.volume))
             })();
             let _ = RegCloseKey(hkey);
@@ -156,6 +171,8 @@ impl Settings {
             // 再大只可能是脏数据
             client_w: self.client_w.clamp(320, 16384),
             client_h: self.client_h.clamp(240, 16384),
+            // bool 没有越界可言，过来就行
+            advanced: self.advanced,
         }
     }
 }
@@ -365,6 +382,7 @@ mod tests {
             muted: false,
             client_w: -5,
             client_h: 0,
+            advanced: true,
         };
         let s = s.sanitized();
         assert_eq!(s.volume, 100.0);
@@ -381,6 +399,22 @@ mod tests {
         assert_eq!(s.sanitized().volume, 100.0);
     }
 
+    /// 高级模式**默认开**。
+    ///
+    /// 这一条是产品决定，不是实现细节：默认关掉等于「装好之后按 `I` /
+    /// `T` 没反应」，而没有任何界面元素告诉用户「你得先去菜单里开一个开关」。
+    /// 第一次启动就把功能藏起来，收到的是「功能坏了」的报告。
+    #[test]
+    fn 高级模式默认是开的() {
+        assert!(Settings::default().advanced);
+        // 注册表里没有这个键时也按开着处理 —— 从旧版本升级上来的人
+        // 不该因为多了个开关就发现功能不见了
+        let key = test_subkey("advanced-default");
+        delete_test_key(&key);
+        assert!(Settings::load_from(&key).advanced);
+        delete_test_key(&key);
+    }
+
     #[test]
     fn 注册表往返能拿回原值() {
         let key = test_subkey("roundtrip");
@@ -390,6 +424,7 @@ mod tests {
             muted: true,
             client_w: 1440,
             client_h: 900,
+            advanced: false,
         };
         want.save_to(&key).expect("应当能写进 HKCU 的测试子键");
 
@@ -398,6 +433,9 @@ mod tests {
         assert_eq!(got.muted, want.muted);
         assert_eq!(got.client_w, want.client_w);
         assert_eq!(got.client_h, want.client_h);
+        // 高级模式也要往返。这一项**默认开**，所以测试里特意存 `false`：
+        // 存 `true` 的话，读不到时的默认值也是 `true`，测不出「真的存进去了」
+        assert_eq!(got.advanced, want.advanced, "高级模式没存住");
 
         delete_test_key(&key);
     }

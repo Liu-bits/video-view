@@ -410,7 +410,7 @@ checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "video-view"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "embed-resource",
  "libloading",

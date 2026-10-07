@@ -290,6 +290,20 @@ pub struct Strings {
     pub menu_sub_scale: &'static str,
     /// 编码列表里 `auto` 那项的标签。其余编码名（GBK / Big5 / …）是专有名词，不译。
     pub sub_encoding_auto: &'static str,
+    /// 右键菜单里的「下一个」
+    pub menu_next: &'static str,
+    /// 右键菜单里的「上一个」
+    pub menu_prev: &'static str,
+    /// 播放列表面板的标题
+    pub panel_playlist: &'static str,
+    /// 播放列表里「没有随这条视频一起拖进来的外挂字幕」
+    pub playlist_no_sidecar: &'static str,
+    /// 快捷键总览里播放列表那几行
+    pub help_playlist: &'static str,
+    pub help_next: &'static str,
+    pub help_prev: &'static str,
+    /// 右键菜单最上面那个「高级模式」开关
+    pub menu_advanced: &'static str,
     // ---- 快捷键总览 ----
     pub help_play_pause: &'static str,
     pub help_seek: &'static str,
@@ -452,6 +466,14 @@ impl Strings {
             menu_sub_coding: "Text encoding (external subtitles)",
             menu_sub_scale: "Subtitle size",
             sub_encoding_auto: "Auto",
+            menu_next: "Next file",
+            menu_prev: "Previous file",
+            menu_advanced: "Advanced mode",
+            panel_playlist: "Playlist",
+            playlist_no_sidecar: "(no external subtitle)",
+            help_playlist: "Playlist panel",
+            help_next: "Next file",
+            help_prev: "Previous file",
             info_subtitle_added: "Subtitle loaded.",
         }
     }
@@ -559,6 +581,14 @@ impl Strings {
             menu_sub_coding: "字幕编码（外挂字幕）",
             menu_sub_scale: "字幕大小",
             sub_encoding_auto: "自动",
+            menu_next: "下一个文件",
+            menu_prev: "上一个文件",
+            menu_advanced: "高级模式",
+            panel_playlist: "播放列表",
+            playlist_no_sidecar: "（没有随这条视频一起拖进来的外挂字幕）",
+            help_playlist: "播放列表面板",
+            help_next: "下一个文件",
+            help_prev: "上一个文件",
             info_subtitle_added: "字幕已加载。",
         }
     }
@@ -598,6 +628,8 @@ impl Strings {
             ("T", self.help_tracks),
             ("J / L", self.help_next_sub),
             ("A", self.help_next_audio),
+            ("P", self.help_playlist),
+            ("N / B", self.help_next),
             ("F", self.help_theatre),
             ("F11", self.help_fullscreen),
             ("S", self.help_screenshot),
@@ -611,7 +643,7 @@ impl Strings {
 
 /// 快捷键总览的行数。面板高度按它算，所以两种语言必须一致
 /// （`快捷键总览两种语言行数一致` 那条测试盯着）。
-pub const HELP_ROWS: usize = 18;
+pub const HELP_ROWS: usize = 20;
 
 /// 解码诊断面板的行数。标签来自 `Strings::diag_labels()`，长度固定。
 pub const DIAG_ROWS: usize = 7;

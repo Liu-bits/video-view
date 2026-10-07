@@ -20,6 +20,7 @@
 //! 英文单词长度差很多，写死必然有一边被截断或另一边空一大块。
 
 use crate::lang;
+use crate::playlist::PlaylistRow;
 use crate::track::TrackRow;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
@@ -479,6 +480,11 @@ pub enum Panel<'a> {
         rows: &'a [TrackRow],
         /// 光标停在第几行（含不可选的分组标题行，所以是**行**下标不是
         /// 「可选行」下标 —— 这样 ↑↓ 与鼠标点击用的是同一套坐标）
+        cursor: usize,
+    },
+    /// 播放列表
+    Playlist {
+        rows: &'a [PlaylistRow],
         cursor: usize,
     },
 }
@@ -1241,6 +1247,48 @@ unsafe fn draw_panel(
     let top = layout.panel.top + px(PANEL_PAD_Y_DIP, dpi);
     let full_width = (layout.panel.right - pad_x).max(pad_x);
 
+    // 播放列表与轨道菜单一样是**整行**形态，理由也一样：文件名长度差别很大，
+    // 按两列对齐会在标记列上留一大片空白。
+    //
+    // 两处共用一套绘制（`draw_track_row` 的签名正好是「标签 + 是否选中 +
+    // 标记」），所以这里只是把 `PlaylistRow` 摊平成那三个参数。
+    if let Panel::Playlist { rows, cursor } = panel {
+        let mut y = top;
+        for (i, row) in rows.iter().enumerate() {
+            if y >= layout.controls.top {
+                break;
+            }
+            let line = RECT {
+                left: pad_x,
+                top: y,
+                right: full_width,
+                bottom: y + row_h,
+            };
+            // 标记：● = 正在放，▸ = 有随它一起拖进来的外挂字幕。
+            // 两个可以同时成立（正在放的那一条带着字幕），所以都画。
+            let mark = match (row.current, row.has_sidecar) {
+                (true, true) => "●▸",
+                (true, false) => "●",
+                (false, true) => "▸",
+                (false, false) => "",
+            };
+            draw_track_row(
+                hdc,
+                theme,
+                &line,
+                i,
+                &row.title,
+                row.current,
+                mark,
+                dpi,
+                hover_row,
+                cursor,
+            );
+            y += row_h;
+        }
+        return;
+    }
+
     // 轨道菜单是**整行**形态：左边是标记（当前在用的 / 默认的），
     // 右边铺满。不走两列 —— 菜单项的文字长度差别很大（「中文 · 2 声道 aac」
     // 与「关闭」），按两列对齐反而会在标记列上留一大片空白。
@@ -1343,6 +1391,10 @@ unsafe fn draw_panel(
         // MessageBox（`clamp_to_client` 的注释专门论证过这一点）。为一个
         // 逻辑上不可达的分支承担「用户在界面上什么都看不到」的风险不划算。
         Panel::Tracks { .. } => (px(48, dpi), Vec::new()),
+        // 播放列表是**整行**形态，理由同轨道菜单：文件名长度差别很大
+        // （`movie.mp4` 与 `a-very-long-name-for-a-movie.mkv`），
+        // 按两列对齐会在标记列上留一大片空白。
+        Panel::Playlist { .. } => (px(48, dpi), Vec::new()),
     };
 
     let mut y = top;

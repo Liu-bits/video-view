@@ -52,10 +52,22 @@ if (-not $Media) {
     #   * **有字幕轨**：右键菜单里「字幕轨」那一项要是不置灰才能用方向键
     #     选中（Win32 的 `MF_GRAYED` 项被方向键跳过）。`loop60s.mp4`
     #     没有字幕轨，那一项是置灰的，右方向键什么都不会发生。
-    $Media = Join-Path $Root "src-tauri\tests\media\loop60s-subs.mp4"
+    $Media = @(
+        (Join-Path $Root "src-tauri\tests\media\loop60s-subs.mp4")
+        (Join-Path $Root "src-tauri\tests\media\h264.mp4")
+        (Join-Path $Root "src-tauri\tests\media\h264.mkv")
+    ) -join " "
 }
-if (-not (Test-Path -LiteralPath $Media)) {
-    throw "找不到测试素材 $Media，跑 scripts/make-test-media.ps1 生成"
+# `-Media` 可以是**空格分隔的多个路径** —— 那会让播放器建一个播放列表，
+# 用来测播放列表面板与「下一个」。默认就是三个文件：一个只有一个文件时
+# 列表只有一行，按 `N` 不动，那条检查就白测了。
+#
+# 逐个验存在，而不是把整串拿去 `Test-Path`：路径写错时要说清是哪一个。
+$MediaList = @($Media -split "\s+" | Where-Object { $_ })
+foreach ($m in $MediaList) {
+    if (-not (Test-Path -LiteralPath $m)) {
+        throw "找不到测试素材 $m（`-Media` 里用空格分隔多个路径，跑 scripts/make-test-media.ps1 生成）"
+    }
 }
 
 Add-Type -AssemblyName System.Drawing
@@ -315,7 +327,7 @@ function Test-Transport([string]$name, [string]$note, [scriptblock]$act, [script
 Get-Process video-view -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
 
-$proc = Start-Process -FilePath $Exe -ArgumentList "`"$Media`"" -PassThru
+$proc = Start-Process -FilePath $Exe -ArgumentList $MediaList -PassThru
 
 # 进程一定要被收掉。
 #
@@ -704,6 +716,48 @@ try {
     Add-Result "escClosesTrackMenu" ($vrT3.vh -eq $vr4.vh) `
         ("Esc 之后画面高 {0} -> {1}（回到无面板基准 {2}）" -f $vrT1.vh, $vrT3.vh, $vr4.vh)
 
+# ---- 播放列表面板 ----------------------------------------------------
+    #
+    # `P` 开关。三个判据：
+    #   1. 面板**吃掉**画面高度（与轨道面板同一个机制）
+    #   2. 面板里有**内容**（像素比对）
+    #   3. `N` 切到下一个之后面板**变了**（● 挪到了另一行）
+    #
+    # 第 3 条是「播放列表真的有内容并且能切」的证据。只有第 1 条的话，
+    # 一个空面板也会通过 —— 而空面板正是这一版之前的状态
+    # （`Playlist::single(PathBuf::new())`，`rows()` 是空的，面板高度 0，
+    # 用户看到的是「按了 `P` 什么也没发生」）。
+    Send-KeyMsg $main 0x50   # P
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpPl = Grab $main
+    $vrP1 = VideoRect
+    Add-Result "playlistPanelShifts" ($vrP1.vh -lt $vrT3.vh) `
+        ("画面 {0} -> {1}（播放列表面板应当吃掉一块）" -f $vrT3.vh, $vrP1.vh)
+
+    # 只比「客户区顶部到画面区顶部」这一条带 —— 那里才是行被画出来的地方。
+    # 把整块画面区一起比是看不出变化的：视频本来就在每帧变。
+    $ph = [math]::Max(0, $vrT3.vh - $vrP1.vh)
+    $pw = $cw
+    $diffPl = PixDiff $bmpHelp $bmpPl $ox 0 $pw $ph 2
+    Add-Result "playlistPanelHasContent" ($diffPl -gt 1.0) `
+        ("面板条带差异率 {0}%（0 意味着面板是空的）" -f $diffPl)
+
+    # N = 下一个。● 挪了行，那条带就该变
+    Send-KeyMsg $main 0x4E   # N
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpPl2 = Grab $main
+    $diffPl2 = PixDiff $bmpPl $bmpPl2 $ox 0 $pw $ph 2
+    Add-Result "playlistNextMovesCursor" ($diffPl2 -gt 0.3) `
+        ("按 N 前后差异率 {0}%（● 应当挪到下一行）" -f $diffPl2)
+
+    Send-KeyMsg $main 0x1B   # Esc 收起面板
+    Start-Sleep -Seconds 2
+    $vrP2 = VideoRect
+    Add-Result "escClosesPlaylistPanel" ($vrP2.vh -eq $vrT3.vh) `
+        ("Esc 之后 {0} -> {1}（应当回到无面板基准 {2}）" -f $vrP1.vh, $vrP2.vh, $vrT3.vh)
+
     # ---- 画面右键菜单 ----------------------------------------------------
     #
     # 判据是「系统真的弹出了一个菜单窗口」（类名 #32768），不是截图比对。
@@ -718,7 +772,10 @@ try {
     # 截图看不到第一行）。
     Force-Foreground $main
     $vrR0 = VideoRect
-    $rx = [int]($vw / 2)
+    # 注意：**这里原本写的是 `$vw`，而 `$vw` 在整个脚本里从未定义过** ——
+    # `[int]($vw / 2)` 求值成 0，于是右键一直点在客户区最左边，与上面
+    # 「画面正中偏上」的意图不符。真正的客户区宽度是上面算出来的 `$cw`。
+    $rx = [int]($cw / 2)
     $ry = [int]($vrR0.vy + $vrR0.vh * 0.25)
     $ptScreen = New-Object VV+POINT
     $ptScreen.X = $rx; $ptScreen.Y = $ry
@@ -737,9 +794,16 @@ try {
     Start-Sleep -Milliseconds 1200
     $menuHwnd = Find-PopupMenu
     if ($menuHwnd -eq [IntPtr]::Zero) {
-        # 再试一次：先点一下画面把焦点落实，再右键
-        Click $ptScreen.X $ptScreen.Y
-        Start-Sleep -Milliseconds 500
+        # 再试一次。右键是**鼠标消息**，投递给哪个窗口取决于那一刻谁在前台，
+        # 而切换前台是异步的 —— 实测偶发，表现为 `rightMenuOpens` 单独
+        # FAIL 一次。
+        #
+        # 重试时**不要**用左键点画面来落实焦点：那会顺带切一次播放/暂停，
+        # 让后面所有与「正在播放」有关的检查都建立在被自己改过的状态上
+        # （第一版就是这么写的，`seekFwd` 因此偶发 FAIL）。
+        # `Force-Foreground` 不碰任何应用状态。
+        Force-Foreground $main
+        Start-Sleep -Milliseconds 700
         RightClick $ptScreen.X $ptScreen.Y
         Start-Sleep -Milliseconds 1200
         $menuHwnd = Find-PopupMenu
@@ -825,12 +889,36 @@ try {
     if ($menuHwnd -ne [IntPtr]::Zero) {
         # 5 次方向键下到「字幕轨」：1=打开文件 2=播放/暂停 3=停止 4=音轨 5=字幕轨
         # （分隔线不算可选项）
-        for ($i = 0; $i -lt 5; $i++) { Send-Key 0x28; Start-Sleep -Milliseconds 150 }
-        Send-Key 0x27
-        Start-Sleep -Milliseconds 900
-        $subHwnd = Find-PopupMenu
+# 一个一个往下走，每走一格按一次右方向键，看有没有弹出新的一层。
+    #
+    # **不要写成「按 N 次 ↓ 到某一项」** —— 之前就是这么写的
+    # （`5 次 ↓ 到「字幕轨」`），而这一版在菜单最上面加了「高级模式」之后，
+    # 字幕轨从第 5 个变成了第 6 个，那条检查立刻挂了。
+    # 菜单项的顺序是会被产品需求改的（加一项、改顺序都很正常），
+    # 而测试跟着顺序走就等于每次都要有人记得回来改。
+    # 「逐个试，找到那个有子菜单的」对顺序免疫。
+    #
+    # 上限 12：菜单最长 31 项，其中带子菜单的只有音轨与字幕轨两个。
+    #
+    # 另：**不要**对菜单窗口调 `SetForegroundWindow`（理由见上面那段）——
+    # 菜单本来就处于模态循环里，键盘直接送 `keybd_event` 就会到达。
+    $subHwnd = [IntPtr]::Zero
+    $subStep = 0
+    for ($i = 1; $i -le 12; $i++) {
+        Send-Key 0x28   # 下
+        Start-Sleep -Milliseconds 120
+        Send-Key 0x27   # 右：展开当前高亮的子菜单（没有就什么也不做）
+        Start-Sleep -Milliseconds 500
+        $now = Find-PopupMenu
+        if ($now -ne [IntPtr]::Zero -and $now -ne $menuHwnd) {
+            $subHwnd = $now
+            $subStep = $i
+            break
+        }
+    }
         $subOk = ($subHwnd -ne [IntPtr]::Zero) -and ($subHwnd -ne $menuHwnd)
-        $subNote = ("#32768 HWND {0} -> {1}（变了说明多弹出一层）" -f $menuHwnd, $subHwnd)
+        $subNote = ("走了 {0} 次 ↓ 之后 #32768 HWND {1} -> {2}（变了说明多弹出一层）" -f `
+                $subStep, $menuHwnd, $subHwnd)
 
         # 把展开后的两块菜单截下来存成产物。
         #

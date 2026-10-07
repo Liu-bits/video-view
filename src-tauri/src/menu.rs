@@ -135,6 +135,19 @@ pub mod id {
     pub const DIAG: u16 = 52;
     pub const HELP: u16 = 53;
     pub const COPY_REPORT: u16 = 54;
+
+    // 播放列表的「下一个 / 上一个」。
+    //
+    // 放在 `COPY_REPORT` 之后而不是插在中间：菜单项的**位置**是用户肌肉
+    // 记忆的一部分，插在中间会让后面每一项都往上挪一行。
+    pub const NEXT: u16 = 55;
+    pub const PREV: u16 = 56;
+
+    /// 高级模式开关。
+    ///
+    /// 放在菜单**最上面**而不是底部：它管的是下面所有项的可用性，
+    /// 放底部意味着用户要滚到最后才知道为什么一堆东西是灰的。
+    pub const ADVANCED: u16 = 60;
 }
 
 /// 菜单里可选的字幕编码，映射到 mpv 的 `sub-codepage`。
@@ -275,6 +288,8 @@ pub struct Snapshot<'a> {
     pub fullscreen: bool,
     /// 诊断面板开着吗 —— 用它给菜单项打勾
     pub diag_open: bool,
+    /// 高级模式开着吗。关着时 0.3.0 起的那些高级项全部置灰。
+    pub advanced: bool,
     /// 当前的 `sub-codepage`。用来给编码子菜单打勾。
     ///
     /// 空串（mpv 那边读不到）会让**没有任何一项被打勾** —— 与其猜一个
@@ -339,6 +354,18 @@ fn build(s: &lang::Strings, snap: Snapshot<'_>) -> Option<HMENU> {
     unsafe {
         let menu = CreatePopupMenu().ok()?;
 
+        // ---- 高级模式 ----
+        //
+        // 放在**最上面**，而且单独一组。理由：它决定下面一堆项能不能用，
+        // 放底部的话用户要滚到最后才知道为什么它们是灰的。
+        //
+        // 打勾表示「开着」。关掉之后 0.3.0 起的那些高级项（解码诊断 /
+        // 轨道菜单 / 播放列表 / 字幕编码与大小 / 复制诊断报告）全部**置灰**
+        // —— 置灰而不是不画，理由和音轨子菜单一样：位置不变，用户学得到
+        // 布局，灰着也比「凭空少了几项」清楚为什么点不动。
+        append(menu, id::ADVANCED, s.menu_advanced, snap.advanced);
+        separator(menu);
+
         append(menu, id::OPEN, s.menu_open, false);
         // 没有媒体时这几项**置灰**而不是不画：位置不变，用户学得到布局，
         // 灰着也比「凭空少了两项」清楚为什么点不动。
@@ -386,11 +413,26 @@ fn build(s: &lang::Strings, snap: Snapshot<'_>) -> Option<HMENU> {
 
         append(menu, id::THEATRE, s.menu_theatre, snap.theatre);
         append(menu, id::FULLSCREEN, s.menu_fullscreen, snap.fullscreen);
+        // 解码诊断与快捷键总览属于「高级」：它们是给想弄明白播放器在干什么
+        // 的人看的，普通用户看到一屏属性只会困惑。
         append(menu, id::DIAG, s.menu_diag, snap.diag_open);
+        enable(menu, id::DIAG, snap.advanced);
         append(menu, id::HELP, s.menu_help, false);
+        enable(menu, id::HELP, snap.advanced);
         separator(menu);
 
         append(menu, id::COPY_REPORT, s.menu_copy_report, false);
+        enable(menu, id::COPY_REPORT, snap.advanced);
+        separator(menu);
+
+        // 播放列表的「下一个 / 上一个」。
+        //
+        // 没有媒体时置灰（`enable`），理由同上面那些项：位置不变，
+        // 用户学得到布局，灰着也比「凭空少了两项」清楚为什么点不动。
+        append(menu, id::NEXT, s.menu_next, false);
+        enable(menu, id::NEXT, snap.loaded);
+        append(menu, id::PREV, s.menu_prev, false);
+        enable(menu, id::PREV, snap.loaded);
 
         Some(menu)
     }
@@ -457,8 +499,10 @@ fn build_sub(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
                 append(sub, base::SUB + n as u16, &describe(t, s), t.selected);
             }
             separator(sub);
-            append_coding_sub(sub, s, snap);
-            append_scale_sub(sub, s, snap);
+            // 高级模式关着时，编码/大小两个子菜单也置灰 —— 它们是 0.6.1
+            // 补上的高级项，与诊断面板同一批
+            append_coding_sub(sub, s, snap, snap.advanced);
+            append_scale_sub(sub, s, snap, snap.advanced);
         }
         // 字幕那个多一个条件：**关字幕**在没有字幕轨时也没意义
         // （本来就没字幕在放，关不掉什么）。
@@ -467,7 +511,7 @@ fn build_sub(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
 }
 
 /// 「编码」子菜单，挂在字幕子菜单末尾。
-fn append_coding_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
+fn append_coding_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>, enabled: bool) {
     // SAFETY: 只调 Win32 菜单 API。
     unsafe {
         let Ok(sub) = CreatePopupMenu() else { return };
@@ -479,12 +523,12 @@ fn append_coding_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
                 code == snap.sub_codepage,
             );
         }
-        append_sub(parent, s.menu_sub_coding, sub, true);
+        append_sub(parent, s.menu_sub_coding, sub, enabled);
     }
 }
 
 /// 「大小」子菜单，挂在字幕子菜单末尾。
-fn append_scale_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
+fn append_scale_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>, enabled: bool) {
     // SAFETY: 同 `append_coding_sub`。
     unsafe {
         let Ok(sub) = CreatePopupMenu() else { return };
@@ -499,7 +543,7 @@ fn append_scale_sub(parent: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
                 (v - snap.sub_scale).abs() < 1e-6,
             );
         }
-        append_sub(parent, s.menu_sub_scale, sub, true);
+        append_sub(parent, s.menu_sub_scale, sub, enabled);
     }
 }
 
@@ -677,6 +721,14 @@ mod tests {
         (0..count(m) as u32).find(|i| label(m, *i).as_deref() == Some(want))
     }
 
+    /// 按**命令 ID** 找位置。给「某个命令在开着/关着两种状态下都要查一遍」
+    /// 的测试用 —— 那样才能保证两次查的是同一行，而不是各自碰巧找到同名字的项。
+    fn find_cmd(m: HMENU, want: u16) -> u32 {
+        (0..count(m) as u32)
+            .find(|i| cmd(m, *i) == u32::from(want))
+            .unwrap_or_else(|| panic!("菜单里找不到命令 ID {want}"))
+    }
+
     fn audio(id: i64, selected: bool) -> Track {
         Track {
             id,
@@ -733,6 +785,7 @@ mod tests {
             theatre: false,
             fullscreen: false,
             diag_open: false,
+            advanced: true,
             sub_codepage: codepage,
             sub_scale: scale,
             tracks,
@@ -831,6 +884,84 @@ mod tests {
         );
         // 顺带确认 `SEGMENT_CEILING` 这个数字本身还站得住
         assert_eq!(decode(NO_TRACK_ID), Decoded::Unknown);
+    }
+
+    #[test]
+    fn 高级模式开关在最上面且按当前状态打勾() {
+        let s = st();
+        let m = owned(&s, snap(&EMPTY));
+        // 位置 0：它管着下面一堆项的可用性，放底部的话用户要滚到最后
+        // 才知道为什么它们是灰的
+        assert_eq!(cmd(m.0, 0), u32::from(id::ADVANCED));
+        assert!(is_checked(m.0, 0), "默认开着就该打勾");
+        // 第 1 项必须是分隔线：开关要独占一组，不能和「打开文件」贴在一起
+        assert_eq!(cmd(m.0, 1), 0, "开关后面应当跟一条分隔线");
+
+        let off = owned(
+            &s,
+            Snapshot {
+                advanced: false,
+                ..snap(&EMPTY)
+            },
+        );
+        assert!(!is_checked(off.0, 0), "关着就不该打勾");
+    }
+
+    #[test]
+    fn 高级模式关着时高级项全部置灰() {
+        let s = st();
+        let mut set = TrackSet::default();
+        set.sub.push(sub(1, true));
+        let on = owned(&s, snap(&set));
+        let off = owned(
+            &s,
+            Snapshot {
+                advanced: false,
+                ..snap(&set)
+            },
+        );
+
+        // 这几项是 0.3.0 起的「高级」功能
+        for cid in [id::DIAG, id::HELP, id::COPY_REPORT] {
+            let pos = find_cmd(on.0, cid);
+            assert!(!is_grayed(on.0, pos), "开着时 {cid} 不该置灰");
+            assert!(is_grayed(off.0, pos), "关着时 {cid} 该置灰");
+        }
+
+        // 字幕菜单里的两个子菜单
+        let sub_on = Owned(sub_handle(on.0, find(on.0, s.menu_sub)));
+        let sub_off = Owned(sub_handle(off.0, find(off.0, s.menu_sub)));
+        for label in [s.menu_sub_coding, s.menu_sub_scale] {
+            assert!(!is_grayed(sub_on.0, find(sub_on.0, label)), "{label}");
+            assert!(is_grayed(sub_off.0, find(sub_off.0, label)), "{label}");
+        }
+
+        // 而**基础**功能不该受影响
+        for cid in [
+            id::OPEN,
+            id::PLAY_PAUSE,
+            id::STOP,
+            id::SCREENSHOT,
+            id::THEATRE,
+            id::FULLSCREEN,
+            id::NEXT,
+            id::PREV,
+        ] {
+            let pos = find_cmd(off.0, cid);
+            assert!(!is_grayed(off.0, pos), "关掉高级模式不该影响 {cid}");
+        }
+    }
+
+    #[test]
+    fn 两种语言下高级模式的项数一致() {
+        // 与 `两种语言都能建出菜单且项数一致` 同一个道理：少一条就意味着
+        // 那种语言下漏了命令，而用户在另一种语言下看到的是缺项的菜单
+        let mut counts = Vec::new();
+        for l in [lang::Lang::ZhCn, lang::Lang::En] {
+            let s = lang::Strings::new(l);
+            counts.push(count(owned(&s, snap(&EMPTY)).0));
+        }
+        assert_eq!(counts[0], counts[1]);
     }
 
     #[test]
