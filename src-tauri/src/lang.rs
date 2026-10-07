@@ -274,6 +274,28 @@ pub struct Strings {
     pub menu_step_fwd: &'static str,
     pub menu_slower: &'static str,
     pub menu_speed_reset: &'static str,
+    /// A-B 循环：设 A 点 / 设 B 点 / 清除。
+    ///
+    /// 「标记」而不是「设置」是因为 A/B 是**位置**而不是开关 ——
+    /// 中文里「设置 A 点」听起来像打开了什么开关。
+    pub menu_timing: &'static str,
+    /// A-B 循环：设 A 点 / 设 B 点 / 清除。
+    ///
+    /// 「标记」而不是「设置」是因为 A/B 是**位置**而不是开关 ——
+    /// 中文里「设置 A 点」听起来像打开了什么开关。
+    pub menu_ab_set_a: &'static str,
+    pub menu_ab_set_b: &'static str,
+    pub menu_ab_clear: &'static str,
+    /// 字幕/音频延迟各三条：加一步、减一步、归零。
+    ///
+    /// **归零那一项的标签会带上当前值**（运行时拼，不是 `&'static str`），
+    /// 所以这里只有「归零」三个字，值由菜单那边 `format!` 拼上去。
+    pub menu_sub_delay_inc: &'static str,
+    pub menu_sub_delay_dec: &'static str,
+    pub menu_sub_delay_reset: &'static str,
+    pub menu_audio_delay_inc: &'static str,
+    pub menu_audio_delay_dec: &'static str,
+    pub menu_audio_delay_reset: &'static str,
     pub menu_faster: &'static str,
     pub menu_jump_start: &'static str,
     pub menu_back_10s: &'static str,
@@ -355,6 +377,13 @@ pub struct Strings {
     pub info_subtitle_added: &'static str,
     /// 「从上次的位置继续」的提示标题
     pub info_resumed: &'static str,
+    /// A-B 循环的瞬时提示。四条：标了 A 点、正在循环、清除了、
+    /// 以及**两个错误情形**（没标 A 就想标 B、B 落在 A 前面）
+    pub ab_point_a: &'static str,
+    pub ab_looping: &'static str,
+    pub ab_cleared: &'static str,
+    pub ab_need_a: &'static str,
+    pub ab_b_before_a: &'static str,
 }
 
 impl Strings {
@@ -457,6 +486,16 @@ impl Strings {
             menu_step_fwd: "Step forward one frame",
             menu_slower: "Slower",
             menu_speed_reset: "Reset speed",
+            menu_timing: "Timing",
+            menu_ab_set_a: "Set A point",
+            menu_ab_set_b: "Set B point",
+            menu_ab_clear: "Clear A-B loop",
+            menu_sub_delay_inc: "Subtitle delay +0.05s",
+            menu_sub_delay_dec: "Subtitle delay -0.05s",
+            menu_sub_delay_reset: "Subtitle delay: reset",
+            menu_audio_delay_inc: "Audio delay +0.05s",
+            menu_audio_delay_dec: "Audio delay -0.05s",
+            menu_audio_delay_reset: "Audio delay: reset",
             menu_faster: "Faster",
             menu_jump_start: "Jump to start",
             menu_back_10s: "Back 10 seconds",
@@ -481,6 +520,11 @@ impl Strings {
             help_prev: "Previous file",
             info_subtitle_added: "Subtitle loaded.",
             info_resumed: "Resumed from",
+            ab_point_a: "A point",
+            ab_looping: "Looping",
+            ab_cleared: "A-B loop cleared",
+            ab_need_a: "Set the A point first (Shift+Left)",
+            ab_b_before_a: "B point is before A point; nothing marked",
         }
     }
 
@@ -574,6 +618,16 @@ impl Strings {
             menu_step_fwd: "前进一帧",
             menu_slower: "减速",
             menu_speed_reset: "重置速度",
+            menu_timing: "时间",
+            menu_ab_set_a: "标记 A 点",
+            menu_ab_set_b: "标记 B 点",
+            menu_ab_clear: "清除 A-B 循环",
+            menu_sub_delay_inc: "字幕延迟 +0.05 秒",
+            menu_sub_delay_dec: "字幕延迟 -0.05 秒",
+            menu_sub_delay_reset: "字幕延迟归零",
+            menu_audio_delay_inc: "音频延迟 +0.05 秒",
+            menu_audio_delay_dec: "音频延迟 -0.05 秒",
+            menu_audio_delay_reset: "音频延迟归零",
             menu_faster: "加速",
             menu_jump_start: "跳到开头",
             menu_back_10s: "后退 10 秒",
@@ -598,6 +652,11 @@ impl Strings {
             help_prev: "上一个文件",
             info_subtitle_added: "字幕已加载。",
             info_resumed: "已从上次的位置继续",
+            ab_point_a: "A 点",
+            ab_looping: "循环中",
+            ab_cleared: "A-B 循环已清除",
+            ab_need_a: "请先按 Shift+← 标记 A 点",
+            ab_b_before_a: "B 点在 A 点之前，未标记",
         }
     }
 

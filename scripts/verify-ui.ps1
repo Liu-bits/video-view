@@ -205,6 +205,41 @@ function Send-Key($vk) {
     [VV]::keybd_event($vk, 0, 2, [IntPtr]::Zero)
 }
 
+# 带修饰键的组合键。修饰键用 `keybd_event` 按住，主键也用 `keybd_event`。
+#
+# # 为什么不用 Send-KeyMsg
+#
+# `App::handle_key` 里的 `Ctrl` / `Shift` / `Alt` 全部来自
+# **`GetKeyState`**，而不是消息的 `lParam`。`SendMessage` 伪造的
+# `WM_KEYDOWN` 不会改变键盘状态 —— 也就是说发过去的 `Ctrl+→` 在应用看来
+# 就是**光秃秃的 `→`**，会去执行快进。
+#
+# 所以这一组带修饰键的快捷键（A-B 循环、字幕/音频延迟）**只能用真键盘
+# 事件**验。这也解释了为什么它们当初不能用 `Send-KeyMsg` 那套写检查。
+#
+# # 这台机器上 keybd_event 送不进的键
+#
+# 实测送不进**字母键**（0x49 / 0x46 完全收不到），但方向键、OEM 键、
+# Esc、空格、F11 都正常。0.8.0 新加的组合里 `Shift+←` / `Shift+→` /
+# `Ctrl+←→` / `Alt+←→` 用的都是方向键，所以能验；只有 `Shift+L`
+# （清除 A-B 循环）用到了字母键 —— 它只能靠右键菜单验。
+function Send-KeyCombo($mods, $vk) {
+    foreach ($m in $mods) {
+        [VV]::keybd_event($m, 0, 0, [IntPtr]::Zero)
+    }
+    Start-Sleep -Milliseconds 80
+    [VV]::keybd_event($vk, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 80
+    [VV]::keybd_event($vk, 0, 2, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    # **倒序松开**修饰键。Win32 不在乎顺序，但正序松开会在
+    # 「Shift+→」之后短暂出现「Shift 单独按住」的状态
+    [array]::Reverse($mods)
+    foreach ($m in $mods) {
+        [VV]::keybd_event($m, 0, 2, [IntPtr]::Zero)
+    }
+}
+
 # 直接发 WM_KEYDOWN / WM_KEYUP，不走键盘注入这一层。
 #
 # ## 为什么不统一用 Send-Key
@@ -1044,6 +1079,93 @@ try {
     $bmpSpdB.Dispose()
     Send-KeyMsg $main 0xDB   # VK_OEM_4 = `[`，按回去
     Start-Sleep -Seconds 2
+
+# ---- 0.8.0：A-B 循环的标记点与字幕/音频延迟 ------------------------------
+    #
+    # 四个键共用同一块「控制栏按钮那一条带」做判据：三者都只改**控制栏**
+    # 里那一行文字 —— 标签（倍速）或瞬时提示（A 点、延迟）。
+    #
+    # 之所以都靠那行字，是因为它们的真实效果（循环、字幕偏移、音频偏移）
+    # 都不是像素能看出来的。唯一能看见的是「我刚按了什么、现在是什么值」，
+    # 而那正是这一行字存在的理由。
+    #
+    # **必须用真键盘事件**（`Send-KeyCombo`），理由见那个函数的注释：
+    # 应用读的是 `GetKeyState`，伪造的 `WM_KEYDOWN` 改不了键盘状态。
+    #
+    # 只比按钮那一条带（进度条以下），避开一直在动的进度条与时间码 ——
+    # 拿整条控制栏比的话每次都是 100% 差异，什么都能「通过」。
+    $bandY = $trackCY + 6
+    $bandH = [math]::Max(0, ($ch - $bandY) - 2)
+
+    # --- Shift+左方向键 = 标记 A 点 ---
+    # 瞬时提示会写「A 点 0:05」，所以按钮那条带必然变。
+    # （`ab_point_a` + `ui::format_time(position)`）
+    Force-Foreground $main
+    Start-Sleep -Milliseconds 400
+    $bmpAbA = Grab $main
+    Send-KeyCombo @(0x10) 0x25   # Shift + Left
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpAbB = Grab $main
+    $diffAb = PixDiff $bmpAbA $bmpAbB $ox ($bandY + $oy) $cw $bandH 2
+    $bmpAbA.Dispose()
+    $bmpAbB.Dispose()
+    Add-Result "abPointShowsNotice" ($diffAb -gt 0.05) `
+        ("Shift+← 之后控制栏差异率 {0}%（应当出现「A 点 …」的提示）" -f $diffAb)
+
+    # --- Ctrl+右方向键 = 字幕延迟 +0.05 秒 ---
+    # 同样靠瞬时提示（`menu_sub_delay_reset` + 带符号秒数）。
+    Force-Foreground $main
+    Start-Sleep -Milliseconds 400
+    $bmpSdA = Grab $main
+    Send-KeyCombo @(0x11) 0x27   # Ctrl + Right
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpSdB = Grab $main
+    $diffSd = PixDiff $bmpSdA $bmpSdB $ox ($bandY + $oy) $cw $bandH 2
+    $bmpSdA.Dispose()
+    $bmpSdB.Dispose()
+    Add-Result "subDelayShowsNotice" ($diffSd -gt 0.05) `
+        ("Ctrl+→ 之后控制栏差异率 {0}%（应当出现「字幕延迟归零 +0.05」）" -f $diffSd)
+
+    # --- Alt+右方向键 = 音频延迟 ---
+    Force-Foreground $main
+    Start-Sleep -Milliseconds 400
+    $bmpAdA = Grab $main
+    Send-KeyCombo @(0x12) 0x27   # Alt + Right
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpAdB = Grab $main
+    $diffAd = PixDiff $bmpAdA $bmpAdB $ox ($bandY + $oy) $cw $bandH 2
+    $bmpAdA.Dispose()
+    $bmpAdB.Dispose()
+    Add-Result "audioDelayShowsNotice" ($diffAd -gt 0.05) `
+        ("Alt+→ 之后控制栏差异率 {0}%（应当出现「音频延迟归零 +0.05」）" -f $diffAd)
+
+# --- 反向键也必须生效（防方向写反）---
+    #
+    # 上面那条 `subDelayShowsNotice` 验的是「按了有反应」。如果
+    # `Ctrl+←` 与 `Ctrl+→` 的**符号写反了**，那条照样会过（提示照样出现，
+    # 只是字不一样），而用户会发现「按左箭头字幕越来越晚」。
+    #
+    # 所以这里反向再按一次，要求**也**出现提示 —— 两次加起来覆盖两个方向。
+    #
+    # （本来还想验「瞬时提示 4 秒后自己消失」，但那条的前提是两次抓图时
+    # 控制栏都画着 —— 控制台窗口挡在前面时两��张一样的图，差异 0%，
+    # 得到的结论是假的。提示过期这件事没有可见后果，不值得为它换一个
+    # 依赖「控制台不挡路」的检查。）
+    Force-Foreground $main
+    Start-Sleep -Milliseconds 400
+    $bmpRdA = Grab $main
+    Send-KeyCombo @(0x11) 0x25   # Ctrl + Left
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpRdB = Grab $main
+    $diffRd = PixDiff $bmpRdA $bmpRdB $ox ($bandY + $oy) $cw $bandH 2
+    $bmpRdA.Dispose()
+    $bmpRdB.Dispose()
+    Add-Result "subDelayReverseWorks" ($diffRd -gt 0.05) `
+        ("Ctrl+← 之后控制栏差异率 {0}%（反向也必须生效，否则方向写反了）" -f $diffRd)
 
     # 把面板状态落成截图，人工看一眼内容对不对
     Send-KeyMsg $main 0x54

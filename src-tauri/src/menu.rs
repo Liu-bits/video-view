@@ -149,12 +149,25 @@ pub mod id {
     /// 放底部意味着用户要滚到最后才知道为什么一堆东西是灰的。
     pub const ADVANCED: u16 = 60;
 
-    /// 从头播放当前文件（跳过「从上次位置继续」）。
-    ///
-    /// **这是自动续播的逃生口。** 没有它的话，用户打开一个视频想重看某个
-    /// 片段却发现它跳到了上次的位置，就只能关掉再开或者改文件 ——
-    /// 而「上次的位置」这个功能是他自己不一定会意识到存在的东西。
+    /// 「从头播放」的逃生口。自动续播是**没有界面提示**的动作，
+    /// 没有它的话用户打开一个视频想重看某个片段却发现它跳到了上次的位置，
+    /// 就只能关掉再开或者改文件。
     pub const PLAY_FROM_BEGINNING: u16 = 61;
+
+    /// 「时间」那一组的命令。编号从 62 起，**不复用**。
+    ///
+    /// 单独开一段而不是接着 60 往后数，是为了让「时间」这一组在 id 空间上
+    /// 自成一块 —— 将来加第二组时间相关的命令（比如 `goto-chapter`）时，
+    /// 看编号就知道它属于哪一组。
+    pub const AB_SET_A: u16 = 62;
+    pub const AB_SET_B: u16 = 63;
+    pub const AB_CLEAR: u16 = 64;
+    pub const SUB_DELAY_INC: u16 = 65;
+    pub const SUB_DELAY_DEC: u16 = 66;
+    pub const SUB_DELAY_RESET: u16 = 67;
+    pub const AUDIO_DELAY_INC: u16 = 68;
+    pub const AUDIO_DELAY_DEC: u16 = 69;
+    pub const AUDIO_DELAY_RESET: u16 = 70;
 }
 
 /// 菜单里可选的字幕编码，映射到 mpv 的 `sub-codepage`。
@@ -305,6 +318,21 @@ pub struct Snapshot<'a> {
     pub sub_codepage: &'a str,
     /// 当前的 `sub-scale`。用来给大小子菜单打勾。
     pub sub_scale: f64,
+    /// A 点是否已经标记了。
+    ///
+    /// 「标记 B 点」在没标记 A 时要**置灰** —— 不是没做，是做了也没用：
+    /// mpv 的 `ab-loop` 要 a 和 b **都**是有效时间才生效，只设 b 等于
+    /// 没设。与其让用户点了之后发现没反应，不如一开始就灰掉。
+    pub ab_set: bool,
+    /// A、B 都设好了（也就是「正在循环」）。
+    pub ab_active: bool,
+    /// 当前字幕延迟（mpv 的 `sub-delay`，秒）。
+    ///
+    /// 用来给「归零」那一项拼上当前值并在为 0 时把它置灰，模式与
+    /// 「重置速度」一致。
+    pub sub_delay: f64,
+    /// 当前音频延迟（mpv 的 `audio-delay`，秒）。
+    pub audio_delay: f64,
     pub tracks: &'a TrackSet,
 }
 
@@ -445,8 +473,138 @@ fn build(s: &lang::Strings, snap: Snapshot<'_>) -> Option<HMENU> {
         // 逃生口把菜单再加长一截。
         append(menu, id::PLAY_FROM_BEGINNING, s.menu_from_beginning, false);
         enable(menu, id::PLAY_FROM_BEGINNING, snap.loaded);
+        separator(menu);
+
+        build_timing(menu, s, snap);
 
         Some(menu)
+    }
+}
+
+/// 「时间」那一组：A-B 循环 + 字幕/音频延迟。
+///
+/// ## 为什么整组收进子菜单而不是平铺 9 项
+///
+/// 平铺的实测结果：右键菜单从约 740 px 涨到 **985 px**，而这台机器的屏幕
+/// 只有 1080 px 高。在画面下半部分右击时菜单放不下，Win32 会**向上翻转**，
+/// 于是菜单盖住整个画面上方、鼠标反而落在菜单**外面** ——
+/// `verify-ui` 的 `rightMenuAtCursor` 就是这么挂的（实测菜单矩形
+/// `(610,95)-(854,1080)`，鼠标在 `y=265`）。
+///
+/// 收进子菜单后顶层只多 1 行（+22 px），菜单回到约 785 px，在 1080 px 的
+/// 屏幕上任何位置都放得下。
+///
+/// ## 延迟的当前值怎么让用户看到
+///
+/// 收进子菜单意味着**不悬停就看不到当前值**。两个补偿：
+///
+/// 1. 「归零」那一项的标题里带出当前值（`字幕延迟归零（+0.15）`），
+///    并且在为 0 时**置灰** —— 与「重置速度」同一个模式，菜单一贯如此
+/// 2. 每次用快捷键改动，控制栏文件名那一块显示 4 秒提示
+///    （`字幕延迟归零 +0.15`）—— 也就是**刚改完一定看得见**，
+///    这比「随时能瞄一眼」更重要
+///
+/// ## 为什么延迟的「归零」项要带上当前值
+///
+/// 延迟是**看不见**的：用户按了三次 `-0.05s` 之后，界面上没有任何东西
+/// 告诉他现在到底是 -0.15 还是 +0.10。于是「归零」这一项的标签改成
+/// `字幕延迟归零（-0.15 秒）`，顺带在为 0 时置灰 —— 与「重置速度」
+/// 用的是同一个模式，菜单一贯如此。
+///
+/// 只在**归零**那一项上带值，而不是三��都带：加/减那两项的值是固定的
+/// （±0.05 秒），带上去是废话。
+///
+/// ## 为什么这几项**不**受高级模式控制
+///
+/// 它们调整的是**播放/音画同步**，不是「诊断、轨道、字幕编码」那类需要
+/// 用户先理解概念的功能。高级模式的语义是「简化到只剩基本播放」，而
+/// 音画不同步是一个连普通用户都会遇到的问题 —— 灰掉它等于告诉人
+/// 「你遇到字幕不同步的时候没办法」。
+fn build_timing(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
+    // SAFETY: 只有 Win32 菜单 API。
+    unsafe {
+        let Ok(sub) = CreatePopupMenu() else { return };
+
+        append(sub, id::AB_SET_A, s.menu_ab_set_a, false);
+        enable(sub, id::AB_SET_A, snap.loaded);
+        // 没有 A 点就设 B 是**没用的**（mpv 要 a 和 b 都是有效时间才循环），
+        // 与其点了没反应，不如一开始就是灰的
+        append(sub, id::AB_SET_B, s.menu_ab_set_b, false);
+        enable(sub, id::AB_SET_B, snap.loaded && snap.ab_set);
+        append(sub, id::AB_CLEAR, s.menu_ab_clear, false);
+        enable(
+            sub,
+            id::AB_CLEAR,
+            snap.loaded && (snap.ab_set || snap.ab_active),
+        );
+        separator(sub);
+
+        append(sub, id::SUB_DELAY_INC, s.menu_sub_delay_inc, false);
+        enable(sub, id::SUB_DELAY_INC, snap.loaded);
+        append(sub, id::SUB_DELAY_DEC, s.menu_sub_delay_dec, false);
+        enable(sub, id::SUB_DELAY_DEC, snap.loaded);
+        let sub_label = format!(
+            "{}（{}）",
+            s.menu_sub_delay_reset,
+            format_delay(snap.sub_delay)
+        );
+        append(sub, id::SUB_DELAY_RESET, &sub_label, false);
+        enable(
+            sub,
+            id::SUB_DELAY_RESET,
+            snap.loaded && snap.sub_delay.abs() > 1e-6,
+        );
+        separator(sub);
+
+        append(sub, id::AUDIO_DELAY_INC, s.menu_audio_delay_inc, false);
+        enable(sub, id::AUDIO_DELAY_INC, snap.loaded);
+        append(sub, id::AUDIO_DELAY_DEC, s.menu_audio_delay_dec, false);
+        enable(sub, id::AUDIO_DELAY_DEC, snap.loaded);
+        let aud_label = format!(
+            "{}（{}）",
+            s.menu_audio_delay_reset,
+            format_delay(snap.audio_delay)
+        );
+        append(sub, id::AUDIO_DELAY_RESET, &aud_label, false);
+        enable(
+            sub,
+            id::AUDIO_DELAY_RESET,
+            snap.loaded && snap.audio_delay.abs() > 1e-6,
+        );
+
+        append_sub(menu, s.menu_timing, sub, snap.loaded);
+    }
+}
+
+/// 把延迟格式化成人读得懂的带符号秒数：`+0.15` / `-0.05` / `0`。
+///
+/// `pub` 是因为 `App` 也要用它拼瞬时提示（控制栏那行字）—— 两处必须用
+/// **同一个**函数，否则用户会在菜单里看到 `+0.15` 而在提示里看到
+/// 别的写法，而那正是「同一个东西实现了两遍」的标准下场。
+///
+/// **只在非零时带小数**：`0.05` 显示成 `+0.05` 而不是 `+0.050`，
+/// 而 0 显示成 `0`（不带 `+`）—— 「+0.00 秒」读起来像「往快了调」，
+/// 而它其实是「没调」。
+///
+/// 步进是 0.05 秒，两位小数够（第三位永远是 0），所以不做更细的兜底 ——
+/// 但仍然过一遍 `round` 来吃掉浮点误差（`0.05` 连加二十次不会是
+/// 精确的 1.0）。
+///
+/// `as i64` 对 `NaN` / `inf` 给 0（对 `inf` 是饱和到 `i64::MAX`，那会
+/// 走到 `whole >= 100` 那条分支去）。`App` 那侧在调用之前已经把值夹到
+/// `DELAY_LIMIT` 以内，所以这里只需要防 NaN。
+pub fn format_delay(v: f64) -> String {
+    let hundredths = (v * 100.0).round().clamp(-1.0e6, 1.0e6) as i64;
+    if hundredths == 0 {
+        return "0".to_string();
+    }
+    let sign = if hundredths > 0 { '+' } else { '-' };
+    let a = hundredths.abs();
+    let (whole, frac) = (a / 100, a % 100);
+    if whole == 0 {
+        format!("{sign}0.{frac:02}")
+    } else {
+        format!("{sign}{whole}.{frac:02}")
     }
 }
 
@@ -631,8 +789,8 @@ mod tests {
     use super::*;
     use crate::track::{Track, TrackKind};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemInfoW, GetMenuState, MENUITEMINFOW, MENU_ITEM_MASK,
-        MFS_CHECKED, MFS_GRAYED, MF_BYPOSITION, MIIM_ID, MIIM_STRING, MIIM_SUBMENU,
+        GetMenuItemCount, GetMenuItemInfoW, GetMenuState, GetSubMenu, MENUITEMINFOW,
+        MENU_ITEM_MASK, MFS_CHECKED, MFS_GRAYED, MF_BYPOSITION, MIIM_ID, MIIM_STRING, MIIM_SUBMENU,
     };
 
     fn st() -> lang::Strings {
@@ -728,6 +886,31 @@ mod tests {
         })
     }
 
+    /// 顶层菜单里**最后一个**子菜单的句柄。
+    ///
+    /// 「时间」那一组是 0.8.0 才加的，而且是加在**最后**。所以按位置取
+    /// 「最后一个子菜单」比按标题找更稳 —— 按标题找的话，改一次翻译就要
+    /// 改一次测试，而翻译变动跟这个测试要验的东西毫无关系。
+    ///
+    /// **靠 `GetSubMenu` 返回空句柄来识别普通项**，而不是看 `wID == 0xFFFFFFFF`
+    /// —— 后者在 `MF_POPUP` 项上的返回值依实现而定（实测拿到的是子菜单
+    /// 句柄本身，不是那个全 1 的值），按它判断会一个都找不到。
+    fn last_submenu(m: HMENU) -> HMENU {
+        let mut found = HMENU::default();
+        for i in 0..count(m) {
+            // SAFETY: `i` 落在 `0..count(m)` 之内
+            let sub = unsafe { GetSubMenu(m, i) };
+            if !sub.is_invalid() {
+                found = sub;
+            }
+        }
+        assert!(
+            !found.is_invalid(),
+            "顶层菜单里一个子菜单都没有 —— 「时间」那一组呢？"
+        );
+        found
+    }
+
     /// 找不到时返回 `None` 而不是 panic —— 用来断言「某一项**不**在菜单里」。
     fn find_opt(m: HMENU, want: &str) -> Option<u32> {
         (0..count(m) as u32).find(|i| label(m, *i).as_deref() == Some(want))
@@ -739,6 +922,12 @@ mod tests {
         (0..count(m) as u32)
             .find(|i| cmd(m, *i) == u32::from(want))
             .unwrap_or_else(|| panic!("菜单里找不到命令 ID {want}"))
+    }
+
+    /// 按命令 ID 取标题。测「标题里带了当前值」这种断言时用。
+    fn item_text(m: HMENU, want: u16) -> String {
+        let pos = find_cmd(m, want);
+        label(m, pos).unwrap_or_default()
     }
 
     fn audio(id: i64, selected: bool) -> Track {
@@ -800,6 +989,10 @@ mod tests {
             advanced: true,
             sub_codepage: codepage,
             sub_scale: scale,
+            ab_set: false,
+            ab_active: false,
+            sub_delay: 0.0,
+            audio_delay: 0.0,
             tracks,
         }
     }
@@ -1001,6 +1194,140 @@ mod tests {
         // 灰掉它等于告诉用简易模式的人「你不能连续看下一集」。
         let n = find_cmd(off.0, id::NEXT);
         assert!(!is_grayed(off.0, n), "「下一个文件」也不受高级模式影响");
+    }
+
+    #[test]
+    fn 延迟的归零项带上当前值_为0时置灰() {
+        let s = st();
+        // 非零：标签里要带出当前值，归零项可点
+        let m1 = owned(
+            &s,
+            Snapshot {
+                sub_delay: -0.15,
+                audio_delay: 0.2,
+                ..snap(&EMPTY)
+            },
+        );
+        let tm1 = last_submenu(m1.0);
+        let t1 = item_text(tm1, id::SUB_DELAY_RESET);
+        assert!(
+            t1.contains("-0.15"),
+            "字幕延迟的归零项应当带出当前值，实际标题 {t1:?}"
+        );
+        let t2 = item_text(tm1, id::AUDIO_DELAY_RESET);
+        assert!(
+            t2.contains("+0.20"),
+            "音频延迟的归零项应当带出当前值，实际标题 {t2:?}"
+        );
+        assert!(!is_grayed(tm1, find_cmd(tm1, id::SUB_DELAY_RESET)));
+        assert!(!is_grayed(tm1, find_cmd(tm1, id::AUDIO_DELAY_RESET)));
+
+        // 为 0：归零项**没有意义**（「归零一个已经是 0 的东西」），
+        // 置灰是唯一诚实的表达
+        let m2 = owned(&s, snap(&EMPTY));
+        let tm2 = last_submenu(m2.0);
+        let t3 = item_text(tm2, id::SUB_DELAY_RESET);
+        assert!(
+            t3.contains('0'),
+            "延迟为 0 时标题应当写 0 而不是 +0.00，实际 {t3:?}"
+        );
+        assert!(
+            is_grayed(tm2, find_cmd(tm2, id::SUB_DELAY_RESET)),
+            "延迟为 0 时归零项应当置灰"
+        );
+        assert!(is_grayed(tm2, find_cmd(tm2, id::AUDIO_DELAY_RESET)));
+        // 加/减那两项**不**置灰 —— 从 0 调起来正是它们的用途
+        assert!(!is_grayed(tm2, find_cmd(tm2, id::SUB_DELAY_INC)));
+        assert!(!is_grayed(tm2, find_cmd(tm2, id::SUB_DELAY_DEC)));
+    }
+
+    #[test]
+    fn 没标_a_点时标_b_点置灰() {
+        let s = st();
+        // 标 A：可点；标 B：不可点（mpv 要 a 和 b 都是有效时间才循环）
+        let m1 = owned(&s, snap(&EMPTY));
+        let tm1 = last_submenu(m1.0);
+        assert!(!is_grayed(tm1, find_cmd(tm1, id::AB_SET_A)));
+        assert!(
+            is_grayed(tm1, find_cmd(tm1, id::AB_SET_B)),
+            "没有 A 点时「标记 B 点」置灰 —— 点了也是白点"
+        );
+        assert!(
+            is_grayed(tm1, find_cmd(tm1, id::AB_CLEAR)),
+            "什么都没标时「清除」没有意义"
+        );
+        // 标了 A 之后：B 可点，清除也可点
+        let m2 = owned(
+            &s,
+            Snapshot {
+                ab_set: true,
+                ..snap(&EMPTY)
+            },
+        );
+        let tm2 = last_submenu(m2.0);
+        assert!(!is_grayed(tm2, find_cmd(tm2, id::AB_SET_B)));
+        assert!(!is_grayed(tm2, find_cmd(tm2, id::AB_CLEAR)));
+    }
+
+    #[test]
+    fn 时间这一组不受高级模式影响() {
+        // 音画不同步是连普通用户都会遇到的问题。灰掉这几项等于告诉人
+        // 「你遇到字幕不同步的时候没办法」。
+        let s = st();
+        let off = owned(
+            &s,
+            Snapshot {
+                advanced: false,
+                ab_set: true,
+                // 两个延迟都设成非 0，否则「归零」那两项会因「已经是 0」
+                // 而置灰 —— 那是**另一条**规则，这里要验的是高级模式那一条
+                sub_delay: -0.1,
+                audio_delay: 0.1,
+                ..snap(&EMPTY)
+            },
+        );
+        let tm = last_submenu(off.0);
+        for id in [
+            id::AB_SET_A,
+            id::AB_SET_B,
+            id::AB_CLEAR,
+            id::SUB_DELAY_INC,
+            id::SUB_DELAY_DEC,
+            id::SUB_DELAY_RESET,
+            id::AUDIO_DELAY_INC,
+            id::AUDIO_DELAY_DEC,
+            id::AUDIO_DELAY_RESET,
+        ] {
+            assert!(
+                !is_grayed(tm, find_cmd(tm, id)),
+                "高级模式关着时 id {id} 被置灰了"
+            );
+        }
+    }
+
+    #[test]
+    fn 延迟的格式化() {
+        assert_eq!(format_delay(0.0), "0", "0 不该带 + 号");
+        assert_eq!(format_delay(-0.0), "0");
+        assert_eq!(format_delay(0.05), "+0.05");
+        assert_eq!(format_delay(-0.05), "-0.05");
+        assert_eq!(format_delay(0.15), "+0.15");
+        assert_eq!(format_delay(-0.15), "-0.15");
+        assert_eq!(format_delay(1.0), "+1.00");
+        assert_eq!(format_delay(-12.5), "-12.50");
+        assert_eq!(format_delay(60.0), "+60.00");
+        // 浮点误差：0.05 连加 20 次不会精确等于 1.0
+        let mut acc = 0.0;
+        for _ in 0..20 {
+            acc += 0.05;
+        }
+        assert_eq!(format_delay(acc), "+1.00");
+        // NaN 不能变成 "NaN" 出现在菜单里
+        assert_eq!(format_delay(f64::NAN), "0");
+        // `inf` 被夹住：`as i64` 对 inf 是饱和到 i64::MAX，不夹的话
+        // 算出来的「小时数」会是个毫无意义的巨大数字
+        assert_eq!(format_delay(f64::INFINITY), "+10000.00");
+        assert_eq!(format_delay(f64::NEG_INFINITY), "-10000.00");
     }
 
     #[test]

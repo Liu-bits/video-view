@@ -51,8 +51,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6,
     VK_7, VK_8, VK_9, VK_A, VK_B, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11,
-    VK_HOME, VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_N, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5,
-    VK_OEM_COMMA, VK_OEM_PERIOD, VK_P, VK_RETURN, VK_RIGHT, VK_S, VK_SPACE, VK_T, VK_UP,
+    VK_HOME, VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_MENU, VK_N, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5,
+    VK_OEM_COMMA, VK_OEM_PERIOD, VK_P, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -70,7 +70,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
-use crate::menu;
+use crate::menu::{self, format_delay as menu_format_delay};
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
 use crate::playlist::{self, file_title, is_subtitle_path, Playlist, PlaylistRow};
 use crate::resume;
@@ -150,6 +150,21 @@ const SPEED_FACTOR: f64 = 1.25;
 /// 差 3 秒的位置对「接着看」这个用途完全够用。
 const RESUME_INTERVAL_MS: u128 = 3000;
 
+/// 字幕/音频延迟能调到的边界（秒）。
+///
+/// **mpv 自己完全不夹这个值** —— 实测 `-60` 到 `600` 全都收下。所以
+/// 夹取必须在这一侧做，否则连按几十次 `-` 之后 `sub-delay` 会变成
+/// `-600` 秒，也就是字幕被推到 10 分钟之后，而用户看到的现象是
+/// 「字幕没了」，**界面上没有任何地方能看出原因**（延迟的显示处只有
+/// 菜单里的「归零」那一项）。
+const DELAY_LIMIT: f64 = 60.0;
+
+/// 延迟一步挪多少秒。
+///
+/// 0.05（50 毫秒）：人耳对音画不同步的察觉阈值大约在 40~80 毫秒量级，
+/// 再小用户按了也没感觉；再大（0.1 秒）又容易过冲。
+const DELAY_STEP: f64 = 0.05;
+
 /// 控制栏瞬时提示停留多久（毫秒）。
 ///
 /// 给 4000：够读完一句「已从上次的位置继续 12:34」，又不至于在用户
@@ -189,6 +204,27 @@ struct UiState {
     /// 状态」，而这个开关要同时落盘 —— `prefs_touch` / `prefs_flush`
     /// 机制读的就是它。
     advanced: bool,
+    /// A-B 循环的 A 点（秒）。`None` = 没标记。
+    ///
+    /// **跟 mpv 的 `ab-loop-a` 一样是全局属性**，换文件不会重置，所以
+    /// `open()` 里要主动清掉 —— 否则「在第 1 集的 10~20 秒设了循环」
+    /// 会作用到第 2 集上，而 20 秒很可能已经过了第 2 集的时长。
+    ab_a: Option<f64>,
+    /// A-B 循环的 B 点（秒）。`None` = 没标记。
+    ///
+    /// 只设了 A 不会循环 —— mpv 要 a 和 b 都是有效时间才生效，所以
+    /// 菜单里「标记 B 点」在没有 A 时是**置灰**的。
+    ab_b: Option<f64>,
+    /// 字幕延迟（秒，mpv 的 `sub-delay`）。
+    ///
+    /// **不落盘**：字幕不同步是**这个文件**的问题（压制质量、字幕组版本），
+    /// 把它记住会让下一个正常的文件莫名其妙地偏移。
+    sub_delay: f64,
+    /// 音频延迟（秒，mpv 的 `audio-delay`）。同样不落盘，理由见 `sub_delay`。
+    ///
+    /// 与 `sub_delay` 一样是**跨文件保留**的（mpv 的全局属性行为）——
+    /// 一次会话里遇到一批同样编码问题的文件时，逐个重调很烦。
+    audio_delay: f64,
 }
 
 impl Default for UiState {
@@ -205,6 +241,10 @@ impl Default for UiState {
             idle: true,
             speed: 1.0,
             sub_codepage: String::new(),
+            ab_a: None,
+            ab_b: None,
+            sub_delay: 0.0,
+            audio_delay: 0.0,
             sub_scale: 1.0,
             // 默认由设置给出（`App::new` 里覆盖）
             advanced: true,
@@ -1314,6 +1354,166 @@ impl App {
         self.invalidate_all();
     }
 
+    // ------------------------------------------------------------ A-B 循环
+
+    /// 在当前位置标记 A 点。**清掉已��的 B 点。**
+    ///
+    /// 「设 A 就清 B」是 mpv 自己的语义（`ab-loop-a` 一变，`ab-loop` 就
+    /// 需要新的 b），也是用户预期的：重新开始标一段，中间那个旧 B 点
+    /// 十有八九是不想要的。
+    fn set_ab_a(&mut self) {
+        if !self.state.has_file {
+            return;
+        }
+        let at = self.state.position;
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let mut err = None;
+        if let Err(e) = p.set_string_property("ab-loop-a", &format!("{at:.3}")) {
+            err = Some(e);
+        } else {
+            self.state.ab_a = Some(at);
+            self.state.ab_b = None;
+            // B 已经作废，而 mpv 那边的 b 也得清掉 —— 否则界面说「没设 B」
+            // 而 mpv 还在拿旧的 b 循环，用户看到的现象是「明明只按了一次
+            // Shift+←，它怎么自己在循环了」
+            let _ = p.set_string_property("ab-loop-b", "no");
+        }
+        if let Some(e) = err {
+            self.report_error(self.strings.err_command, &e);
+            return;
+        }
+        self.show_notice(format!(
+            "{} {}",
+            self.strings.ab_point_a,
+            ui::format_time(at)
+        ));
+        self.refresh_panel_rows();
+        self.invalidate_controls();
+    }
+
+    /// 在当前位置标记 B 点。
+    ///
+    /// 没有 A 点时**什么也不做并说明原因**，而不是默默设一个 mpv 不会用的
+    /// b —— 后者会让用户以为循环已经设好了。
+    fn set_ab_b(&mut self) {
+        if !self.state.has_file {
+            return;
+        }
+        if self.state.ab_a.is_none() {
+            self.show_notice(self.strings.ab_need_a.to_string());
+            return;
+        }
+        let at = self.state.position;
+        // A 点在 B 点之后就是一段「倒着走」的范围，mpv 会立刻跳回 A 并
+        // 反复循环 —— 看起来像卡死。直接当成「重新标 A」更符合直觉。
+        let Some(a) = self.state.ab_a else { return };
+        if at <= a {
+            self.show_notice(self.strings.ab_b_before_a.to_string());
+            return;
+        }
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let r = p.set_string_property("ab-loop-b", &format!("{at:.3}"));
+        if let Err(e) = r {
+            self.report_error(self.strings.err_command, &e);
+            return;
+        }
+        self.state.ab_b = Some(at);
+        let range = format!("{} - {}", ui::format_time(a), ui::format_time(at));
+        self.show_notice(format!("{} {range}", self.strings.ab_looping));
+        self.refresh_panel_rows();
+        self.invalidate_controls();
+    }
+
+    /// 清除 A-B 循环。
+    ///
+    /// 「关掉」在 mpv 那边是**把 a 设成 `no`** —— 这��� libmpv 0.41 里
+    /// **没有** `ab-loop` 这个开关属性（实测 `property not found`，
+    /// `command ab-loop no` 报 `invalid parameter`）。所以「a 被清掉」
+    /// 就是「没在循环」这一件事的完整表达，界面上的 `ab_a` 跟着清。
+    fn clear_ab_loop(&mut self) {
+        if !self.state.has_file {
+            return;
+        }
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let r = p.set_string_property("ab-loop-a", "no");
+        if let Err(e) = r {
+            self.report_error(self.strings.err_command, &e);
+            return;
+        }
+        self.state.ab_a = None;
+        self.state.ab_b = None;
+        self.show_notice(self.strings.ab_cleared.to_string());
+        self.refresh_panel_rows();
+        self.invalidate_controls();
+    }
+
+    // ------------------------------------------------------- 字幕 / 音频延迟
+
+    /// 把字幕/音频延迟挪一步，并夹回合法范围。
+    ///
+    /// **mpv 完全不夹这个值** —— 实测 `-60` 到 `600` 全都收下。所以
+    /// 夹取必须在这一侧做，否则连按几十次 `-` 之后 `sub-delay` 会变成
+    /// `-600`，那意味着字幕被推到 10 分钟之后，用户看到的是「字幕没了」
+    /// 而且**没法从界面上看出来原因**（延迟没有别的显示处）。
+    fn nudge_delay(&mut self, sub: bool, delta: f64) {
+        if !self.state.has_file {
+            return;
+        }
+        let cur = if sub {
+            self.state.sub_delay
+        } else {
+            self.state.audio_delay
+        };
+        let next = (cur + delta).clamp(-DELAY_LIMIT, DELAY_LIMIT);
+        let (prop, val) = if sub {
+            ("sub-delay", next)
+        } else {
+            ("audio-delay", next)
+        };
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        let r = p.set_string_property(prop, &format!("{val:.3}"));
+        if let Err(e) = r {
+            self.report_error(self.strings.err_command, &e);
+            return;
+        }
+        if sub {
+            self.state.sub_delay = val;
+        } else {
+            self.state.audio_delay = val;
+        }
+        // 只在**动过**之后提示：从 0 加到 +0.05 也提示一次是有用的
+        // （确认这组键真的有用），但归零之后再提示就成噪音了。
+        if val != cur {
+            let label = if sub {
+                self.strings.menu_sub_delay_reset
+            } else {
+                self.strings.menu_audio_delay_reset
+            };
+            self.show_notice(format!("{label} {}", menu_format_delay(val)));
+        }
+        self.refresh_panel_rows();
+    }
+
+    /// 延迟归零。
+    fn reset_delay(&mut self, sub: bool) {
+        self.nudge_delay(
+            sub,
+            -if sub {
+                self.state.sub_delay
+            } else {
+                self.state.audio_delay
+            },
+        );
+    }
+
     /// 设置有改动，标脏等落盘。
     fn prefs_touch(&mut self) {
         self.prefs.volume = self.state.volume;
@@ -1422,6 +1622,17 @@ impl App {
         // 「已从上次的位置继续 12:34」盖住，而那句话对下一个文件是错的。
         self.notice.clear();
         self.notice_until = None;
+        // A-B 循环必须**逐文件清掉**。mpv 的 `ab-loop-a` / `ab-loop-b` 是
+        // 全局属性（`option-info` 里的 `expects-file` 是 `false`），换文件
+        // 不会重置 —— 于是「第 1 集的 10~20 秒设的循环」会作用到第 2 集上，
+        // 而 20 秒很可能已经过了第 2 集的时长，用户看到的是「一换文件就
+        // 立刻跳回开头并反复播放」。
+        //
+        // 延迟（`sub-delay` / `audio-delay`）**不**在这里清：它们同样是
+        // 全局属性，而用户一次会话里看一批同样编码问题的文件时，逐个重调
+        // 很烦。见 `UiState::sub_delay` 的注释。
+        self.state.ab_a = None;
+        self.state.ab_b = None;
         // 诊断数据必须清。不清的话上一段视频的分辨率和丢帧数会留在面板上，
         // 看起来像新文件也丢了 10 帧——那是误导（丢帧计数 mpv 自己会重置，
         // 但解码器建好之前读到的还是旧文件的值）。
@@ -2780,6 +2991,15 @@ fn pick_video_dialog(strings: &lang::Strings) -> Option<PathBuf> {
 /// 这个引用会一直活到 `handle_key` 返回，与重入那一层取到的 `&mut App` 撞车。
 unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
     let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+    // `shift` / `alt` 是 0.8.0 加的（A-B 循环用 `Shift+←/→/L`，
+    // 音频延迟用 `Alt+←/→`）。
+    //
+    // 用 `GetKeyState` 而不是消息里的 `lParam & (1 << 29)`（extended 位）：
+    // extended 位说的是「**右** Alt / **右** Ctrl」这类键位，不是修饰键
+    // 本身有没有按。用它判断 Shift 会得到「右 Shift 才是 Shift」这种
+    // 完全错误的结果。
+    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+    let alt = GetKeyState(VK_MENU.0 as i32) < 0;
     let key = |k: u16| vk == k;
 
     // ---- 轨道菜单打开时，方向键 / 回车 / Esc 归菜单 ----
@@ -2837,6 +3057,40 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
             } else if app.panel != PanelMode::None {
                 app.set_panel(PanelMode::None);
             }
+            true
+        }
+        // ---- 带修饰键的方向键 ----
+        //
+        // **必须放在纯方向键那几条之前**，否则 `Shift+←` 会落到
+        // `key(VK_LEFT)` 上变成「快退 10 秒」—— 而 Shift 键被吃掉之后
+        // 用户完全不知道为什么自己的「标记 A 点」变成了「后退」。
+        //
+        // 三个修饰键分给三件事，互不重叠：
+        //   * `Shift+←/→` A-B 循环的 A 点 / B 点
+        //   * `Ctrl+←/→`  字幕延迟（字幕不同步是最常见的那个）
+        //   * `Alt+←/→`   音频延迟（音频比字幕更容易被用户自己察觉）
+        _ if ctrl && key(VK_LEFT.0) => {
+            (*app_ptr).nudge_delay(true, -DELAY_STEP);
+            true
+        }
+        _ if ctrl && key(VK_RIGHT.0) => {
+            (*app_ptr).nudge_delay(true, DELAY_STEP);
+            true
+        }
+        _ if alt && key(VK_LEFT.0) => {
+            (*app_ptr).nudge_delay(false, -DELAY_STEP);
+            true
+        }
+        _ if alt && key(VK_RIGHT.0) => {
+            (*app_ptr).nudge_delay(false, DELAY_STEP);
+            true
+        }
+        _ if shift && key(VK_LEFT.0) => {
+            (*app_ptr).set_ab_a();
+            true
+        }
+        _ if shift && key(VK_RIGHT.0) => {
+            (*app_ptr).set_ab_b();
             true
         }
         _ if key(VK_LEFT.0) => {
@@ -2936,6 +3190,12 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
         // 循环，「关闭字幕」仍然只在菜单里选。
         _ if key(VK_J.0) => {
             (&mut *app_ptr).cycle_track(TrackKind::Sub, -1);
+            true
+        }
+        // `Shift+L` = 清除 A-B 循环。放在 `key(VK_L)` 之前，
+        // 否则 Shift 会被吃掉、变成「下一条字幕轨」
+        _ if shift && key(VK_L.0) => {
+            (*app_ptr).clear_ab_loop();
             true
         }
         _ if key(VK_L.0) => {
@@ -3137,6 +3397,10 @@ fn show_context_menu(app_ptr: *mut App) {
             advanced: app.state.advanced,
             sub_codepage: &app.state.sub_codepage,
             sub_scale: app.state.sub_scale,
+            ab_set: app.state.ab_a.is_some(),
+            ab_active: app.state.ab_a.is_some() && app.state.ab_b.is_some(),
+            sub_delay: app.state.sub_delay,
+            audio_delay: app.state.audio_delay,
             tracks: &app.tracks,
         };
         menu::show(app.hwnd, sx, sy, &app.strings, snap)
@@ -3236,6 +3500,15 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
         id::PREV => app.step_playlist(false),
         id::ADVANCED => app.toggle_advanced(),
         id::PLAY_FROM_BEGINNING => app.restart_from_beginning(),
+        id::AB_SET_A => app.set_ab_a(),
+        id::AB_SET_B => app.set_ab_b(),
+        id::AB_CLEAR => app.clear_ab_loop(),
+        id::SUB_DELAY_INC => app.nudge_delay(true, DELAY_STEP),
+        id::SUB_DELAY_DEC => app.nudge_delay(true, -DELAY_STEP),
+        id::SUB_DELAY_RESET => app.reset_delay(true),
+        id::AUDIO_DELAY_INC => app.nudge_delay(false, DELAY_STEP),
+        id::AUDIO_DELAY_DEC => app.nudge_delay(false, -DELAY_STEP),
+        id::AUDIO_DELAY_RESET => app.reset_delay(false),
         _ => {}
     }
 }
