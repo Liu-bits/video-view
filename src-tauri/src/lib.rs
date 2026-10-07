@@ -21,6 +21,7 @@ pub mod lang;
 pub mod menu;
 pub mod mpv;
 pub mod playlist;
+pub mod resume;
 pub mod settings;
 mod surface;
 pub mod track;

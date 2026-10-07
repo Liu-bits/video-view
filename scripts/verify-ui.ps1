@@ -95,6 +95,10 @@ public class VV {
   [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, IntPtr e);
   // 面板那节用它直接发按键（keybd_event 送不进字母键，见 Send-KeyMsg 的说明）
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+      // `WM_CLOSE` 用 PostMessage 而不是 SendMessage：SendMessage 会**同步**等
+      // 目标窗口处理完，而这里的处理链是 DestroyWindow -> 消息循环退出 ->
+      // 落盘设置与播放位置，顺手一改就会把调用线程一起拖进清理流程里。
+      [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
   // 右键菜单：#32768 是 Win32 菜单窗口的类名。用类名找而不是枚举全部顶层
@@ -995,6 +999,52 @@ try {
     Add-Result "escEscapesTheatreAfterPanel" ($vrD0.vh -gt $vrD1.vh) `
         ("影院 {0} -> Esc 一次 -> {1}（应当退出影院；死锁时这里会相等）" -f $vrD0.vh, $vrD1.vh)
 
+# ---- 倍速标签：1.0 时不画，改了倍速要看得见 ------------------------------
+    #
+    # 0.7.0 把倍速改成「记住」，可它在整个界面上一个像素都不显示 ——
+    # 按了 `]` 用户看不到变化，重启后倍率不同也无从察觉。这一版给控制栏
+    # 加了 `1.25x` 这样的标签（`Layout::speed`），这里钉住它真的会画。
+    #
+    # 比的是**控制栏下半部分**（进度条以下）而不是整条控制栏：进度条上
+    # 有正在走的填充和两个一直在跳的时间码，拿整条比的话每次都是 100% 差异，
+    # 什么都能「通过」。
+    #
+    # 只按一次 `]`：从 1.0 变成 1.25，标签从无到有，是最大的信号。
+    # 结束时按 `[` 按回去 —— 后面还要关窗写播放位置，倍率会影响那一步的
+    # 耗时（1.25 倍下 4 秒要走 5 秒画面），虽然不影响正确性，但让整轮
+    # 的时间可预期一点。
+    $bandY = $trackCY + 6
+    $bandH = [math]::Max(0, ($ch - $bandY) - 2)
+    # `PixDiff` 的坐标是**位图**坐标，不是客户区坐标 —— 标题栏加边框要
+    # 自己加上（`$oy`）。漏掉的话会往上偏一整条标题栏的高度，采到的是
+    # 画面区，而画面区在这两帧之间恰好几乎不变，于是差异率是 0，
+    # 看起来像「标签没画」。
+    $bmpSpdA = Grab $main
+    Send-KeyMsg $main 0xDC   # VK_OEM_5 = `]`
+    Start-Sleep -Seconds 2
+    Force-Foreground $main
+    $bmpSpdB = Grab $main
+    $diffSpd = PixDiff $bmpSpdA $bmpSpdB $ox ($bandY + $oy) $cw $bandH 2
+    $bmpSpdA.Dispose()
+    Add-Result "speedLabelShows" ($diffSpd -gt 0.05) `
+        ("按 ] 之后控制栏下半部分差异率 {0}%（倍速从 1.00x 变成别的，应当出现标签）" -f $diffSpd)
+    # 顺手留一张 `1.25x` 的控制栏截图：像素判据只说「那一块变了」，
+    # 变出来的东西是不是 `1.25x` 这三个字，脚本答不了 —— 得能看。
+    # 所以这张图是在**标签还在**的时候抓的，抓完再把倍速按回去。
+    #
+    # **不要**为了「这一段是一组」而给它套上 `{ }`。PowerShell 里裸的
+    # `{ ... }` 是**脚本块字面量**，不是语句块：它不会被执行，而是被写到
+    # 输出管道里（`ToString()` 出来正好是那几行源码）。症状很怪 ——
+    # 控制台里会看到那几行代码被原样打印出来，而里面的
+    # `Write-Host` 一声不吭。
+    $sd = Join-Path $PSScriptRoot "..\artifacts\ui-shots"
+    New-Item -ItemType Directory -Path $sd -Force | Out-Null
+    $bmpSpdB.Save((Join-Path $sd "controls-speed.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+    Write-Host "  speed screenshot -> controls-speed.png"
+    $bmpSpdB.Dispose()
+    Send-KeyMsg $main 0xDB   # VK_OEM_4 = `[`，按回去
+    Start-Sleep -Seconds 2
+
     # 把面板状态落成截图，人工看一眼内容对不对
     Send-KeyMsg $main 0x54
     Start-Sleep -Seconds 2
@@ -1010,6 +1060,155 @@ try {
         $pair[1].Dispose()
     }
     Write-Host ("  screenshots -> {0}" -f (Resolve-Path $shotDir))
+
+    # ---- 播放位置记忆 ----------------------------------------------------
+    #
+    # 这一项专门防**静默失效**：播放位置的写盘失败是 `let _ = std::fs::write`,
+    # 出错也不吭声，界面上看不出任何区别 —— 而用户看到的现象是「这个软件
+    # 好像不记得我看到哪儿了」，没有任何线索指向真正的原因。
+    #
+    # 0.7.0 开发时这里真的挂过一次：`crashlog::appdata_dir()` 已经拼了一层
+    # `VideoView`，`resume::default_path` 又拼了一层，写盘路径成了
+    # `…\VideoView\VideoView\resume.txt`，每次都 `NotFound`。上面 35 项
+    # 全绿 —— 因为没有一项与它有关。
+    #
+    # 判据是「正常关窗之后文件存在且非空」。整轮跑下来早就超过 30 秒，
+    # 当前位置必然大于 `MIN_SECONDS`（2 秒），所以空文件就一定是坏了。
+    #
+    # **必须走正常关窗**（`WM_CLOSE`）而不是 `Remove-Proc` 强杀：退出时那次
+    # 强制写盘是 `WM_CLOSE` 之后才跑的，强杀根本到不了那里。
+    $resumeFile = Join-Path $env:LOCALAPPDATA "VideoView\resume.txt"
+    # 先删掉旧的，免得读到上一轮的残留而假通过
+    Remove-Item -LiteralPath $resumeFile -Force -ErrorAction SilentlyContinue
+    [VV]::PostMessageW($main, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+    $gone = $proc.WaitForExit(20000)
+    Add-Result "resumeWrittenOnExit" ($gone -and (Test-Path -LiteralPath $resumeFile)) `
+        ("正常关窗={0}，{1} {2}" -f $gone, $resumeFile, $(if (Test-Path -LiteralPath $resumeFile) { "大小 $((Get-Item -LiteralPath $resumeFile).Length)" } else { "不存在" }))
+    # 判据只是「文件存在」而不是「非空」：整轮跑下来播放列表已经播到
+    # 末尾，当前项的位置会落进 `TAIL_SECONDS`(30s) 里被 `decide` 判成
+    # 「看完了」，那一条记录**本来就该被删掉** —— 于是合法地写出 0 字节。
+    # 「内容里确实有能用的条目」由下面 `resumeSeeksBack` 验。
+
+    # ---- 续播真的会跳回去吗 -------------------------------------------------
+    #
+    # 上面那条只证明「位置写下来了」，没证明「下次打开会跳过去」。这一条
+    # 补上后半截：把**同一个文件开两次**比进度条 ——
+    #   * 一次留着记忆文件（应当跳到上次的位置）
+    #   * 一次删掉记忆文件（必然从头）
+    #
+    # 比的是**百分比**而不是像素：两次启动的窗口几何可能差几个 DIP，
+    # 像素偏移会把结论搅浑。
+    #
+    # 刻度为什么取 2.0%：续播位置最小时是 `MIN_SECONDS` = 2 秒，而素材
+    # 是 60 秒，所以理论下限就是 2/60 ≈ 3.3%。留一点余量，够用又不
+    # 会把「其实没跳」那种差 1% 的情况放过去。
+    function Measure-FillPercent($h) {
+        $wr2 = Get-Rect $h
+        $org2 = New-Object VV+POINT
+        [VV]::ClientToScreen($h, [ref]$org2) | Out-Null
+        $cr2 = New-Object VV+RECT
+        [VV]::GetClientRect($h, [ref]$cr2) | Out-Null
+        $cw2 = $cr2.Right - $cr2.Left
+        $ch2 = $cr2.Bottom - $cr2.Top
+        $d2 = [double][VV]::GetDpiForWindow($h)
+        # 与 ui.rs 的 Layout 常量一致（见上面「几何」那一段的同一组数）
+        $padX2 = [int][math]::Round(10 * $d2 / 96.0)
+        $padTop2 = [int][math]::Round(6 * $d2 / 96.0)
+        $trackH2 = [int][math]::Round(16 * $d2 / 96.0)
+        $timeW2 = [int][math]::Round(52 * $d2 / 96.0)
+        $gap2 = [int][math]::Round(8 * $d2 / 96.0)
+        $trackCY2 = ($ch2 - [int][math]::Round(62 * $d2 / 96.0)) + $padTop2 + [int]($trackH2 / 2)
+        $seekX2 = $padX2 + $timeW2 + $gap2
+        $seekR2 = $cw2 - $padX2 - $timeW2 - $gap2
+        $bmp2 = Grab $h
+        $right2 = -1
+        for ($x = $seekX2 + ($org2.X - $wr2.Left); $x -lt ($seekR2 + ($org2.X - $wr2.Left)); $x++) {
+            $c = $bmp2.GetPixel($x, $trackCY2 + ($org2.Y - $wr2.Top))
+            if ($c.R -ge 180 -and $c.G -ge 90 -and $c.G -le 220 -and $c.B -le 80) { $right2 = $x - ($org2.X - $wr2.Left) }
+        }
+        $bmp2.Dispose()
+        if ($right2 -lt 0) { return -1.0 }
+        return [math]::Round(100.0 * ($right2 - $seekX2) / ($seekR2 - $seekX2), 1)
+    }
+
+    # 从记忆文件里挑出**第一条路径真的还在**的记录。
+    # 格式是「<路径字节数> <秒数>」一行、路径原文一行，两行一条。
+    $resumePath = $null
+    $resumeSecs = 0.0
+    if (Test-Path -LiteralPath $resumeFile) {
+        # **按字节读，不按行读。** 格式是「<路径字节数> <秒数>\n<路径原文>\n」，
+        # 而 Windows 允许文件名里有换行 —— `Get-Content` 会把那一条切成
+        # 三行，后面的记录全部错位。解析器必须跟被测格式用同一套假设。
+        $bytes = [System.IO.File]::ReadAllBytes($resumeFile)
+        $i = 0
+        while ($i -lt $bytes.Length) {
+            # 1. 路径字节数 + 空格
+            $sp = -1
+            for ($j = $i; $j -lt $bytes.Length; $j++) {
+                if ($bytes[$j] -eq 0x20) { $sp = $j; break }
+            }
+            if ($sp -lt 0) { break }
+            $n = 0
+            if (-not [int]::TryParse(
+                    [System.Text.Encoding]::ASCII.GetString($bytes, $i, $sp - $i),
+                    [ref]$n)) { break }
+            # 2. 秒数 + 换行
+            $nl = -1
+            for ($j = $sp + 1; $j -lt $bytes.Length; $j++) {
+                if ($bytes[$j] -eq 0x0A) { $nl = $j; break }
+            }
+            if ($nl -lt 0) { break }
+            $sv = 0.0
+            if (-not [double]::TryParse(
+                    [System.Text.Encoding]::ASCII.GetString($bytes, $sp + 1, $nl - $sp - 1),
+                    [ref]$sv)) { break }
+            # 3. 路径原文（UTF-8）+ 结尾换行
+            $ps = $nl + 1
+            $pe = $ps + $n
+            if (($pe + 1) -gt $bytes.Length) { break }
+            $cand = [System.Text.Encoding]::UTF8.GetString($bytes, $ps, $n)
+            $i = $pe + 1
+            # 4. **选秒数最大的那一条**，而不是第一条
+            #
+            # 默认素材是三个文件，其中 `h264.mp4` / `h264.mkv` 只有几秒。
+            # 短文件的位置必然落进 `TAIL_SECONDS`(30s) 里被 `decide` 判成
+            # 「看完了」而删掉，所以它们通常不在表里；但只要有一条残留，
+            # 「第一条」就可能正好是它 —— 那时两边都从头播，差异 0，
+            # 得到一个「续播坏了」的错误结论。
+            # 位置最大的那条最可能来自长文件，也就最可能落在可跳的区间里。
+            if ((Test-Path -LiteralPath $cand) -and $sv -gt $resumeSecs) {
+                $resumePath = $cand
+                $resumeSecs = $sv
+            }
+        }
+    }
+
+    if (-not $resumePath) {
+        Add-Result "resumeSeeksBack" $false `
+            ("记忆文件里没有可用的条目（{0}）—— 位置压根没记下来，后半截无从验证" -f $resumeFile)
+    } else {
+        # 等 4 秒：够 mpv 起播并把进度条画出来，又保证「续播位置 + 4 秒」
+        # 不会超过 60 秒素材的时长（`resume_to` 已经把 ≥55 秒的记录拒掉，
+        # 55+4 = 59 < 60）。等更久的话文件会播完、进度条被清空，
+        # 量到 -1，得到的结论是假的。
+        $pA = Start-Process -FilePath $Exe -ArgumentList "`"$resumePath`"" -PassThru
+        Start-Sleep -Seconds 4
+        $pA.Refresh()
+        $fillResume = Measure-FillPercent $pA.MainWindowHandle
+        Remove-Proc $pA
+
+        Remove-Item -LiteralPath $resumeFile -Force -ErrorAction SilentlyContinue
+        $pB = Start-Process -FilePath $Exe -ArgumentList "`"$resumePath`"" -PassThru
+        Start-Sleep -Seconds 4
+        $pB.Refresh()
+        $fillFresh = Measure-FillPercent $pB.MainWindowHandle
+        Remove-Proc $pB
+
+        Write-Host ("  resume {0}: 带记忆 {1}% / 从头 {2}%（记忆位置 {3}s）" -f $resumePath, $fillResume, $fillFresh, $resumeSecs)
+        Add-Result "resumeSeeksBack" ([math]::Abs($fillResume - $fillFresh) -gt 2.0 -and $fillResume -gt 0 -and $fillFresh -gt 0) `
+            ("同一个文件：带记忆 {0}% vs 从头 {1}%（记忆位置 {2}s，差 {3}%，应当 > 2）" -f `
+                $fillResume, $fillFresh, $resumeSecs, [math]::Abs($fillResume - $fillFresh))
+    }
 
 } catch {
     # 记下来，不直接抛。

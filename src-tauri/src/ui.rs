@@ -85,6 +85,11 @@ const BTN_PAD_Y_DIP: i32 = 5;
 /// 时间码列宽下限。实际宽度取「实测 `88:88:88` 宽」与它的较大者，
 /// 这样 h:mm:ss 也不会被切。
 const TIME_W_DIP: i32 = 52;
+/// 倍速标签的宽度（DIP）。
+///
+/// 按 `sanitized` 允许的最宽值 `16.00x` 加余量算的。给窄了的话
+/// `text_center` 会截断成「16.0…」，那比不显示更难懂。
+const SPEED_W_DIP: i32 = 48;
 const VOL_W_DIP: i32 = 96;
 const SLIDER_THICK_DIP: i32 = 3;
 const THUMB_DIP: i32 = 11;
@@ -171,6 +176,17 @@ pub struct Layout {
     pub btn_play: RECT,
     pub btn_stop: RECT,
     pub file_name: RECT,
+    /// 倍速标签的位置（`file_name` 右边切出来的一块，宽度 `SPEED_W_DIP`）。
+    ///
+    /// **矩形本身是有宽度的**，`1.0` 倍时只是**不往里画东西**。这么区分是
+    /// 必要的：块状布局里「空的」很容易被读成「零宽」，而零宽会让下面
+    /// 那个「三组控件之间留组间距」的断言算错 —— 中间那块的右边缘到底是
+    /// `file_name.right` 还是 `speed.right`，差别正好是一个 `SPEED_W_DIP`。
+    ///
+    /// 不画而不是画成灰色 / 画成 1.00x，是因为绝大多数人不会改倍速，
+    /// 界面上多一行字对那些人只是噪音。真要改倍速的人按 `[` / `]` 之后
+    /// 才需要知道自己调到了哪，而那一行字就在他刚才看的地方。
+    pub speed: RECT,
     pub mute: RECT,
     pub volume: RECT,
     /// 影院模式下控制栏高度为 0，视频区占满整个客户区。
@@ -316,6 +332,17 @@ impl Layout {
         // 窗口窄到放不下时文件名区域消失，而不是把左右两组挤到重叠。
         let file_left = left_end + cluster_gap;
         let file_right = (right_start - cluster_gap).max(file_left);
+        // 倍速标签从文件名那一块的**右端**切出去，而不是新开一列 ——
+        // 控制栏的横向已经排满了（按钮 / 文件名 / 静音 / 音量），
+        // 新开一列会把音量挤到边上，而文件名会被压得只剩几个字。
+        //
+        // 给 `SPEED_W_DIP` 是按「1.25x」到「16.00x」里最宽的那个留的，
+        // 加上一点余量。切掉之后 `file_name` 仍然有 `max(file_left)`
+        // 兜底，窗口极窄时退化成一个 0 宽的矩形而不是负宽。
+        let speed_w = px(SPEED_W_DIP, dpi);
+        let speed_left = (file_right - speed_w).max(file_left);
+        let speed = rect(speed_left, btn_y, file_right - speed_left, btn_h);
+        let file_right = speed_left;
         let file_name = rect(file_left, btn_y, file_right - file_left, btn_h);
 
         // 影院模式下控制栏整体收起，但仍然给出一个「不在屏幕上」的矩形，
@@ -361,6 +388,7 @@ impl Layout {
             btn_play,
             btn_stop,
             file_name,
+            speed,
             mute,
             volume,
             theatre,
@@ -643,6 +671,19 @@ pub struct PaintState<'a> {
     pub muted: bool,
     pub loaded: bool,
     pub title: &'a str,
+    /// 当前倍速。**1.0 时不画** —— 见 `Layout::speed` 的说明。
+    pub speed: f64,
+    /// 盖在文件名位置上的瞬时提示（比如「已从上次的位置继续 12:34」）。
+    ///
+    /// 非空时**优先于** `title` 显示，4 秒后由 `App` 清空。
+    ///
+    /// 放在这里而不是弹对话框，是因为「已从上次的位置继续」这条信息
+    /// **不该抢走焦点**：它出现在用户刚打开文件的瞬间，那一刻用户往往
+    /// 已经在按空格或者拖进度条了。模态 `MessageBox` 会把那些键吃掉
+    /// —— `verify-ui.ps1` 里就是这么发现的：`clickPause` / `spacePause`
+    /// / `seekFwd` 连挂 12 项，每一项都**晚生效一拍**，因为那个框一直
+    /// 挡在前面直到被下一次按键关掉。
+    pub notice: &'a str,
     /// 正在拖动进度条：此时进度由鼠标位置决定，不跟随播放进度。
     pub dragging_seek: bool,
     /// 拖动时显示的秒数。
@@ -1136,10 +1177,19 @@ pub fn paint(
             !s.loaded,
         );
 
-        let name = if s.loaded { s.title } else { "" };
+        let name = if !s.notice.is_empty() {
+            s.notice
+        } else if s.loaded {
+            s.title
+        } else {
+            ""
+        };
         if !name.is_empty() {
             // 居中而不是右对齐：右对齐会让文件名贴着「音量」那组，两团文字
             // 挤在窗口右端，左边又空一大片。
+            //
+            // 瞬时提示用同一个位置、同一套排版：它就是要「顶替文件名」
+            // 出现几秒的位置，跳到别处反而让人多看一处才能反应过来。
             text_center_ellipsis(hdc, theme.fonts.mono, C_DIM, name, &layout.file_name);
         }
 
@@ -1149,6 +1199,24 @@ pub fn paint(
             s.strings.mute_off
         };
         text_center(hdc, theme.fonts.ui, C_DIM, mute_label, &layout.mute);
+
+        // 倍速。**1.0 时一个像素都不画** —— 默认状态保持原样，
+        // 而真正需要它的人（按过 `[` / `]` 的）一眼就能看到自己调到了哪。
+        //
+        // 用 mono 字体：倍速是数字，与旁边的时间码同字体，读起来是一套的。
+        //
+        // 两位小数是刻意的：`1.25` 要看得见，`1.5625`（连按两次 `]`）
+        // 会显示成 `1.56`，而用户心里算的是 1.5625 —— 但 `SPEED_FACTOR`
+        // 是 1.25，两次是 1.5625，三位才准。这里给两位：1.56 与 1.5625
+        // 对「我现在大概是 1.6 倍」这个用途没有区别，而三位在 26 DIP 高的
+        // 标签里会挤到换行。
+        if (s.speed - 1.0).abs() > 1e-6 {
+            let (buf, n) = speed_label_buf(s.speed);
+            // 只可能是 ASCII 数字 / `.` / `x`，`from_utf8` 不会失败；
+            // `unwrap_or` 只是不想在这里 panic
+            let label = std::str::from_utf8(&buf[..n]).unwrap_or("x");
+            text_center(hdc, theme.fonts.mono, C_ACCENT, label, &layout.speed);
+        }
 
         draw_slider(
             hdc,
@@ -1500,6 +1568,64 @@ unsafe fn stroke(hdc: HDC, theme: &mut Theme, rect: &RECT, color: COLORREF) {
 }
 
 /// 在矩形里画居中单行文字。
+/// 把倍速格式化成 `1.25x` 这样的标签，**写进栈上的缓冲**，不分配。
+///
+/// 返回 `(缓冲, 有效长度)`。调用方自己 `from_utf8` 一下就能拿到 `&str`。
+///
+/// ## 为什么要手写而不是 `format!("{:.2}x", speed)`
+///
+/// `draw_controls` 每帧调一次，倍速 ≠ 1.0 的用户每次重绘都要付一次堆分配。
+/// 项目在 `app.rs` 里立过这条规矩（「布局在绘制之前算好，行数必须是能免费
+/// 拿到的常量，否则每帧一次堆分配」），`panel_rows` 缓存就是为了那个规矩。
+///
+/// ## 为什么两位小数够
+///
+/// `SPEED_FACTOR` 是 1.25，连按两次得到 `1.5625`。显示成 `1.56` 对
+/// 「我大概在 1.6 倍」这个用途没有区别，而三位在 26 DIP 高的标签里会挤到
+/// 换行。
+///
+/// 缓冲 8 字节：整数部分两位 + 小数点 + 两位小数 + `x` = 6，留 2 字节余量。
+/// 上界靠 `settings::sanitized` 把倍速夹在 16 以内 —— 这一段**不自己夹**，
+/// 多一份夹取定义就多一处会跟别处不一致的地方（那种不一致的现场是
+/// 「界面显示 1.0 倍、实际 3 倍」）。夹不住的输入（NaN / 负数 / 极大）
+/// 在这里退化成 `0.00x`，而那条路径上 `sanitized` 已经先夹过一次了。
+fn speed_label_buf(speed: f64) -> ([u8; 8], usize) {
+    let mut buf = [b' '; 8];
+    // 先夹再转。
+    //
+    // **这一步不能省。** Rust 的 `as i64` 是**饱和**转换：`f64::INFINITY
+    // as i64` 得到 `i64::MAX`（不是 0），于是下面的
+    // `b'0' + (whole / 10) as u8` 会在 debug 下「attempt to add with
+    // overflow」直接 panic。写这个函数时我一度在注释里断言「`as i64` 对
+    // NaN / inf / 负数都给 0」—— 那是不对的，只有 NaN 才给 0。
+    //
+    // 夹的上界 16.00 与 `settings::sanitized` 一致。两边都要有：那边防的是
+    // 「注册表里被手改成 1000 倍速」，这边防的是「`PaintState` 被绕过
+    // `sanitized` 直接构造」（集成测试就是那么干的）。`NaN` 过不了
+    // `clamp`，而 `NaN as i64` 恰好是 0，所以落到 `0.00x`。
+    let hundredths = (speed * 100.0).round().clamp(0.0, 1600.0) as i64;
+    let whole = hundredths / 100;
+    let frac = hundredths % 100;
+    let mut n;
+    if whole >= 10 {
+        buf[0] = b'0' + (whole / 10) as u8;
+        buf[1] = b'0' + (whole % 10) as u8;
+        n = 2;
+    } else {
+        buf[0] = b'0' + whole as u8;
+        n = 1;
+    }
+    buf[n] = b'.';
+    n += 1;
+    buf[n] = b'0' + (frac / 10) as u8;
+    n += 1;
+    buf[n] = b'0' + (frac % 10) as u8;
+    n += 1;
+    buf[n] = b'x';
+    n += 1;
+    (buf, n)
+}
+
 unsafe fn text_center(hdc: HDC, font: HFONT, color: COLORREF, text: &str, rect: &RECT) {
     text_in(
         hdc,
@@ -2196,6 +2322,47 @@ mod tests {
     /// 视觉重心全压在左侧。改版之后文件名是中间那一整段（有内容居中画），
     /// 三组均匀分布。
     #[test]
+    fn 倍速标签的格式() {
+        let s = |v: f64| {
+            let (b, n) = speed_label_buf(v);
+            std::str::from_utf8(&b[..n]).unwrap().to_string()
+        };
+        // 连按 `]` 的实际取值：SPEED_FACTOR = 1.25
+        assert_eq!(s(1.25), "1.25x");
+        assert_eq!(s(1.5625), "1.56x");
+        assert_eq!(s(1.953125), "1.95x");
+        // 单个数字与整倍速
+        assert_eq!(s(0.5), "0.50x");
+        assert_eq!(s(2.0), "2.00x");
+        // 两位整数 —— 这是「整数部分固定两位」那种写法最容易漏的一档
+        assert_eq!(s(10.0), "10.00x");
+        assert_eq!(s(16.0), "16.00x");
+        // 四舍五入而不是截断。
+        //
+        // **不要用 `1.005`**：`1.005 * 100.0` 在 f64 里是
+        // `100.49999999999999`，round 之后还是 100 —— 那测的是浮点表示，
+        // 不是这段代码。这里挑的是「乘 100 之后小数部分明确在 0.5 以上」
+        // 的值。
+        assert_eq!(s(1.006), "1.01x");
+        assert_eq!(s(1.994), "1.99x");
+        // 非法输入不 panic：NaN / 负数落到下界，`inf` 落到上界。
+        //
+        // `inf` 落在上界而不是下界，是因为 `as i64` 是**饱和**转换 ——
+        // `f64::INFINITY as i64` 是 `i64::MAX`，不夹的话
+        // `b'0' + (whole / 10) as u8` 会溢出 panic。
+        assert_eq!(s(f64::NAN), "0.00x");
+        assert_eq!(s(-3.0), "0.00x");
+        assert_eq!(s(f64::INFINITY), "16.00x");
+        assert_eq!(s(1e18), "16.00x", "超出夹取上界的应当被夹住");
+        // 缓冲不会溢出
+        for v in [0.0, 0.0625, 1.0, 9.999, 16.0, 99.0, 999.0, 1e18] {
+            let (_, n) = speed_label_buf(v);
+            assert!(n <= 8, "v={v} 时标签长度 {n} 超出了缓冲");
+            assert!(n >= 4, "v={v} 时标签长度 {n} 短得不对劲");
+        }
+    }
+
+    #[test]
     fn 三组控件分布均匀且不重叠() {
         for lang in [lang::Lang::ZhCn, lang::Lang::En] {
             let l = Layout::new(1375, 900, 120, false, 0, &metrics_for(lang));
@@ -2207,7 +2374,25 @@ mod tests {
             assert_eq!(l.btn_stop.left - l.btn_play.right, small);
             // 组间：按钮组 -> 文件名、音量组 -> 文件名，各留一个组间距
             assert_eq!(l.file_name.left - l.btn_stop.right, gap);
-            assert_eq!(l.mute.left - l.file_name.right, gap);
+            // 中间那一块的**右边缘**是倍速标签而不是文件名了 —— 倍速标签
+            // 是从文件名里切出来的（见 `Layout::new`）。所以这里比的是
+            // `speed.right`：用 `file_name.right` 会差出一个 `SPEED_W_DIP`
+            // 的宽度，看起来像「组间距被改小了」。
+            assert_eq!(
+                l.mute.left - l.speed.right,
+                gap,
+                "{lang:?} 下中间块与音量组之间的间距不对（{}-{}）",
+                l.mute.left,
+                l.speed.right
+            );
+            // 倍速标签正好是从文件名的右端切出去的宽度，不多不少
+            assert_eq!(
+                l.speed.right - l.file_name.right,
+                px(SPEED_W_DIP, 120),
+                "倍速标签不该比预留的宽度更宽或更窄"
+            );
+            assert_eq!(l.speed.top, l.file_name.top);
+            assert_eq!(l.speed.bottom, l.file_name.bottom);
             // 组内：静音标签与音量滑块
             assert_eq!(l.volume.left - l.mute.right, small);
 

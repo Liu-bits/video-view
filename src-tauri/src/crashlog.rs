@@ -274,6 +274,19 @@ fn local_appdata() -> Option<PathBuf> {
     Some(PathBuf::from(v))
 }
 
+/// `%LOCALAPPDATA%\VideoView`，顺带把目录建出来。
+///
+/// 给「按文件记播放位置」用 —— 那个文件不该放在 `Program Files` 下：
+/// 写一个便利功能不该要管理员权限，而且程序目录升级时会被覆盖掉。
+///
+/// 返回 `None` 表示「拿不到 `%LOCALAPPDATA%` 或建不了目录」。调用方
+/// 必须把这件事**安静地跳过**：记忆位置是便利功能，存不了就不记，
+/// 不能因此拦住用户看片。
+pub fn appdata_dir() -> Option<PathBuf> {
+    let dir = local_appdata()?.join("VideoView");
+    ensure_dir(&dir).then_some(dir)
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

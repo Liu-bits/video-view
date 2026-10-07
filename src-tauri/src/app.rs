@@ -16,6 +16,7 @@
 //! 之后所有 Win32 坐标都是物理像素。`ui` 里按 DPI 做 DIP->像素换算，字体按
 //! 同一 DPI 重建，系统缩放是 100% / 125% / 150% / 200% 都不用额外配置。
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -72,6 +73,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::menu;
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
 use crate::playlist::{self, file_title, is_subtitle_path, Playlist, PlaylistRow};
+use crate::resume;
 use crate::surface;
 use crate::ui::{self, Hit, Layout, PaintState, Panel};
 
@@ -140,6 +142,19 @@ const VOLUME_STEP: f64 = 5.0;
 /// 乘而不是加减：倍速是乘性感知（0.5 → 1.0 → 2.0），
 /// 加减法在 1.0 附近会给出 1.05 这种没人要的速度。
 const SPEED_FACTOR: f64 = 1.25;
+
+/// 播放位置记忆的写盘节流（毫秒）。
+///
+/// `tick` 每 250ms 触发一次，不节流就是每秒 4 次写盘。3 秒的间隔在
+/// 「关掉播放器前记的位置最多差 3 秒」与「写盘频率」之间取平衡 ——
+/// 差 3 秒的位置对「接着看」这个用途完全够用。
+const RESUME_INTERVAL_MS: u128 = 3000;
+
+/// 控制栏瞬时提示停留多久（毫秒）。
+///
+/// 给 4000：够读完一句「已从上次的位置继续 12:34」，又不至于在用户
+/// 盯着画面时一直挂着一行字把文件名挡掉。
+const NOTICE_MS: std::time::Duration = std::time::Duration::from_millis(4000);
 
 /// 嵌入 exe 的图标资源 id，与 assets/app.rc 里的 `IDI_APP_ICON` 对应。
 ///
@@ -463,6 +478,33 @@ struct App {
     prefs_dirty: bool,
     /// 上次落盘的时刻，用于节流（拖动音量不该写几十次注册表）。
     prefs_last_flush: std::time::Instant,
+    /// 「上次播到哪儿」的整张表。启动时读一次，之后按节流写回文件。
+    ///
+    /// **不**在每次切文件时重读：读是 O(n) 的线性扫描（`resume::parse`），
+    /// 而 `tick` 每 250ms 触发一次。
+    resume: HashMap<PathBuf, f64>,
+    /// 上次写 `resume` 的时刻，用于节流。
+    resume_last_write: std::time::Instant,
+    /// 这次启动**已经为哪个文件**恢复过位置了。
+    ///
+    /// 「从头播放」(`restart_from_beginning`) 会把它设成当前文件：那个动作
+    /// 的含义就是「这个文件从头看」，而删掉记录之后 `store_resume` 立刻会
+    /// 把位置 0 写回去（`TooEarly` → 不写，磁盘上那条也就没了）。如果这里
+    /// 不记一笔，下一轮 `FileLoaded` 会读到刚刚写回去的位置又跳一次。
+    ///
+    /// 注意它存的是**最后一个**文件，不是「本次启动恢复过的所有文件」。
+    /// A→B→A 的顺序下回到 A 会再跳一次 —— 而那是对的：A 在 B 播放期间被
+    /// `store_resume` 更新过，用户回到 A 时看到自己上次的落点是合理的。
+    resume_done_for: Option<PathBuf>,
+    /// 控制栏里顶替文件名显示几秒的瞬时提示。空串 = 不显示。
+    ///
+    /// 为什么要有这个：续播是**用户看不见原因**的动作 —— 打开文件，画面
+    /// 直接从上次的位置开始播，不解释的话用户只会以为「这软件乱跳」。
+    /// 但解释的方式不能是弹窗，见 `show_notice`。
+    notice: String,
+    /// 提示什么时候过期。用 `Option` 而不是「空串」单独表示「不显示」，
+    /// 是因为空串**同时**也可能是「要显示一个空提示」，那没有意义。
+    notice_until: Option<std::time::Instant>,
 }
 
 /// 排队等弹的错误提示上限。
@@ -501,6 +543,16 @@ impl App {
                 // 没有这个键）的高级项全都是可用的 —— 装好之后按 `I`
                 // 没反应那不是简化，是功能坏了。
                 advanced: prefs.advanced,
+                // 倍速 / 字幕大小 / 字幕编码也从设置里取。跟高级模式
+                // 同一个道理：**用户调过就是想要它**，每次启动重置成
+                // 默认值等于让用户每部片子都重新按一遍 `[`。
+                //
+                // 这三个只是先落到 `UiState`，真正推给 mpv 要等播放器
+                // 建好之后（`apply_media_prefs`）—— `player` 这时还是
+                // `None`。
+                speed: prefs.speed,
+                sub_scale: prefs.sub_scale,
+                sub_codepage: prefs.sub_codepage.clone(),
                 ..UiState::default()
             },
             dragging: Dragging::None,
@@ -540,6 +592,11 @@ impl App {
             prefs,
             prefs_dirty: false,
             prefs_last_flush: std::time::Instant::now(),
+            resume: HashMap::new(),
+            resume_last_write: std::time::Instant::now(),
+            resume_done_for: None,
+            notice: String::new(),
+            notice_until: None,
         }
     }
 
@@ -914,6 +971,33 @@ impl App {
         }
     }
 
+    /// 把记住的倍速 / 字幕大小 / 字幕编码推给刚建好的 mpv。
+    ///
+    /// 必须在**播放器建好之后**调：`App::new` 里 `player` 还是 `None`，
+    /// 而这三个都是 mpv 的属性。在 `App::new` 里设 `UiState` 只能让界面
+    /// 显示得对，mpv 那边还是默认值 —— 而「界面上写着 1.5 倍、实际 1.0 倍」
+    /// 比什么都不做更糟，因为用户会以为是自己记错了。
+    fn apply_media_prefs(&mut self) {
+        let Some(p) = self.player.as_ref() else {
+            return;
+        };
+        // 三条都是「设不进去也不该拦住用户」：编码名可能在新版 mpv 里
+        // 不存在了，字幕大小可能被容器里的硬字幕覆盖。失败就保持 mpv 的
+        // 默认值，不弹错误框 —— 用户没做错任何事。
+        // 走 `App` 自己的那几个 setter 而不是直接打 mpv 属性：
+        // 字幕编码要跟一次 `sub-reload` 才真正生效，那一步在 setter 里
+        // （而 `sub-reload` 在没有文件时会被 setter 跳过）。
+        if let Err(e) = p.set_speed(self.state.speed) {
+            self.report_error(self.strings.err_command, &e);
+        }
+        self.set_sub_scale(self.state.sub_scale);
+        if !self.state.sub_codepage.is_empty() {
+            let cp = self.state.sub_codepage.clone();
+            self.set_sub_codepage(&cp);
+        }
+        self.invalidate_controls();
+    }
+
     /// 换字幕编码（`sub-codepage`）。
     ///
     /// ## 必须补一条 `sub-reload`
@@ -926,6 +1010,10 @@ impl App {
     /// （菜单项会打勾、`sub-codepage` 确实变了），只有真的拿一个 GBK 的
     /// `.srt` 去试才会发现字幕纹丝不动。
     fn set_sub_codepage(&mut self, code: &str) {
+        // 借用要分开拿：`p` 是 `&self.player` 的借用，而下面
+        // `prefs_touch_media` 要 `&mut self`。中间任何地方都夹一个
+        // `&mut self`（哪怕只是 `state.sub_codepage = ...`）都不行 ——
+        // 所以先 `set_string_property` 完就把借用丢掉，再改状态。
         let Some(p) = self.player.as_ref() else {
             return;
         };
@@ -933,10 +1021,20 @@ impl App {
             self.report_error(self.strings.err_set_sub_coding, &e);
             return;
         }
-        self.state.sub_codepage = code.to_string();
         // `sub-reload` 失败不算错：没有字幕可重载时它本来就会失败，
         // 而用户此时的期望是「设置成功」，不是「报一个错」。
-        let _ = p.run_command(&["sub-reload"]);
+        //
+        // **所以没有文件时干脆别发。** 只判断同步返回值是不够的 ——
+        // `run_command` 返回 `Err` 只是「命令被拒」，mpv 还会**另外**推一个
+        // `CommandError` 事件，而事件那侧会直接弹框（`MpvEventMessage::
+        // CommandError` -> `report_error`）。于是 `let _ =` 一点用都没有：
+        // 换编码时没加载文件，用户看到的是「刚打开程序就弹一个
+        // sub-reload 失败」，而他什么都还没做。
+        if self.state.has_file {
+            let _ = p.run_command(&["sub-reload"]);
+        }
+        self.state.sub_codepage = code.to_string();
+        self.prefs_touch_media();
     }
 
     /// 换字幕大小（`sub-scale`）。
@@ -963,6 +1061,7 @@ impl App {
             return;
         }
         self.state.sub_scale = v;
+        self.prefs_touch_media();
     }
 
     /// 把一个外挂字幕文件加载进来（拖放 / 文件对话框）。
@@ -1002,11 +1101,235 @@ impl App {
         self.replace_tracks(TrackSet::default());
     }
 
-    /// 面板内容，供 `paint` 用。
+    // ------------------------------------------------------------ 播放位置记忆
+
+    /// 启动时把位置表读进来。
+    ///
+    /// 读不到 / 读坏都**安静跳过** —— 位置记忆是便利功能，坏了不该
+    /// 拦住用户看片。`resume::parse` 本身也是「跳过坏行、保住好数据」。
+    fn load_resume(&mut self) {
+        let Some(dir) = crashlog::appdata_dir() else {
+            return;
+        };
+        let path = resume::file_in(&dir);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let mut map = resume::parse(&text);
+        // **不调 `resume::drop_missing`。**
+        //
+        // `is_file()` 在断开的状态上返回 false：U 盘没插、NAS 关机、
+        // `Z:` 映射盘未连接、网络盘 SMB 超时。那不是「文件没了」，只是
+        // 「现在看不到」—— 拿它当删除依据就是**永久丢数据**：条目被删掉，
+        // 随后的落盘把删减后的表写回去，等介质接回来时位置已经找不回。
+        //
+        // 另一个理由是**性能**：`load_resume` 跑在消息循环开始之前，
+        // 几百条记录全在断开的网络盘上时 `is_file()` 一格一格等 SMB 超时，
+        // 启动窗口能冻住几十秒。
+        //
+        // 文件大小靠 `prune` 的条数上限控制，那不依赖 IO。
+        resume::prune(&mut map, resume::MAX_ENTRIES);
+        self.resume = map;
+        self.resume_last_write = std::time::Instant::now();
+    }
+
+    /// 文件加载完之后跳到上次的位置。
+    ///
+    /// 只在 `FileLoaded` 时调。`resume_done_for` 记的是「这次启动已经为
+    /// 哪个文件恢复过了」—— 它的作用是让「从头播放」之后的那个文件不再又
+    /// 跳一次，而不是「一个文件一辈子只跳一次」。
+    fn maybe_resume(&mut self, path: &Path) {
+        if self.resume_done_for.as_deref() == Some(path) {
+            return;
+        }
+        self.resume_done_for = Some(path.to_path_buf());
+        let stored = self.resume.get(path).copied();
+        let duration = if self.state.duration > 0.0 {
+            Some(self.state.duration)
+        } else {
+            None
+        };
+        // 时长未知时**照样跳**。`resume_to` 对 `None` 时长不做片尾判断，只把
+        // 记录交出去 —— 因为 mpv 自己会把超时的落点夹回文件内，而「跳到
+        // 片尾」这件事 `seek_absolute` 已经通过 `clamp_seek_target` 防住了
+        // （时长未知时它不拿 0 当上界）。
+        //
+        // 不跳反而更糟：那等于「第一次打开不跳、下次打开才跳」，用户看到
+        // 的是同一个文件两次打开行为不一致。
+        let Some(target) = resume::resume_to(stored, duration) else {
+            return;
+        };
+        self.seek_absolute(target);
+        // **不是** `queue_notice`：那会弹模态 `MessageBox`，在「用户刚打开
+        // 文件、正准备按空格」的时刻抢走输入。实测把 `verify-ui.ps1` 的
+        // `clickPause` / `spacePause` / `seekFwd` 一起带崩 —— 每一项都晚
+        // 生效一拍，因为按键先被那个框吃掉了。
+        self.show_notice(format!(
+            "{} {}",
+            self.strings.info_resumed,
+            resume::format_position(target)
+        ));
+    }
+
+    /// 在控制栏的文件名位置显示一条瞬时提示，几秒后自动收回。
+    ///
+    /// **不要**用它来报需要用户处理的事 —— 那该走 `report_error`
+    /// （模态，有声，能被截图/日志抓到）。这个是「说一声就走」的：
+    /// 续播、字幕已加载这类**用户已经能自己看出来**的状态。
+    ///
+    /// 直接改 `notice` 是不够的：提示到期要自己消失，而界面只在
+    /// `invalidate` 之后才重绘，所以 `tick` 里必须盯着那个截止时刻。
+    fn show_notice(&mut self, text: String) {
+        self.notice = text;
+        self.notice_until = Some(std::time::Instant::now() + NOTICE_MS);
+        self.invalidate_controls();
+    }
+
+    /// 提示到期就收回文件名。每帧查一次，`Instant` 比较是纳秒级的读，
+    /// 而 `tick` 本来就每 250ms 跑一次，不构成负担。
+    fn expire_notice(&mut self) {
+        let Some(until) = self.notice_until else {
+            return;
+        };
+        if std::time::Instant::now() >= until {
+            self.notice.clear();
+            self.notice_until = None;
+            self.invalidate_controls();
+        }
+    }
+
+    /// 记下当前文件的位置（带节流 + 只在内容真的变了时写盘）。
+    ///
+    /// 由 `tick` 调用，而 `tick` 每 250ms 触发一次 —— 不节流的话就是
+    /// 每秒往磁盘写 4 次。3 秒的间隔在「关掉播放器前记的位置最多差 3 秒」
+    /// 与「写盘频率」之间取了个平衡。
+    ///
+    /// `force` 用于退出前那一次：那时不管距上次写过了多久都要写。
+    fn store_resume(&mut self, force: bool) {
+        if !force && self.resume_last_write.elapsed().as_millis() < RESUME_INTERVAL_MS {
+            return;
+        }
+        // 没在播的时候不记 —— 那时的 `position` 是 0 或者上一次文件的残留。
+        //
+        // 这里**刻意不更新** `resume_last_write`：打开文件之后的第一轮 tick
+        // 应当立刻落盘，而不是再等 3 秒。看起来像漏了，其实是「没在播的那些
+        // tick 什么都不该做」。
+        if !self.state.has_file {
+            return;
+        }
+        let p = self.playlist.current_item().path.clone();
+        self.resume_last_write = std::time::Instant::now();
+        let duration = if self.state.duration > 0.0 {
+            Some(self.state.duration)
+        } else {
+            None
+        };
+        // 「表有没有真的变」—— 不变就不重写整个文件。
+        //
+        // 为什么要在意：打开文件之后一路暂停不动的用户，会每 3 秒白写
+        // 一次 40 KB。而且写下去的文件内容逐字节相同，除了让 SSD 多磨损
+        // 之外没有任何意义。
+        let changed = match resume::decide(self.state.position, duration) {
+            resume::Keep::At(secs) => {
+                // 比较之后再 insert：无条件 insert 的话 map 的内容虽然
+                // 一样，但下面 `!changed` 的判断就永远不成立
+                if self.resume.get(&p) == Some(&secs) {
+                    false
+                } else {
+                    self.resume.insert(p, secs);
+                    true
+                }
+            }
+            resume::Keep::Finished => {
+                // 看到片尾了 = 看完了，这条记录该消失，下次从头放
+                self.resume.remove(&p).is_some()
+            }
+            // 片头：既不记也不删，表没动
+            resume::Keep::TooEarly => false,
+        };
+        if !changed && !force {
+            return;
+        }
+        // 运行期也裁一次。`prune` 只在 `load_resume` 调是不够的：一次长时间
+        // 开着、看过 600 个文件的会话里，表会无界增长，而 `MAX_ENTRIES` 的
+        // 文档承诺的是「最多 500 条」。
+        resume::prune(&mut self.resume, resume::MAX_ENTRIES);
+        let Some(dir) = crashlog::appdata_dir() else {
+            return;
+        };
+        self.write_resume_file(&resume::file_in(&dir));
+    }
+
+    /// 把整张表写回磁盘。**先写临时文件，再改名。**
+    ///
+    /// ## 为什么不直接 `fs::write`
+    ///
+    /// `fs::write` 是「截断 + 写」。中途断电 / 拔 U 盘 / 被同步盘抢占，
+    /// 留在磁盘上的是**前缀**。前缀本身能被 `parse` 读出来，看起来没事 ——
+    /// 真正的问题是 `serialize` 遍历 `HashMap`，而 `HashMap` 的迭代顺序
+    /// **每次进程都不同**，所以丢掉的是**随机的一半**，不是「最近没写的那一条」。
+    /// 下一次启动读到这个残缺文件，又把它原样写回去，**丢失就此固化**。
+    ///
+    /// 改名（`rename`）在同一卷内是原子的：要么还是旧文件，要么已经是完整
+    /// 的新文件，不存在中间态。
+    ///
+    /// 临时文件放在**同一个目录**而不是 `%TEMP%`：跨卷的 `rename` 不是
+    /// 原子的（Windows 上会退化成「复制 + 删除」），那就白改了。
+    fn write_resume_file(&self, path: &std::path::Path) {
+        let text = resume::serialize(&self.resume);
+        let tmp = path.with_extension("txt.tmp");
+        if std::fs::write(&tmp, text).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if std::fs::rename(&tmp, path).is_err() {
+            // 改名失败就退回到直接覆盖：宁可丢掉一半，也别一条都不记。
+            let _ = std::fs::write(path, resume::serialize(&self.resume));
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// 从头开始播当前这个文件。
+    ///
+    /// **必须有这个逃生口**：自动续播在没有界面提示的地方是不可撤销的 ——
+    /// 用户打开一个视频想重看一遍某个片段，结果它跳到了上次的位置，
+    /// 而他只能去菜单里找「从头播放」或者干脆关掉再开。
+    ///
+    /// 「从头播」这个动作本身也要写进记忆表（位置 0 → `TooEarly` → 不改），
+    /// 所以下一次打开同一个文件时它**不会**又跳回去 —— 用户明确表达过
+    /// 「这个从头看」。
+    fn restart_from_beginning(&mut self) {
+        if !self.state.has_file {
+            return;
+        }
+        let p = self.playlist.current_item().path.clone();
+        // 删掉记录 + 标记「这个文件已经处理过」，
+        // 否则下一轮 `FileLoaded` 会读到刚刚写回去的位置又跳一次
+        self.resume.remove(&p);
+        self.resume_done_for = Some(p);
+        self.seek_absolute(0.0);
+        self.state.position = 0.0;
+        // 强制写回去，否则 3 秒节流会让旧记录留在磁盘上，下一次启动继续跳
+        self.store_resume(true);
+        self.invalidate_all();
+    }
+
     /// 设置有改动，标脏等落盘。
     fn prefs_touch(&mut self) {
         self.prefs.volume = self.state.volume;
         self.prefs.muted = self.state.muted;
+        self.prefs_dirty = true;
+    }
+
+    /// 倍速 / 字幕大小 / 字幕编码变了，标脏。
+    ///
+    /// 单独一个方法而不是塞进 `prefs_touch`：那三个是**用户主动改的**
+    /// （按 `[`、菜单里点编码），而音量是**持续拖动**的。混在一起会让人
+    /// 以为「改编码会一直写注册表」——实际上它只在用户改的那一下写。
+    fn prefs_touch_media(&mut self) {
+        self.prefs.speed = self.state.speed;
+        self.prefs.sub_scale = self.state.sub_scale;
+        self.prefs.sub_codepage = self.state.sub_codepage.clone();
         self.prefs_dirty = true;
     }
 
@@ -1081,8 +1404,24 @@ impl App {
         self.state.idle = false;
         self.state.position = 0.0;
         self.state.duration = 0.0;
-        self.state.speed = 1.0;
+        // **这里原来有一句 `self.state.speed = 1.0;`，删掉了。**
+        //
+        // mpv 的 `speed` 是**全局选项**，换文件不会重置它，而 0.7.0 又开始
+        // 记住倍速（`apply_media_prefs` 在启动时把上次的值推给 mpv）。于是
+        // 打开文件时把 `state.speed` 清成 1.0 会造成两边不一致：mpv 还在
+        // 1.25 倍播，界面认为 1.0 —— 后果是
+        //   * 倍速标签不画（`(1.0 - 1.0).abs() > 1e-6` 为假），用户不知道
+        //     自己其实在 1.25 倍下看片
+        //   * 按 `]` 算出来是 `1.0 × 1.25 = 1.25`，而 mpv 本来就是 1.25，
+        //     **看起来毫无反应**
+        //
+        // 与 `sub_scale` / `sub_codepage` 同理：那两个也没在这里重置。
+        // 「换文件要重置什么」这个问题归 mpv 管，我们不该替它重置。
         self.state.title = file_title(path);
+        // 换文件就把瞬时提示收掉：否则 4 秒之内切文件，新文件名会被上一条
+        // 「已从上次的位置继续 12:34」盖住，而那句话对下一个文件是错的。
+        self.notice.clear();
+        self.notice_until = None;
         // 诊断数据必须清。不清的话上一段视频的分辨率和丢帧数会留在面板上，
         // 看起来像新文件也丢了 10 帧——那是误导（丢帧计数 mpv 自己会重置，
         // 但解码器建好之前读到的还是旧文件的值）。
@@ -1334,7 +1673,7 @@ impl App {
 
     /// 跳转到指定秒数。
     fn seek_absolute(&mut self, seconds: f64) {
-        let target = seconds.clamp(0.0, self.state.duration.max(0.0));
+        let target = resume::clamp_seek_target(seconds, self.state.duration);
         if let Err(e) = self.player().seek(target) {
             self.report_error(self.strings.err_seek, &e);
         }
@@ -1377,6 +1716,7 @@ impl App {
         }
         // 立即更新，不等 mpv 的属性事件绕一圈（和 toggle_pause 同一个理由）
         self.state.speed = next;
+        self.prefs_touch_media();
         self.refresh_panel_rows();
         self.invalidate_controls();
     }
@@ -1529,6 +1869,13 @@ impl App {
     fn tick(&mut self) {
         // 设置落盘要走完这一整段，所以放在最前面无条件做
         self.prefs_flush(false);
+        // 播放位置记忆同样要在**每个提前 return 之前**都跑一遍。
+        //
+        // 放在「设置落盘」后面而不是最后：那几个提前 return（拖动中、
+        // 没文件、读不到 time-pos）都会跳过末尾，而那正是最需要记位置的
+        // 几种时刻 —— 尤其是「拖动中」：用户拖到哪了就是该记的落点。
+        self.store_resume(false);
+        self.expire_notice();
 
         // 拖动中以鼠标位置为准，不跟着播放进度跳
         if self.dragging == Dragging::Seek {
@@ -1642,6 +1989,14 @@ impl App {
                     // 就知道的，但那时 mpv 还没有这个文件的轨道，`sub-add`
                     // 会失败。所以先暂存，等这里再挂。
                     self.apply_pending_sidecars();
+                    // 从上次的位置继续。
+                    //
+                    // 放在 `FileLoaded` 而不是 `open()` 里：只有到这一刻
+                    // `state.duration` 才是真的（`open()` 只是把界面归位，
+                    // 时长要等 mpv 读出容器），而没有时长就没法判断
+                    // 「记住的位置是不是已经在片尾了」。
+                    let cur = self.playlist.current_item().path.clone();
+                    self.maybe_resume(&cur);
                     surface::set_video_visible(self.video, true);
                     // 轨道这时才存在。菜单如果正开着，行数会变，必须重排；
                     // 没开也要刷新，否则用户开菜单时读到的是上一个文件的轨
@@ -1784,6 +2139,8 @@ impl App {
                     muted: self.state.muted,
                     loaded: self.state.has_file,
                     title: &self.state.title,
+                    speed: self.state.speed,
+                    notice: &self.notice,
                     dragging_seek: self.dragging == Dragging::Seek,
                     drag_seconds,
                     theatre: self.theatre,
@@ -2878,6 +3235,7 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
         id::NEXT => app.step_playlist(true),
         id::PREV => app.step_playlist(false),
         id::ADVANCED => app.toggle_advanced(),
+        id::PLAY_FROM_BEGINNING => app.restart_from_beginning(),
         _ => {}
     }
 }
@@ -3205,6 +3563,9 @@ fn create_and_loop() -> Result<(), String> {
         // 差一点不影响用户看到的东西。
         let _ = app.player().set_volume(app.state.volume);
         let _ = app.player().set_mute(app.state.muted);
+        // 倍速 / 字幕大小 / 字幕编码，理由与上面两条一样：
+        // 「界面显示 1.5 倍、实际 1.0 倍」比不显示更糟。
+        app.apply_media_prefs();
 
         // 250ms 定时器**必须等到 `player` 就位之后再武装**。
         //
@@ -3243,6 +3604,11 @@ fn create_and_loop() -> Result<(), String> {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
 
+        // 读播放位置表。必须在第一次 `open()` **之前** ——
+        // `maybe_resume` 是在 `FileLoaded` 时查这张表的，而 `open()` 一跑
+        // 就注定了那个时刻。顺序反了的话第一条记录永远读不到。
+        app.load_resume();
+
         // 启动时给的文件。**可以多个** —— 见 `initial_files` 的说明。
         //
         // 多个文件时走播放列表：第一个开始播，其余的留在列表里等
@@ -3269,6 +3635,9 @@ fn create_and_loop() -> Result<(), String> {
         // 退出前把设置强制落盘（`tick` 里是节流的，最后一次改动可能还没到
         // 落盘时刻）。窗口尺寸在这一刻才是准确的。
         app.prefs_flush(true);
+        // 播放位置也要**强制**写一次：节流间隔是 3 秒，而用户「看一眼
+        // 就关掉」是最常见的用法 —— 不强制写就等于这种情况什么都不记。
+        app.store_resume(true);
 
         // 退出前把 mpv 收干净：它的事件线程还在读 DLL
         let _ = app.player().shutdown();

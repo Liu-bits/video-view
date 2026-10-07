@@ -14,6 +14,7 @@
 //! 反过来，如果有人凭旧资料把属性名改回去，这条也会红。
 
 use video_view_lib::mpv::{InitOptions, MpvPlayer};
+use video_view_lib::settings::Settings;
 
 fn player() -> Option<MpvPlayer> {
     let p = MpvPlayer::new(&InitOptions {
@@ -211,6 +212,67 @@ fn 换文件之后设置还在() {
         (scale - 1.5).abs() < 1e-6,
         "换文件之后 sub-scale 被重置了，实得 {scale}"
     );
+
+    let _ = p.shutdown();
+}
+
+/// 0.7.0 之后倍速 / 字幕大小 / 字幕编码会被**记住**并在启动时推给 mpv，
+/// 所以「存下来的值」必须全都是 mpv 真的收得下的。
+///
+/// 这条走的是完整链路的 mpv 那一截：值经过 `sanitized` 夹过 -> 逐个塞给
+/// mpv -> 读回来比对。
+///
+/// 分两截的原因：注册表那半截归 `settings.rs` 的单测（那边不需要 mpv，
+/// 跑得快），这里只管「mpv 收不收」。mpv 起一次要几百毫秒，把与 mpv
+/// 无关的断言塞进来会让这个文件整体变慢十几倍。
+///
+/// 之前没有这条，两个错都可能被放过去：
+///   * 把倍速存成 `DWORD` -> `1.25` 变成 `1.00`（用户以为记住了，其实没记住）
+///   * 存下一个 mpv 拒收的值 -> 启动时 `apply_media_prefs` 报错弹框，
+///     而用户什么都没做错
+#[test]
+fn 记住的那三个值_mpv_都收得下() {
+    let Some(p) = player() else { return };
+
+    let raw = Settings {
+        speed: 1.25,
+        sub_scale: 1.75,
+        sub_codepage: "  gbk  ".to_string(),
+        ..Settings::default()
+    };
+    // 编码走一遍真实的归一：注册表里可能带着空白（用户从别处拷来的），
+    // 而 `sanitized` 会 trim 掉 —— mpv 那边只认干净的编码名。
+    let saved = raw.sanitized();
+    assert_eq!(saved.sub_codepage, "gbk", "编码两边的空白应当被 trim 掉");
+    p.set_string_property("sub-codepage", &saved.sub_codepage)
+        .unwrap_or_else(|e| panic!("记住的编码 {} mpv 收不下：{e}", saved.sub_codepage));
+
+    // 夹取边界逐个过一遍，而不只是中间值。
+    //
+    // 第一版只喂了 `1.25` / `1.75` —— 那是这三条里最「正常」的两个值，
+    // 把 `sanitized` 的 clamp 改成 `0.0..=1000.0` 这条测试照样绿。
+    // 现在喂的是**边界值**：如果 `sanitized` 的范围比 mpv 声明的宽，
+    // 这里就会红。
+    for sp in [0.0625_f64, 1.0, 16.0] {
+        p.set_speed(sp)
+            .unwrap_or_else(|e| panic!("夹取范围内的倍速 {sp} mpv 收不下：{e}"));
+        let back = p.get_property_string("speed").expect("读 speed");
+        let got: f64 = back
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("speed 读回来 {back:?}"));
+        assert!((got - sp).abs() < 1e-6, "倍速写进去是 {got}");
+    }
+    for ss in [0.0_f64, 0.5, 100.0] {
+        p.set_string_property("sub-scale", &format!("{ss}"))
+            .unwrap_or_else(|e| panic!("夹取范围内的字幕大小 {ss} mpv 收不下：{e}"));
+        let back = p.get_property_string("sub-scale").expect("读 sub-scale");
+        let got: f64 = back
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("sub-scale 读回来 {back:?} 解析失败"));
+        assert!((got - ss).abs() < 1e-6, "字幕大小写进去是 {got}");
+    }
 
     let _ = p.shutdown();
 }

@@ -148,6 +148,13 @@ pub mod id {
     /// 放在菜单**最上面**而不是底部：它管的是下面所有项的可用性，
     /// 放底部意味着用户要滚到最后才知道为什么一堆东西是灰的。
     pub const ADVANCED: u16 = 60;
+
+    /// 从头播放当前文件（跳过「从上次位置继续」）。
+    ///
+    /// **这是自动续播的逃生口。** 没有它的话，用户打开一个视频想重看某个
+    /// 片段却发现它跳到了上次的位置，就只能关掉再开或者改文件 ——
+    /// 而「上次的位置」这个功能是他自己不一定会意识到存在的东西。
+    pub const PLAY_FROM_BEGINNING: u16 = 61;
 }
 
 /// 菜单里可选的字幕编码，映射到 mpv 的 `sub-codepage`。
@@ -433,6 +440,11 @@ fn build(s: &lang::Strings, snap: Snapshot<'_>) -> Option<HMENU> {
         enable(menu, id::NEXT, snap.loaded);
         append(menu, id::PREV, s.menu_prev, false);
         enable(menu, id::PREV, snap.loaded);
+        // 「从头播放」放在这一组的**最后**：它与上下两条不是一类
+        // （那两个换文件，这个不换），但单独开一组会为了一个不常用的
+        // 逃生口把菜单再加长一截。
+        append(menu, id::PLAY_FROM_BEGINNING, s.menu_from_beginning, false);
+        enable(menu, id::PLAY_FROM_BEGINNING, snap.loaded);
 
         Some(menu)
     }
@@ -962,6 +974,48 @@ mod tests {
             counts.push(count(owned(&s, snap(&EMPTY)).0));
         }
         assert_eq!(counts[0], counts[1]);
+    }
+
+    #[test]
+    fn 从头播放这一项在菜单里_而且不是高级项() {
+        let s = st();
+        let m = owned(&s, snap(&EMPTY));
+        let pos = find_cmd(m.0, id::PLAY_FROM_BEGINNING);
+        assert!(!is_grayed(m.0, pos), "有媒体时不该置灰");
+        // 它是**续播**的逃生口，所以即使高级模式关着也要能用 ——
+        // 关掉续播的入口等于把用户锁在「自动跳」里
+        let off = owned(
+            &s,
+            Snapshot {
+                advanced: false,
+                ..snap(&EMPTY)
+            },
+        );
+        assert!(
+            !is_grayed(off.0, find_cmd(off.0, id::PLAY_FROM_BEGINNING)),
+            "「从头播放」不该受高级模式影响"
+        );
+        // 下一个 / 上一个**也不受**高级模式影响。它们看着像高级功能
+        // （0.6.2 加的），但把它们灰掉的代价比留着更大：高级模式的语义是
+        // 「简化到只剩基本播放」，而「换一个文件」正是基本播放的一部分。
+        // 灰掉它等于告诉用简易模式的人「你不能连续看下一集」。
+        let n = find_cmd(off.0, id::NEXT);
+        assert!(!is_grayed(off.0, n), "「下一个文件」也不受高级模式影响");
+    }
+
+    #[test]
+    fn 没媒体时续播逃生口置灰() {
+        let s = st();
+        let m = owned(
+            &s,
+            Snapshot {
+                loaded: false,
+                ..snap(&EMPTY)
+            },
+        );
+        assert!(is_grayed(m.0, find_cmd(m.0, id::PLAY_FROM_BEGINNING)));
+        assert!(is_grayed(m.0, find_cmd(m.0, id::NEXT)));
+        assert!(is_grayed(m.0, find_cmd(m.0, id::PREV)));
     }
 
     #[test]

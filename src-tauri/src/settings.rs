@@ -64,8 +64,17 @@ pub struct Settings {
     /// 默认 `true`。理由见 `App::toggle_advanced` 的注释 ——
     /// 默认关掉等于「装好之后按 `I` 没反应」，那不是简化，是功能坏了。
     pub advanced: bool,
+    /// 上次的播放倍速（mpv 的 `speed`）。
+    ///
+    /// 记住它的理由跟音量一样：**用户调过就是想要它**。倍速是那种
+    /// 「看番要 1.5 倍、看教程要 2 倍」的场景，每次启动都重置成 1.0
+    /// 的话每部片子都要重新按 `[` 好几下。
+    pub speed: f64,
+    /// 上次的字幕大小（mpv 的 `sub-scale`，0~100）。
+    pub sub_scale: f64,
+    /// 上次的字幕编码（mpv 的 `sub-codepage`）。空串 = 用 mpv 默认值。
+    pub sub_codepage: String,
 }
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -77,6 +86,9 @@ impl Default for Settings {
             client_w: 1100,
             client_h: 720,
             advanced: true,
+            speed: 1.0,
+            sub_scale: 1.0,
+            sub_codepage: String::new(),
         }
     }
 }
@@ -119,6 +131,26 @@ impl Settings {
             if let Some(v) = read_dword(HKEY_CURRENT_USER, subkey, "Advanced") {
                 s.advanced = v != 0;
             }
+            // 倍速 / 字幕大小 / 字幕编码：读不到就用默认值。
+            // 三个都用**字符串**存而不是 `DWORD`，因为倍速与字幕大小是
+            // 小数，DWORD 存会丢精度（1.25 -> 1）。注册表其实有
+            // `REG_QWORD`，但它是整数，仍然存不了小数。
+            if let Some(v) = read_sz(HKEY_CURRENT_USER, subkey, "Speed").as_deref() {
+                if let Some(x) = parse_finite(v) {
+                    s.speed = x;
+                }
+            }
+            if let Some(v) = read_sz(HKEY_CURRENT_USER, subkey, "SubScale").as_deref() {
+                if let Some(x) = parse_finite(v) {
+                    s.sub_scale = x;
+                }
+            }
+            // 编码**原样存**：合法值由 mpv 那边兜底校验，而这里
+            // 自造一份白名单只会带来「升级 mpv 加了新编码但我们不认」
+            // 这种问题。存空串 = 用户没改过 = 用默认值。
+            if let Some(v) = read_sz(HKEY_CURRENT_USER, subkey, "SubCodepage") {
+                s.sub_codepage = v;
+            }
         }
 
         s.sanitized()
@@ -147,7 +179,26 @@ impl Settings {
                 write_dword(hkey, "ClientW", s.client_w as u32)?;
                 write_dword(hkey, "ClientH", s.client_h as u32)?;
                 write_dword(hkey, "Advanced", u32::from(s.advanced))?;
-                write_sz(hkey, "Volume", &format!("{:.2}", s.volume))
+                write_sz(hkey, "Volume", &format!("{:.2}", s.volume))?;
+                // 倍速与字幕大小存**三位小数**。为什么不存更多：唯一会用到这份精度的
+                // 地方是「记住上次的倍速」，而 `SPEED_FACTOR` 是 1.25，
+                // 连按几次得到的是 1.25 / 1.5625 / 1.953125 ——
+                // 截成三位是 1.562，与真值的差是 4e-4，对播放速度来说
+                // 远低于可感知的程度，而且这个误差**不累积**：下一次按 `]`
+                // 是拿 1.562 去乘的，不是拿 1.5625 乘。
+                // 为什么不存更少：`.2` 会把 1.5625 变成 1.56，而「上次是
+                // 1.5625」这个信息在右键菜单那一项（`重置速度` 的可用性）
+                // 上还有用。
+                //
+                // `sanitized` 已经把它们夹进合法范围，所以这里写出来的
+                // 一定是有限的，`{:.3}` 不会出 `NaN`。
+                write_sz(hkey, "Speed", &format!("{:.3}", s.speed))?;
+                write_sz(hkey, "SubScale", &format!("{:.3}", s.sub_scale))?;
+                // 空串**也要写**：mpv 的默认值是「不指定编码」，
+                // 而 Windows 会跳过「空」不是「空串」，所以写 `"(default)"`
+                // 之类会变成一个用户没选过的编码。空串就是空串，
+                // 读回来时 `read_sz` 给 `Some("")`，`sanitized` 再归一。
+                write_sz(hkey, "SubCodepage", &s.sub_codepage)
             })();
             let _ = RegCloseKey(hkey);
             r
@@ -159,7 +210,14 @@ impl Settings {
     /// 这一步不是防御性编程的洁癖：这些值来自注册表，可能被别的程序改坏，
     /// 也可能来自旧版本的写法。带着 `volume = 1e30` 启动的表现是音量条
     /// 永远是满的、`client_w = -1` 的表现是窗口根本创建不出来。
-    fn sanitized(&self) -> Self {
+    /// 把越界 / 脏值夹回合法范围。
+    ///
+    /// 独立成一个 `pub`（而不是只留私有方法）是为了让**集成测试**
+    /// （`tests/sub_settings.rs`）复用同一套归一逻辑 —— 那条测试要验的
+    /// 恰恰是「`sanitized` 夹过的范围整个落在 mpv 声明的范围内」，如果测试
+    /// 自己再写一遍夹取，两个定义迟早不一样，而那种不一致的现场是
+    /// 「界面显示 1.0 倍、实际 3 倍」，极难查。
+    pub fn sanitized(&self) -> Self {
         Self {
             volume: if self.volume.is_finite() {
                 self.volume.clamp(0.0, 100.0)
@@ -173,15 +231,79 @@ impl Settings {
             client_h: self.client_h.clamp(240, 16384),
             // bool 没有越界可言，过来就行
             advanced: self.advanced,
+            // mpv 的 `speed` 合法范围是 0.01~100（0 会被当成「暂停」，负数会让
+            // 播放倒着跑或者直接报错）。上界 16 与 `scale_speed` 一致。
+            //
+            // **下界刻意取 0.0625 而不是「更好看的」0.25**：这个值必须与
+            // `App::scale_speed` 和 `mpv::set_speed` 的下界**完全一致**。
+            // 三处不一致的后果很具体 —— 用户连按 `[` 到 0.0625 倍，
+            // 落盘的是 0.0625，下次启动被这里拉回 0.25，**播放速度凭空
+            // 变了 4 倍**。早期版本这里写的是 0.25 而另两处是 0.0625，
+            // 就是这个 bug。
+            //
+            // 0.0625 倍本身没什么实用价值，但「记住用户设过的东西」比
+            // 「把它拉回一个我认为更合理的值」重要：拉回来等于程序擅自
+            // 改了用户的设置，而且没有任何提示。
+            speed: if self.speed.is_finite() {
+                self.speed.clamp(0.0625, 16.0)
+            } else {
+                1.0
+            },
+            // `sub-scale` 实测范围是 0~100（`option-info` 查的，
+            // 手册上写的 0.1~10 不准）。0 是合法的（等于不显示字幕），
+            // 所以下界不抬。
+            sub_scale: if self.sub_scale.is_finite() {
+                self.sub_scale.clamp(0.0, 100.0)
+            } else {
+                1.0
+            },
+            // 编码**只做长度限制**，不校验内容。
+            //
+            // 校验就得维护一份白名单，而 mpv 的编码列表会随版本变长 ——
+            // 白名单落后于 mpv 的后果是「用户在新版 mpv 里能选，我们却
+            // 把它丢了」。交给 mpv 判非法值：它会忽略并保持原编码。
+            //
+            // 限制长度是为了不让一个手滑写进去的超长字符串把
+            // `MAX_VALUE_BYTES` 的配额吃满——读比写更容易失败，
+            // 而「写得进读不出」的组合会让这个值永远卡在坏状态。
+            //
+            // **比较的是 UTF-16 字节数，不是 `str::len()`。**
+            // `MAX_VALUE_BYTES` 是给 `read_sz` 用的，而注册表里的
+            // `REG_SZ` 是 UTF-16 —— `write_sz` 写出去的是 `c.len() * 2 + 2`
+            // 字节（多的那 2 是结尾的 NUL）。拿 `str::len()` 去比 64 的话，
+            // 一个 40 字符的编码名（`len() == 40 < 64` 通过）写出去是
+            // 82 字节，下次 `read_sz` 里 `needed > MAX_VALUE_BYTES` 直接
+            // 读不出来 —— 静默退回默认值。也就是这段注释要防的那个 case
+            // 它自己没防住。
+            sub_codepage: {
+                let c = self.sub_codepage.trim();
+                // +2 是结尾的 NUL；`<=` 而不是 `<` 是因为
+                // `read_sz` 在 `needed == MAX_VALUE_BYTES` 时仍然读得到
+                let bytes = c.len() * 2 + 2;
+                if bytes <= MAX_VALUE_BYTES as usize {
+                    c.to_string()
+                } else {
+                    String::new()
+                }
+            },
         }
     }
 }
 
-/// 解析音量字符串。
+/// 解析一个有限的小数。空串 / `NaN` / `inf` / 任何非数字一律 `None`
+/// ——调用方那时的动作是「用默认值」，不是「报错」。
 ///
-/// 接受带不带空格、正负号、`%` 后缀：`"80"`、`" 80 "`、`"80%"` 都行。
-/// 写成 REG_SZ 而不是 REG_DWORD 是因为浮点数没有整数表示，`80.5` 用 DWORD
-/// 存要么截断要么得乘 10 再除回来。
+/// 与 `parse_volume` 分开是因为它不做「去掉尾部 `%`」那一步：
+/// 那是音量专用的（有人会往注册表里手打 `80%`），而倍速与字幕大小
+/// 带了 `%` 就是错的输入，不该被默默接受。
+fn parse_finite(text: &str) -> Option<f64> {
+    let v: f64 = text.trim().parse().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// 解析音量。**容忍尾部 `%`**（`"80%"` / `" 80 "` / `"80"` 都行），
+/// 因为音量是注册表里唯一一个「用户可能手打」的值，而 DWORD 存不下
+/// `80.5`。
 fn parse_volume(text: &str) -> Option<f64> {
     let t = text.trim().trim_end_matches('%').trim();
     let v: f64 = t.parse().ok()?;
@@ -375,6 +497,33 @@ mod tests {
         assert_eq!(parse_volume("inf"), None);
     }
 
+    /// `parse_finite` 之前一个直接单测都没有，而它是 `sanitized` 里
+    /// `is_finite` 分支的**唯一**触发来源：`"1e999"` 会被 Rust 的
+    /// `f64::parse` 接受成 `inf`，`"NaN"` / `"inf"` 同理 —— 那三个如果不
+    /// 挡住，就会一路进到 `{:.3}` 格式化里变成 `inf`，写进注册表之后
+    /// 下次启动再读还是 `inf`，倍速标签直接画出 `infx`。
+    #[test]
+    fn parse_finite_只收真正的有限小数() {
+        assert_eq!(parse_finite("1.25"), Some(1.25));
+        assert_eq!(parse_finite("  0.5  "), Some(0.5));
+        assert_eq!(parse_finite("16"), Some(16.0));
+        assert_eq!(parse_finite("1e2"), Some(100.0));
+        // 下面这些才是重点
+        assert_eq!(parse_finite(""), None);
+        assert_eq!(parse_finite("   "), None);
+        assert_eq!(parse_finite("abc"), None);
+        assert_eq!(parse_finite("NaN"), None);
+        assert_eq!(parse_finite("nan"), None);
+        assert_eq!(parse_finite("inf"), None);
+        assert_eq!(parse_finite("Infinity"), None);
+        // Rust 的 f64::parse 接受这个并返回 inf
+        assert_eq!(parse_finite("1e999"), None);
+        assert_eq!(parse_finite("-1e999"), None);
+        // **不带** `%` 后缀：`80%` 对音量是常见的手误，对倍速/字幕大小
+        // 则是错输入，不该被默默接受（那是 `parse_volume` 才管的）
+        assert_eq!(parse_finite("80%"), None);
+    }
+
     #[test]
     fn 越界的值会被拉回可用范围() {
         let s = Settings {
@@ -383,11 +532,34 @@ mod tests {
             client_w: -5,
             client_h: 0,
             advanced: true,
+            speed: 1.0,
+            sub_scale: 1.0,
+            sub_codepage: String::new(),
         };
         let s = s.sanitized();
         assert_eq!(s.volume, 100.0);
         assert!(s.client_w >= 320, "{}", s.client_w);
         assert!(s.client_h >= 240, "{}", s.client_h);
+        // 越界的媒体设置也要被夹住 —— 之前这条测试只管音量与窗口大小，
+        // 0.7.0 加进来的三个字段没人管，于是它们的第一版夹取范围写错了
+        // （下界 0.25 vs 另两处的 0.0625）也没人发现
+        let wild = Settings {
+            speed: 1e30,
+            sub_scale: -5.0,
+            sub_codepage: "x".repeat(200),
+            ..Settings::default()
+        }
+        .sanitized();
+        assert!(wild.speed <= 16.0, "倍速上限没夹住：{}", wild.speed);
+        assert!(
+            wild.sub_scale >= 0.0,
+            "字幕大小下限没夹住：{}",
+            wild.sub_scale
+        );
+        assert_eq!(
+            wild.sub_codepage, "",
+            "超长的编码名应当归一成空串而不是写得进读不出"
+        );
     }
 
     #[test]
@@ -425,6 +597,9 @@ mod tests {
             client_w: 1440,
             client_h: 900,
             advanced: false,
+            speed: 1.25,
+            sub_scale: 1.75,
+            sub_codepage: "gbk".to_string(),
         };
         want.save_to(&key).expect("应当能写进 HKCU 的测试子键");
 
@@ -436,6 +611,66 @@ mod tests {
         // 高级模式也要往返。这一项**默认开**，所以测试里特意存 `false`：
         // 存 `true` 的话，读不到时的默认值也是 `true`，测不出「真的存进去了」
         assert_eq!(got.advanced, want.advanced, "高级模式没存住");
+        // 倍速与字幕大小存的是**字符串**，所以这里要验的是「小数没被截断」。
+        // 用 1.25 / 1.75 而不是 1.0 / 2.0 是有意的：后者用 DWORD 也能存，
+        // 换成 DWORD 的实现一样能过这个测试 —— 而那正是需要防的那种退化。
+        assert_eq!(
+            got.speed, want.speed,
+            "倍速必须是精确往返（1.25 不能变成 1.00）"
+        );
+        assert_eq!(got.sub_scale, want.sub_scale, "字幕大小必须是精确往返");
+        assert_eq!(got.sub_codepage, want.sub_codepage, "字幕编码没存住");
+
+        delete_test_key(&key);
+    }
+
+    #[test]
+    fn 记着的媒体设置被手改成非法值时归一() {
+        let key = test_subkey("sanitize-media");
+        delete_test_key(&key);
+        let raw = Settings {
+            // 0 倍速在 mpv 里是「暂停」，负倍速会让播放倒着跑
+            speed: -3.0,
+            sub_scale: 9999.0,
+            sub_codepage: "  ".to_string(),
+            ..Settings::default()
+        };
+        raw.save_to(&key).expect("应当能写进 HKCU 的测试子键");
+        let got = Settings::load_from(&key);
+        // 默认值与 `App::scale_speed` / `mpv::set_speed` 的下界必须一致
+        assert!(
+            got.speed >= 0.0625,
+            "倍速不该被归一成低于下限的值：{}",
+            got.speed
+        );
+        assert!(
+            got.speed <= 16.0,
+            "倍速不该被归一成高于上限的值：{}",
+            got.speed
+        );
+        assert!(
+            (0.0..=100.0).contains(&got.sub_scale),
+            "字幕大小应当落在 0~100，实际 {}",
+            got.sub_scale
+        );
+        assert_eq!(got.sub_codepage, "", "纯空白的编码应当归一成空串");
+
+        delete_test_key(&key);
+    }
+
+    #[test]
+    fn 字幕编码的值可能带空白_读的时候要_trim_掉() {
+        // `save_to` 与 `load_from` 都不是 trim 的，只 `sanitized` trim。
+        // 目的是「用户从别的软件拷了一串带空格的编码名过来」能被接受，
+        // 而不是变成一条 mpv 认不出来的属性值。
+        let key = test_subkey("codepage-space");
+        delete_test_key(&key);
+        let raw = Settings {
+            sub_codepage: "  big5  ".to_string(),
+            ..Settings::default()
+        };
+        raw.save_to(&key).expect("应当能写进 HKCU 的测试子键");
+        assert_eq!(Settings::load_from(&key).sub_codepage, "big5");
 
         delete_test_key(&key);
     }

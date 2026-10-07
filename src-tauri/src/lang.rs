@@ -304,6 +304,8 @@ pub struct Strings {
     pub help_prev: &'static str,
     /// 右键菜单最上面那个「高级模式」开关
     pub menu_advanced: &'static str,
+    /// 右键菜单里的「从头播放」
+    pub menu_from_beginning: &'static str,
     // ---- 快捷键总览 ----
     pub help_play_pause: &'static str,
     pub help_seek: &'static str,
@@ -351,6 +353,8 @@ pub struct Strings {
     /// 没有媒体可挂时给用户的提示（挂字幕需要一个正在播的视频）
     pub err_no_media_for_sub: &'static str,
     pub info_subtitle_added: &'static str,
+    /// 「从上次的位置继续」的提示标题
+    pub info_resumed: &'static str,
 }
 
 impl Strings {
@@ -469,12 +473,14 @@ impl Strings {
             menu_next: "Next file",
             menu_prev: "Previous file",
             menu_advanced: "Advanced mode",
+            menu_from_beginning: "Play from the beginning",
             panel_playlist: "Playlist",
             playlist_no_sidecar: "(no external subtitle)",
             help_playlist: "Playlist panel",
             help_next: "Next file",
             help_prev: "Previous file",
             info_subtitle_added: "Subtitle loaded.",
+            info_resumed: "Resumed from",
         }
     }
 
@@ -584,12 +590,14 @@ impl Strings {
             menu_next: "下一个文件",
             menu_prev: "上一个文件",
             menu_advanced: "高级模式",
+            menu_from_beginning: "从头播放",
             panel_playlist: "播放列表",
             playlist_no_sidecar: "（没有随这条视频一起拖进来的外挂字幕）",
             help_playlist: "播放列表面板",
             help_next: "下一个文件",
             help_prev: "上一个文件",
             info_subtitle_added: "字幕已加载。",
+            info_resumed: "已从上次的位置继续",
         }
     }
 
