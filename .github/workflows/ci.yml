@@ -1,0 +1,107 @@
+# VideoView CI —— 把 AGENTS.md 里的「验证纪律」从纸面约定变成门禁。
+#
+# 为什么需要它：此前所有验证（cargo check / cargo test / verify-ui / package）
+# 都靠人在本地记得跑。一旦有人（或另一个 AI 会话）漏跑，发现问题的时机就推迟到
+# 「别人 clone 下来编不过」。本仓库有过一次工作区停在 51 个编译错误上的记录，
+# 就是没有门禁的直接代价。
+#
+# 四个 job，按成本从低到高。前一个挂了后面照样跑完，一次能看到全部问题。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的新推送取消掉还在排队的旧检查，省 runner 额度。
+# 检查是幂等的，取消旧的那次不会丢信息。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. 格式 ────────────────────────────────────────────────────────
+  # 秒级，最先跑。强制卡点。
+  #
+  # 敢设成强制，是因为已入库的代码实测 100% 符合 rustfmt（v0.8.0 的
+  # 全部源码 `cargo fmt --check` 干净）。历史无债，门槛立得住。
+  fmt:
+    name: 格式 (rustfmt)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --all --check
+        working-directory: src-tauri
+        run: cargo fmt --all --check
+
+  # ── 2. Lint ────────────────────────────────────────────────────────
+  # 强制卡点。
+  #
+  # 这里原本带 `continue-on-error: true`（软卡点），理由是这个 job 从没在
+  # CI 上跑过、历史代码的 clippy 底数未知。0.9.0 收尾时摸清了：整仓只有
+  # 3 条提示，已经全部清掉，现在是 **0 警告**。
+  #
+  # 于是转为强制 —— 门禁只有在干净的时候才立得住，一条永远黄的检查
+  # 只会训练人去忽略它。
+  clippy:
+    name: Lint (clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: cargo clippy --all-targets
+        working-directory: src-tauri
+        run: cargo clippy --all-targets
+
+  # ── 3. 编译 ────────────────────────────────────────────────────────
+  check:
+    name: 编译 (cargo check)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: cargo check --all-targets
+        working-directory: src-tauri
+        run: cargo check --all-targets
+
+  # ── 4. 单元测试 ────────────────────────────────────────────────────
+  # 只跑 `--lib`，**不跑 tests/ 下的集成测试**，这是刻意的：
+  # 集成测试要真的加载 libmpv-2.dll（不入库，靠 scripts/fetch-libmpv.ps1 取）
+  # 并读 tests/media/ 下的媒体文件。CI 上没有 dll。
+  # 集成测试仍然只在本地跑，属于发版前的人工步骤（见 CONTRIBUTING.md）。
+  test:
+    name: 单元测试 (cargo test --lib)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: cargo test --lib
+        working-directory: src-tauri
+        run: cargo test --lib
+
+# ── 刻意不放进 CI 的三件事 ─────────────────────────────────────────
+#
+#   * scripts/verify-ui.ps1 —— 35 项检查要真的起窗口、真的发菜单消息。
+#     GitHub 的 windows runner 没有可交互桌面会话，跑不了。留在本地。
+#   * scripts/package.ps1 —— 打包要 libmpv dll + NSIS，且产物要传 Release。
+#     属于发版动作，由人在本地执行（见 NEXT.md 的发版清单）。
+#   * tests/*.rs 集成测试 —— 理由见上面 test job 的注释。

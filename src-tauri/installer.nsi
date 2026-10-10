@@ -13,7 +13,7 @@
 ; 版本号由 scripts/package.ps1 用 -DVERSION 传进来，保证和 Cargo.toml 一致。
 ; 这里保留的默认值只是为了让脚本能被手工执行时也能跑起来。
 !ifndef VERSION
-  !define VERSION "0.8.0"
+  !define VERSION "0.9.0"
 !endif
 !define OUT_FILE "..\artifacts\VideoView-Setup-${VERSION}.exe"
 ; 暂存目录：由 scripts/package.ps1 铺好，里面只有要装进 $INSTDIR 的文件

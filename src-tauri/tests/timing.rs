@@ -59,10 +59,11 @@ fn media_60s() -> std::path::PathBuf {
 fn 设了_a_b_之后_mpv_真的在循环() {
     let f = media_60s();
     if !f.is_file() {
-        eprintln!("跳过：{} 不存在", f.display());
-        return;
+        panic!("media file missing: {}", f.display());
     }
-    let Some(p) = player() else { return };
+    let Some(p) = player() else {
+        panic!("mpv player unavailable, test env is broken")
+    };
     p.load_file(&f).expect("load_file");
     std::thread::sleep(Duration::from_millis(900));
 
@@ -97,10 +98,11 @@ fn 设了_a_b_之后_mpv_真的在循环() {
 fn 把_a_设成_no_就真的停止循环() {
     let f = media_60s();
     if !f.is_file() {
-        eprintln!("跳过：{} 不存在", f.display());
-        return;
+        panic!("media file missing: {}", f.display());
     }
-    let Some(p) = player() else { return };
+    let Some(p) = player() else {
+        panic!("mpv player unavailable, test env is broken")
+    };
     p.load_file(&f).expect("load_file");
     std::thread::sleep(Duration::from_millis(900));
 
@@ -143,10 +145,11 @@ fn 把_a_设成_no_就真的停止循环() {
 fn 只设_a_不会循环() {
     let f = media_60s();
     if !f.is_file() {
-        eprintln!("跳过：{} 不存在", f.display());
-        return;
+        panic!("media file missing: {}", f.display());
     }
-    let Some(p) = player() else { return };
+    let Some(p) = player() else {
+        panic!("mpv player unavailable, test env is broken")
+    };
     p.load_file(&f).expect("load_file");
     std::thread::sleep(Duration::from_millis(900));
 
@@ -175,7 +178,9 @@ fn 只设_a_不会循环() {
 /// 会和注释直接矛盾。
 #[test]
 fn 延迟写得进读得回且跨文件保留() {
-    let Some(p) = player() else { return };
+    let Some(p) = player() else {
+        panic!("mpv player unavailable, test env is broken")
+    };
 
     for (name, v) in [("sub-delay", -0.25), ("audio-delay", 0.35)] {
         p.set_string_property(name, &format!("{v}"))
@@ -186,9 +191,7 @@ fn 延迟写得进读得回且跨文件保留() {
 
     let f = media_60s();
     if !f.is_file() {
-        eprintln!("跳过换文件那半截：{} 不存在", f.display());
-        let _ = p.shutdown();
-        return;
+        panic!("media file missing: {}", f.display());
     }
     p.load_file(&f).expect("load_file");
     std::thread::sleep(Duration::from_millis(900));
@@ -211,7 +214,9 @@ fn 延迟写得进读得回且跨文件保留() {
 /// 用户看到的现象是「字幕没了」而界面上没有任何地方能看出原因。
 #[test]
 fn mpv_对延迟完全不夹范围_所以夹取必须在我们这侧() {
-    let Some(p) = player() else { return };
+    let Some(p) = player() else {
+        panic!("mpv player unavailable, test env is broken")
+    };
     for v in ["-60.0", "-600.0", "600.0"] {
         assert!(
             p.set_string_property("sub-delay", v).is_ok(),
@@ -237,7 +242,9 @@ fn mpv_对延迟完全不夹范围_所以夹取必须在我们这侧() {
 /// `sub-encoding` 的坑一模一样。
 #[test]
 fn video_delay_这个属性不存在() {
-    let Some(p) = player() else { return };
+    let Some(p) = player() else {
+        panic!("mpv player unavailable, test env is broken")
+    };
     let err = p
         .set_string_property("video-delay", "0.1")
         .expect_err("`video-delay` 不该存在；0.8.0 因此只做了字幕与音频两个方向");

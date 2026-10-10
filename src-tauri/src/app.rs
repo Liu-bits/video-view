@@ -51,8 +51,9 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6,
     VK_7, VK_8, VK_9, VK_A, VK_B, VK_C, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F, VK_F11,
-    VK_HOME, VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_MENU, VK_N, VK_O, VK_OEM_2, VK_OEM_4, VK_OEM_5,
-    VK_OEM_COMMA, VK_OEM_PERIOD, VK_P, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE, VK_T, VK_UP,
+    VK_F2, VK_HOME, VK_I, VK_J, VK_L, VK_LEFT, VK_M, VK_MENU, VK_N, VK_O, VK_OEM_2, VK_OEM_4,
+    VK_OEM_5, VK_OEM_COMMA, VK_OEM_PERIOD, VK_P, VK_RETURN, VK_RIGHT, VK_S, VK_SHIFT, VK_SPACE,
+    VK_T, VK_UP,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -66,10 +67,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOW, WINDOW_EX_STYLE,
     WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
     WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 
+use crate::folder;
 use crate::menu::{self, format_delay as menu_format_delay};
 use crate::mpv::{InitOptions, MpvEventMessage, MpvPlayer};
 use crate::playlist::{self, file_title, is_subtitle_path, Playlist, PlaylistRow};
@@ -295,6 +297,13 @@ impl PanelMode {
     }
 }
 
+/// 延迟到窗口消息里才打开的模态对话框种类。
+#[derive(Debug, Clone, Copy)]
+enum DialogKind {
+    File,
+    Folder,
+}
+
 /// 正在拖动的控件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dragging {
@@ -454,8 +463,8 @@ struct App {
     /// `&mut App`；两个同时存活的独占引用是 UB，而且对话框期间派发的
     /// `WM_TIMER` 会改状态，回来后原函数继续用被改过的值。
     pending_errors: Vec<(String, String, MESSAGEBOX_STYLE)>,
-    /// 有人请求打开文件对话框，真正的模态调用放到 `WM_APP_OPEN_DIALOG` 里做。
-    open_dialog: bool,
+    /// 模态对话框只在 `WM_APP_OPEN_DIALOG` 分支打开，避免重入时借用 App。
+    open_dialog: Option<DialogKind>,
     /// 解码诊断数据。`hwdec-current` 等观测项收在这里。
     ///
     /// 0.3.0 里 `hwdec-current` 落在 `UiState` 上但**从不显示**——接了一半的
@@ -545,6 +554,22 @@ struct App {
     /// 提示什么时候过期。用 `Option` 而不是「空串」单独表示「不显示」，
     /// 是因为空串**同时**也可能是「要显示一个空提示」，那没有意义。
     notice_until: Option<std::time::Instant>,
+
+    // ---- 书签 ----
+    /// 全部书签。启动时从文件读一次，之后每次增删**同步**写回。
+    ///
+    /// 不按文件拆开存：`bookmark::for_file` 按路径过滤，而列表上限是
+    /// 两千条（`MAX_BOOKMARKS`），线性扫一遍是纳秒级的事 —— 为它建
+    /// 一张按路径索引的 `HashMap` 是还没测出问题就先上复杂度。
+    bookmarks: Vec<crate::bookmark::Bookmark>,
+    /// 当前文件的书签菜单行缓存。
+    ///
+    /// **必须缓存**，不能等开菜单时现算：`menu::Snapshot` 拿的是
+    /// `&[BookmarkRow]`，而现算出来的 `Vec` 在构造 `Snapshot` 的那个
+    /// 表达式结束时就死了，借不出去。
+    ///
+    /// 刷新时机只有三处：`FileLoaded`、回到空闲态、书签增删之后。
+    bookmark_rows_cache: Vec<menu::BookmarkRow>,
 }
 
 /// 排队等弹的错误提示上限。
@@ -615,7 +640,7 @@ impl App {
                 h: 0,
             },
             pending_errors: Vec::new(),
-            open_dialog: false,
+            open_dialog: None,
             diag: Diagnostics::default(),
             panel,
             panel_rows: Vec::new(),
@@ -637,6 +662,10 @@ impl App {
             resume_done_for: None,
             notice: String::new(),
             notice_until: None,
+            bookmarks: load_bookmarks(),
+            // 空表是对的：这时还没有「当前文件」，`bookmark_rows()` 会
+            // 因为 `has_file` 为假而返回空。等 `FileLoaded` 再编。
+            bookmark_rows_cache: Vec::new(),
         }
     }
 
@@ -649,6 +678,23 @@ impl App {
         self.player
             .as_ref()
             .expect("播放核心尚未初始化：窗口创建流程有问题")
+    }
+
+    /// 当前播放项的文件路径。没有正在播放的文件时返回 `None`。
+    ///
+    /// 直接读 `playlist.current_item().path`，**不另存一份**「当前路径」：
+    /// 书签、续播、诊断报告要的都是同一个「当前文件」，多一个来源就多
+    /// 一处可能不一致的地方。
+    ///
+    /// `has_file` 这道门不能省 —— 启动时 `playlist` 是
+    /// `Playlist::single(PathBuf::new())`，一个空路径的壳。`current_item()`
+    /// 那时是合法调用，但返回的路径没有意义，会被书签当成一个真实的
+    /// 文件名存进表里。
+    fn current_path(&self) -> Option<PathBuf> {
+        if !self.state.has_file {
+            return None;
+        }
+        Some(self.playlist.current_item().path.clone())
     }
 
     /// 按当前状态重算布局，并同步给画面窗口。
@@ -1378,7 +1424,15 @@ impl App {
             // B 已经作废，而 mpv 那边的 b 也得清掉 —— 否则界面说「没设 B」
             // 而 mpv 还在拿旧的 b 循环，用户看到的现象是「明明只按了一次
             // Shift+←，它怎么自己在循环了」
-            let _ = p.set_string_property("ab-loop-b", "no");
+            // B 已经作废，而 mpv 那边的 b 也得清掉 —— 否则界面说「没设 B」
+            // 而 mpv 还在拿旧的 b 循环，用户看到的现象是「明明只按了一次
+            // Shift+←，它怎么自己在循环了」。
+            //
+            // 不吞掉错误：如果 a 设成功了而 b 清不掉，界面上说「没设 B」
+            // 而 mpv 还在循环旧 B，就是又一种「UI 说没播」。
+            if let Err(e) = p.set_string_property("ab-loop-b", "no") {
+                err = Some(e);
+            }
         }
         if let Some(e) = err {
             self.report_error(self.strings.err_command, &e);
@@ -1479,6 +1533,12 @@ impl App {
         let Some(p) = self.player.as_ref() else {
             return;
         };
+        // **值没变就别发往返 mpv。** 已经被夹在边界上时按 +/- 步进，
+        // `next` 会等于 `cur`，但 mpv 那边的值没变、提示也不该出现 ——
+        // 与其在图上刷一遍不变的值，不如一开始就 return。
+        if (next - cur).abs() < 1e-9 {
+            return;
+        }
         let r = p.set_string_property(prop, &format!("{val:.3}"));
         if let Err(e) = r {
             self.report_error(self.strings.err_command, &e);
@@ -1489,13 +1549,11 @@ impl App {
         } else {
             self.state.audio_delay = val;
         }
-        // 只在**动过**之后提示：从 0 加到 +0.05 也提示一次是有用的
-        // （确认这组键真的有用），但归零之后再提示就成噪音了。
         if val != cur {
             let label = if sub {
-                self.strings.menu_sub_delay_reset
+                self.strings.delay_sub
             } else {
-                self.strings.menu_audio_delay_reset
+                self.strings.delay_audio
             };
             self.show_notice(format!("{label} {}", menu_format_delay(val)));
         }
@@ -1633,6 +1691,24 @@ impl App {
         // 很烦。见 `UiState::sub_delay` 的注释。
         self.state.ab_a = None;
         self.state.ab_b = None;
+        // **Rust 侧清完还不够，mpv 那一边也要清。**
+        //
+        // 上一版只写了上面两行，注释还写着「必须逐文件清掉」—— 而 mpv 的
+        // `ab-loop-a` 仍然是上一个文件的值，于是第 2 集一加载就按旧区间
+        // 循环。更糟的是它**在界面上不可见**：菜单里的「清除 A-B 循环」
+        // 按 `ab_a.is_some()` 置灰，而那个已经是 None，于是「清除」也跟着
+        // 灰了 —— 用户看得见「它在循环」，却**没有任何办法关掉它**。
+        //
+        // 「没有 `ab-loop` 开关属性」这件事在这里再次成立，所以关掉只能
+        // 把 a 设成 `no`。
+        //
+        // 两个都设是多余的（a 一清 mpv 就不会再循环），但一起设能让 mpv
+        // 那边的状态与 `state` 严格一致 —— 免得将来有人读 `ab-loop-b`
+        // 时读到一个属于上一个文件的值。
+        if let Some(p) = self.player.as_ref() {
+            let _ = p.set_string_property("ab-loop-a", "no");
+            let _ = p.set_string_property("ab-loop-b", "no");
+        }
         // 诊断数据必须清。不清的话上一段视频的分辨率和丢帧数会留在面板上，
         // 看起来像新文件也丢了 10 帧——那是误导（丢帧计数 mpv 自己会重置，
         // 但解码器建好之前读到的还是旧文件的值）。
@@ -1677,6 +1753,28 @@ impl App {
         self.pending_sidecars = sidecars;
         let path = self.playlist.current_item().path.clone();
         self.open(&path);
+    }
+
+    /// 把目录中的视频按文件名自然序载入播放列表。
+    fn open_folder(&mut self, dir: &Path) {
+        let files = folder::scan(dir);
+        if files.is_empty() {
+            self.show_notice(self.strings.err_no_video_in_folder.to_string());
+            return;
+        }
+        let current = self
+            .state
+            .has_file
+            .then(|| self.playlist.current_item().path.clone());
+        let start = folder::preferred_start(&files, current.as_deref()).unwrap_or(0);
+        let mut paths = files.clone();
+        paths.extend(folder::scan_subtitles(dir));
+        let (Some(pl), Some(_)) = Playlist::from_paths(&paths) else {
+            return;
+        };
+        let sidecars = pl.items()[start].sidecar.iter().cloned().collect();
+        self.load_playlist(pl, start, sidecars);
+        self.show_notice(format!("{} {}", self.strings.folder_loaded, files.len()));
     }
 
     /// 拖放一批路径进来。
@@ -1964,15 +2062,44 @@ impl App {
         self.seek_absolute(self.state.duration * f64::from(digit) / 10.0);
     }
 
-    /// 保存当前画面到图片目录。
+    /// 保存当前画面。**0.9.0 起先问路径**，默认预填 `screenshot_path()`。
+    ///
+    /// 以前只能存进系统的「图片」目录，而那个目录在很多机器上根本不用 ——
+    /// 用户截完图不知道文件去哪儿了。现在弹一个预填好的输入框：直接回车
+    /// 就是原来的行为，想放别处就改。
     fn screenshot(&mut self) {
         if !self.state.has_file {
             return;
         }
-        let Some(path) = self.screenshot_path() else {
+        let Some(default) = self.screenshot_path() else {
             self.report_error(self.strings.err_screenshot, "no writable pictures folder");
             return;
         };
+
+        // 预填**完整路径**而不是只有文件名：想换地方的人多半是要挪到桌面
+        // 或某个项目目录，从完整路径上改比从头敲一遍快。
+        let initial = default.to_string_lossy().to_string();
+        let hwnd = self.hwnd;
+        let (t_title, t_prompt) = (
+            self.strings.screenshot_title,
+            self.strings.screenshot_prompt,
+        );
+        // 借用规则同 `add_bookmark`：`ask_text` 内部跑模态循环，调用期间
+        // 不能持有 `&mut self`。
+        let Some(entered) = crate::prompt::ask_text(hwnd, t_title, t_prompt, &initial) else {
+            // 取消就**真的**不截图。退回默认路径存一张会让「取消」失效，
+            // 而用户按取消往往正是因为不想要这张图。
+            return;
+        };
+
+        let path = PathBuf::from(entered);
+        // 先查路径再调 mpv：`screenshot_to_file` 失败时只会回一句笼统的
+        // 错误，分不出「目录不存在」和「这一帧截不出来」。分开报，
+        // 用户才知道该改什么。
+        if let Err(e) = check_screenshot_target(&path) {
+            self.report_error(self.strings.err_screenshot, &e);
+            return;
+        }
         if let Err(e) = self.player().screenshot_to_file(&path) {
             self.report_error(self.strings.err_screenshot, &e);
         }
@@ -2063,6 +2190,145 @@ impl App {
         self.invalidate_all();
     }
 
+    /// 显示书签输入对话框。
+    ///
+    // 1. 暂停播放（由 `handle_key` 中的 F2 调用者已完成）
+    // 2. 弹出自定义输入框让用户输入书签名称
+    // 3. 确认后保存书签（时间 + 名称）到书签文件
+    // 4. 重新恢复播放状态
+    /// 在当前位置加一条书签（`F2`，以及右键「书签」子菜单的第一项）。
+    ///
+    /// ## 为什么先暂停
+    ///
+    /// 弹窗是模态的：它在 `ask_text` 里跑自己的消息循环，而主窗口的
+    /// 消息循环**被挡住了**。也就是说弹窗期间 mpv 还在按它自己的时钟
+    /// 往前走 —— 视频继续播，而画面停在原来那一帧（主窗口收不到
+    /// WM_PAINT）。用户盯着一个不动的画面想名字，回头发现要记的位置
+    /// 已经跑掉五分钟了。
+    ///
+    /// 暂停把这个不一致消掉：想名字期间看到的帧就是会存下来的那个位置。
+    ///
+    /// 暂停之后**不自动恢复**。用户想名字的时候多半已经不想继续看那一段
+    /// 了，让他自己按空格恢复；自动恢复会让「我只想记个位置」变成
+    /// 「记完还得再按一次空格」。
+    fn add_bookmark(&mut self) {
+        if !self.state.has_file {
+            return;
+        }
+        // 先暂停。**记下原来是不是暂停的** —— 弹窗被取消时不该把一个
+        // 本来就在暂停的用户变成正在播，那是他自己停的。
+        let was_paused = self.state.paused;
+        if !was_paused {
+            self.toggle_pause();
+        }
+        let at = self.state.position;
+        if at < crate::bookmark::MIN_SECONDS {
+            // 片头的书签点回去等于没点，不值得占一条记录。
+            // 恢复播放：这一条走的是「什么都没做」，不该留下暂停这个副作用。
+            if !was_paused {
+                self.toggle_pause();
+            }
+            return;
+        }
+
+        // 默认名字是时间戳：直接回车就得到一个可用的名字，而不用自己想。
+        let initial = resume::format_position(at);
+        let hwnd = self.hwnd;
+        let (t_title, t_prompt) = (self.strings.bookmark_title, self.strings.bookmark_prompt);
+        // `ask_text` 是 **safe** 函数（它内部自己包了 unsafe），调它不必
+        // 再套一层。这里唯一要小心的是借用：它内部跑模态循环，期间不能
+        // 持有 `&mut self` —— 所以只把几个不可变的 `&str` 借出去，
+        // `self` 的独占借用在调用前就结束了（`t_title` / `t_prompt` 是
+        // `Copy` 的 `&'static str`，`hwnd` 是 `Copy` 的句柄）。
+        let name = crate::prompt::ask_text(hwnd, t_title, t_prompt, &initial);
+
+        // 取消：不留书签，也不改播放状态（保持暂停，见上）。
+        let Some(name) = name else { return };
+
+        let Some(path) = self.current_path() else {
+            return;
+        };
+        let added = crate::bookmark::add(
+            &mut self.bookmarks,
+            crate::bookmark::Bookmark {
+                path,
+                position: at,
+                title: name,
+            },
+        );
+        if !added {
+            return;
+        }
+        if let Err(e) = self.write_bookmarks() {
+            self.report_error(self.strings.err_bookmark, &e);
+            return;
+        }
+        self.refresh_bookmark_rows();
+        self.show_notice(self.strings.info_bookmark_saved.to_string());
+    }
+
+    /// 跳到当前文件的第 `n` 条书签。
+    ///
+    /// `n` 是**菜单里那一段的顺序**，所以跳转前重新取一次列表 ——
+    /// 用户可能刚加了书签，旧的下标已经不对了。
+    fn jump_bookmark(&mut self, n: usize) {
+        let Some(path) = self.current_path() else {
+            return;
+        };
+        let list = crate::bookmark::for_file(&self.bookmarks, &path);
+        let Some(bm) = list.get(n) else { return };
+        self.seek_absolute(bm.position);
+    }
+
+    /// 删掉当前文件的全部书签。
+    fn clear_bookmarks(&mut self) {
+        let Some(path) = self.current_path() else {
+            return;
+        };
+        let n = crate::bookmark::remove_file(&mut self.bookmarks, &path);
+        if n == 0 {
+            return;
+        }
+        if let Err(e) = self.write_bookmarks() {
+            self.report_error(self.strings.err_bookmark, &e);
+            return;
+        }
+        self.refresh_bookmark_rows();
+        self.show_notice(self.strings.info_bookmark_cleared.to_string());
+    }
+
+    /// 书签落盘。**同步写**：书签是用户明确要求记住的东西，而写一个
+    /// 几百 KB 的文本是毫秒级 —— 不值得为它引入延迟写入队列
+    /// （`resume` 那种每 3 秒节流的策略在这里反而会丢书签）。
+    fn write_bookmarks(&self) -> Result<(), String> {
+        let Some(dir) = crashlog::appdata_dir() else {
+            return Err("no writable data folder".to_string());
+        };
+        let text = crate::bookmark::serialize(&self.bookmarks);
+        std::fs::write(crate::bookmark::file_in(&dir), text).map_err(|e| e.to_string())
+    }
+
+    /// 重编书签子菜单的那一段行。
+    fn refresh_bookmark_rows(&mut self) {
+        self.bookmark_rows_cache = self.bookmark_rows();
+    }
+
+    /// 当前文件的书签菜单行。
+    fn bookmark_rows(&self) -> Vec<menu::BookmarkRow> {
+        let Some(path) = self.current_path() else {
+            return Vec::new();
+        };
+        crate::bookmark::for_file(&self.bookmarks, &path)
+            .into_iter()
+            .map(|b| menu::BookmarkRow {
+                // 名字截到 28 个字符：菜单宽约 380 DIP，减去时间戳与
+                // 留白剩下的空间放不下更多，而超长名字不截会把子菜单
+                // 顶到屏幕外（见 `build_timing` 里关于菜单翻转的说明）。
+                label: crate::bookmark::short_title(&b.title, 28),
+                at: resume::format_position(b.position),
+            })
+            .collect()
+    }
     /// 请求打开文件对话框。
     ///
     /// 这里**不**直接调 rfd 的模态对话框，只置个标志再 PostMessage。
@@ -2070,7 +2336,18 @@ impl App {
     /// 而那时上层还持有一个 `&mut App`。真正开对话框的代码在
     /// `WM_APP_OPEN_DIALOG` 分支里，那里的借用已经结束了。
     fn pick_file(&mut self) {
-        self.open_dialog = true;
+        self.pick_dialog(DialogKind::File);
+    }
+
+    fn pick_folder(&mut self) {
+        self.pick_dialog(DialogKind::Folder);
+    }
+
+    fn pick_dialog(&mut self, kind: DialogKind) {
+        if self.open_dialog.is_some() {
+            return;
+        }
+        self.open_dialog = Some(kind);
         unsafe {
             let _ = PostMessageW(Some(self.hwnd), WM_APP_OPEN_DIALOG, WPARAM(0), LPARAM(0));
         }
@@ -2212,6 +2489,9 @@ impl App {
                     // 轨道这时才存在。菜单如果正开着，行数会变，必须重排；
                     // 没开也要刷新，否则用户开菜单时读到的是上一个文件的轨
                     self.refresh_tracks();
+                    // 书签是**按当前文件**过滤出来的，换文件就必须重编
+                    // 这一段，否则新文件打开菜单看到的是上一个文件的书签。
+                    self.refresh_bookmark_rows();
                     if self.panel == PanelMode::Tracks {
                         layout_dirty = true;
                     }
@@ -2245,6 +2525,9 @@ impl App {
         self.state.duration = 0.0;
         // 同 `stop`：播完之后不留上一段的轨道状态
         self.clear_tracks();
+        // 书签同理：已经没有文件了，菜单里那一段要变回「（没有书签）」。
+        // `has_file` 在上面就设成 `false` 了，所以这里必然编出空表。
+        self.refresh_bookmark_rows();
         surface::set_video_visible(self.video, false);
         was_active
     }
@@ -2439,6 +2722,48 @@ impl App {
 /// `SetWindowOrgEx` 平移内存 DC 的原点，但它要的是**负**偏移
 /// （客户区 `(0,0)` 落在位图的哪个像素），而 GDI 直接拒绝负值。
 /// 与其绕开这个坑，不如让位图和客户区保持同一套坐标系。
+/// 从磁盘读书签。文件不存在 / 读不动 / 内容坏了，一律返回空表。
+///
+/// 「读不到」和「没有书签」在界面上是同一件事（菜单显示「（没有书签）」），
+/// 所以这里**不返回 `Result`**：让调用方为一件它无法处理的事写错误分支
+/// 没有意义 —— 一个刚装好的用户第一次启动就是这个状态，那不是错误。
+///
+/// 内容坏掉时 `bookmark::parse` 自己会尽量抢救（见那里的 resync 逻辑），
+/// 这里不做二次校验。
+/// 校验截图目标路径。`Err` 里是**能照着改**的原因，不是错误码。
+///
+/// 只查两件静态的事：路径不是目录、父目录确实存在。**不预先建文件探
+/// 写权限** —— mpv 写失败时会经由调用方那条 `report_error` 出来，那不是
+/// 静默失败；而探测用的临时文件一旦清理失败，就会在用户目录里留下垃圾，
+/// 代价比它挡住的问题大。
+fn check_screenshot_target(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("the path is empty".to_string());
+    }
+    // 填了一个已存在的目录：`screenshot_to_file` 会失败，但它的错误信息
+    // 看不出「你填的是个文件夹」。这里先说清楚。
+    if path.is_dir() {
+        return Err(format!("{} is a folder, not a file", path.display()));
+    }
+    match path.parent() {
+        // 只有文件名、没有目录部分是合法的：mpv 会当成当前目录下的
+        // 相对路径。空 `parent()` 就是这种情况。
+        Some(p) if p.as_os_str().is_empty() || p.is_dir() => Ok(()),
+        Some(p) => Err(format!("no such folder: {}", p.display())),
+        None => Err("the path has no folder part".to_string()),
+    }
+}
+
+fn load_bookmarks() -> Vec<crate::bookmark::Bookmark> {
+    let Some(dir) = crashlog::appdata_dir() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(crate::bookmark::file_in(&dir)) else {
+        return Vec::new();
+    };
+    crate::bookmark::parse(&text)
+}
+
 fn blit_points(dirty: &RECT) -> (i32, i32, i32, i32) {
     (dirty.left, dirty.top, dirty.left, dirty.top)
 }
@@ -2743,14 +3068,21 @@ unsafe extern "system" fn app_wnd_proc(
         WM_APP_OPEN_DIALOG => {
             // 同上：rfd 的对话框也是模态的，这里同样没有借用 App。
             // 标志先清再开框，避免对话框被重入时排队的消息重复开一个。
-            if (*app_ptr).open_dialog {
-                (*app_ptr).open_dialog = false;
-                // 先取文案副本（Strings 是 Copy）：`pick_video_dialog` 之后要
-                // 拿 `&mut App`，借用不能跨过模态调用
-                let strings = (*app_ptr).strings;
-                if let Some(path) = pick_video_dialog(&strings) {
-                    (&mut *app_ptr).open(&path);
+            // 在进入模态消息循环之前结束 App 的可变借用。
+            let dialog = (*app_ptr).open_dialog.take();
+            let strings = (*app_ptr).strings;
+            match dialog {
+                Some(DialogKind::File) => {
+                    if let Some(path) = pick_video_dialog(&strings) {
+                        (&mut *app_ptr).open(&path);
+                    }
                 }
+                Some(DialogKind::Folder) => {
+                    if let Some(path) = pick_folder_dialog(&strings) {
+                        (&mut *app_ptr).open_folder(&path);
+                    }
+                }
+                None => {}
             }
             LRESULT(0)
         }
@@ -2933,6 +3265,36 @@ unsafe extern "system" fn app_wnd_proc(
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
         }
+        // **Alt 按着时，其它键走的是 `WM_SYSKEYDOWN` 而不是 `WM_KEYDOWN`。**
+        //
+        // 只处理 `WM_KEYDOWN` 的话，`Alt+←` / `Alt+→`（0.8.0 的音频延迟）
+        // 会**整个消失**：窗口过程根本收不到那条消息，而本窗口
+        // `WS_POPUP | WS_OVERLAPPEDWINDOW` 又没有菜单栏，于是
+        // `DefWindowProcW` 什么也不做 —— 用户按了 Alt+→，屏幕上什么都没有，
+        // **也没有任何提示**。
+        //
+        // `Ctrl` 与 `Shift` 不受这个影响（它们不改变消息的种类）。
+        //
+        // ## 为什么不把整个 `WM_SYSKEYDOWN` 都转给 `handle_key`
+        //
+        // 那样会连带把 `Alt+F4` / `Alt+Tab` / `Alt+Esc` 也吞掉 ——
+        // 那几个是系统级的，用户按了必须有反应。所以这里**只**转发
+        // 「Alt + 方向键」这一种，其余交回 `DefWindowProcW`。
+        //
+        // 加这一条之后 `verify-ui.ps1` 的 `audioDelayShowsNotice` 从
+        // 「靠像素噪声蒙混过关」变成真的验到了：它之前一直是绿的，
+        // 因为 `Alt+→` 根本没送到，而前一条「字幕延迟」的提示还挂在
+        // 控制栏上，于是那两次抓图恰好不一样。
+        WM_SYSKEYDOWN => {
+            let vk = wparam.0 as u16;
+            let alt_down = GetKeyState(VK_MENU.0 as i32) < 0;
+            let is_alt_arrow = alt_down && (vk == VK_LEFT.0 || vk == VK_RIGHT.0);
+            if is_alt_arrow && handle_key(app_ptr, vk) {
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         WM_DROPFILES => {
             handle_drop(app_ptr, HDROP(wparam.0 as *mut c_void));
             LRESULT(0)
@@ -2973,15 +3335,21 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
 /// `&mut App` 撞车（同 `handle_key` 的理由）。
 fn pick_video_dialog(strings: &lang::Strings) -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .add_filter(
-            strings.dlg_filter_video,
-            &[
-                "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpg", "mpeg",
-            ],
-        )
+        .add_filter(strings.dlg_filter_video, folder::VIDEO_EXTS)
         .add_filter(strings.dlg_filter_all, &["*"])
         .set_title(strings.dlg_title)
         .pick_file()
+}
+
+/// 目录选择对话框。返回 `None` = 用户取消。
+///
+/// 与 `pick_video_dialog` 一样**不接 `&mut App`**：rfd 的对话框是模态的，
+/// 它自己会转一圈消息循环 —— 那期间如果手里还借着一个 `&mut App`，而同一个
+/// 窗口过程又要解引用那块 `Box<App>`，就是最难查的那种崩溃。
+fn pick_folder_dialog(strings: &lang::Strings) -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .set_title(strings.dlg_title_folder)
+        .pick_folder()
 }
 
 /// 键盘快捷键。返回 true 表示已处理。
@@ -3131,6 +3499,20 @@ unsafe fn handle_key(app_ptr: *mut App, vk: u16) -> bool {
         }
         _ if key(VK_F.0) => {
             (&mut *app_ptr).toggle_theatre();
+            true
+        }
+        _ if key(VK_F2.0) => {
+            // F2：加书签。
+            //
+            // **暂停与弹窗都在 `add_bookmark` 里面**，这里不能再调
+            // `toggle_pause` —— 那样会切换两次，净效果是「不暂停」，
+            // 而「先暂停再问名字」正是这个动作的前提（否则用户想名字的
+            // 十几秒里画面还在往前走，他记的位置早就过去了）。
+            (&mut *app_ptr).add_bookmark();
+            true
+        }
+        _ if key(VK_O.0) && ctrl && shift => {
+            (&mut *app_ptr).pick_folder();
             true
         }
         _ if key(VK_O.0) && ctrl => {
@@ -3402,6 +3784,7 @@ fn show_context_menu(app_ptr: *mut App) {
             sub_delay: app.state.sub_delay,
             audio_delay: app.state.audio_delay,
             tracks: &app.tracks,
+            bookmarks: &app.bookmark_rows_cache,
         };
         menu::show(app.hwnd, sx, sy, &app.strings, snap)
     };
@@ -3442,6 +3825,10 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
             (&mut *app_ptr).set_sub_scale(v);
             return;
         }
+        menu::Decoded::Bookmark(n) => {
+            (&mut *app_ptr).jump_bookmark(n);
+            return;
+        }
         // 占位项（`NO_TRACK_ID`）和任何越界值。不当错误处理：菜单里那个
         // 灰掉的「（这个文件没有音轨）」就是占位项，弹错误框既没帮助
         // 又会打断操作。
@@ -3452,6 +3839,7 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
     let app = &mut *app_ptr;
     match cmd {
         id::OPEN => app.pick_file(),
+        id::OPEN_FOLDER => app.pick_folder(),
         id::PLAY_PAUSE => app.toggle_pause(),
         id::STOP => app.stop(),
         id::SUB_OFF => {
@@ -3509,6 +3897,10 @@ unsafe fn run_menu_command(app_ptr: *mut App, cmd: menu::Command) {
         id::AUDIO_DELAY_INC => app.nudge_delay(false, DELAY_STEP),
         id::AUDIO_DELAY_DEC => app.nudge_delay(false, -DELAY_STEP),
         id::AUDIO_DELAY_RESET => app.reset_delay(false),
+        // 书签。加书签会弹输入框（`add_bookmark` 内部跑模态循环），
+        // 所以它和别的动作一样是「一次借用、一步做完」，不需要特殊处理。
+        id::BOOKMARK_ADD => app.add_bookmark(),
+        id::BOOKMARK_CLEAR => app.clear_bookmarks(),
         _ => {}
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "video-view"
-version = "0.8.0"
+version = "0.9.0"
 description = "轻量级 Windows 桌面视频播放器，基于 libmpv 与原生 Win32 界面"
 authors = ["VideoView contributors"]
 license = "GPL-3.0-or-later"
@@ -47,6 +47,8 @@ windows = { version = "0.62", features = [
   "Win32_System_SystemServices",
   # 日志目录：CreateDirectoryW / GetFileAttributesW
   "Win32_Storage_FileSystem",
+  # EM_SETSEL：文本输入框里全选预填内容（见 prompt 模块）
+  "Win32_UI_Controls",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   # HDROP / DragAcceptFiles / DragQueryFileW / SHGetKnownFolderPath（图片目录）

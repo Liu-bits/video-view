@@ -202,6 +202,12 @@ pub struct Strings {
     pub dlg_filter_video: &'static str,
     pub dlg_filter_all: &'static str,
     pub dlg_title: &'static str,
+    /// 目录选择对话框的标题。
+    ///
+    /// **与 `dlg_title` 分开**：系统对话框的标题栏是用户判断「我是不是点错
+    /// 了按钮」的唯一依据，两个对话框共用一个标题会让用户在文件夹框里
+    /// 看到「选择要播放的视频」。
+    pub dlg_title_folder: &'static str,
 
     // ---- 错误标题（MessageBox 标题栏）----
     pub err_startup: &'static str,
@@ -217,6 +223,12 @@ pub struct Strings {
     // ---- 错误正文 ----
     pub err_bad_unicode: &'static str,
     pub err_not_a_file: &'static str,
+    /// 「打开的文件夹里没有视频」。**单独一条**而不是复用 `err_not_a_file`：
+    /// 选错了一层目录是完全正常的事，弹「拖进来的不是文件」会让他以为
+    /// 程序坏了。
+    pub err_no_video_in_folder: &'static str,
+    /// 「已载入 N 个文件」的瞬时提示。
+    pub folder_loaded: &'static str,
 
     // ---- 启动阶段的致命错误 ----
     pub err_read_target: &'static str,
@@ -253,6 +265,10 @@ pub struct Strings {
     pub err_command: &'static str,
 
     // ---- 截图 / 诊断报告 ----
+    /// 截图路径输入弹窗的标题
+    pub screenshot_title: &'static str,
+    /// 截图路径输入弹窗里的提示文字
+    pub screenshot_prompt: &'static str,
     pub err_screenshot: &'static str,
     pub err_report: &'static str,
     pub info_report_copied: &'static str,
@@ -261,6 +277,8 @@ pub struct Strings {
     // 键位右边不写快捷键：右键菜单是「不知道有快捷键」的用户唯一的发现
     // 途径，菜单项多了括号反而挤。快捷键在 `?` 那一页。
     pub menu_open: &'static str,
+    /// 「打开文件夹...」。与 `menu_open` 并排放在第一组。
+    pub menu_open_folder: &'static str,
     pub menu_play_pause: &'static str,
     pub menu_stop: &'static str,
     pub menu_audio: &'static str,
@@ -328,6 +346,24 @@ pub struct Strings {
     pub menu_advanced: &'static str,
     /// 右键菜单里的「从头播放」
     pub menu_from_beginning: &'static str,
+    /// 右键菜单里的「书签」
+    pub menu_bookmark: &'static str,
+    /// 书签子菜单里的「添加书签（F2）」
+    pub menu_bookmark_add: &'static str,
+    /// 书签子菜单里的「清除本文件全部书签」
+    pub menu_bookmark_clear: &'static str,
+    /// 一个书签都没有时的占位
+    pub menu_bookmark_none: &'static str,
+    /// 书签输入弹窗的标题
+    pub bookmark_title: &'static str,
+    /// 书签输入弹窗里的提示文字
+    pub bookmark_prompt: &'static str,
+    /// 「书签已保存」一类的瞬时提示前缀
+    pub info_bookmark_saved: &'static str,
+    /// 「书签已删除」
+    pub info_bookmark_cleared: &'static str,
+    /// 书签输入失败（写不进文件）
+    pub err_bookmark: &'static str,
     // ---- 快捷键总览 ----
     pub help_play_pause: &'static str,
     pub help_seek: &'static str,
@@ -384,6 +420,13 @@ pub struct Strings {
     pub ab_cleared: &'static str,
     pub ab_need_a: &'static str,
     pub ab_b_before_a: &'static str,
+    /// 「字幕延迟」/「音频延迟」的**名字**（不带数值、不带动作）。
+    ///
+    /// **不能**复用 `menu_sub_delay_reset`（「字幕延迟归零」）：那是菜单里
+    /// 那个「归零（-0.15）」按钮的标题，而控制栏的瞬时提示说的是
+    /// 「我把值调到了 +0.15」—— 写「归零 +0.15」是自相矛盾的。
+    pub delay_sub: &'static str,
+    pub delay_audio: &'static str,
 }
 
 impl Strings {
@@ -409,6 +452,8 @@ impl Strings {
             dlg_filter_video: "Video files",
             dlg_filter_all: "All files",
             dlg_title: "Select a video to play",
+            dlg_title_folder: "Select a folder to play",
+            menu_open_folder: "Open folder...",
             err_startup: "VideoView failed to start",
             err_video_window: "Could not create the video window",
             err_open: "Could not open the file",
@@ -420,6 +465,8 @@ impl Strings {
             err_playback: "Playback error",
             err_bad_unicode: "The file path is not valid Unicode and cannot be processed.",
             err_not_a_file: "What was dropped is not a file.",
+            err_no_video_in_folder: "There are no video files in this folder.",
+            folder_loaded: "Loaded",
             err_read_target: "Could not read the startup target: {e}",
             err_register_class: "Could not register the window class: {e}",
             diag_hwdec: "Decode",
@@ -440,6 +487,8 @@ impl Strings {
             diag_vo_drops: "output dropped frames",
             diag_fps_behind: "actual FPS is below the file's",
             err_command: "The playback engine rejected a command",
+            screenshot_title: "Save screenshot",
+            screenshot_prompt: "Save to:",
             err_screenshot: "Could not save the screenshot",
             err_report: "Could not copy the diagnostics report",
             info_report_copied: "Diagnostics copied to the clipboard.",
@@ -513,6 +562,15 @@ impl Strings {
             menu_prev: "Previous file",
             menu_advanced: "Advanced mode",
             menu_from_beginning: "Play from the beginning",
+            menu_bookmark: "Bookmarks",
+            menu_bookmark_add: "Add bookmark (F2)",
+            menu_bookmark_clear: "Delete all bookmarks for this file",
+            menu_bookmark_none: "(no bookmarks for this file)",
+            bookmark_title: "Add bookmark",
+            bookmark_prompt: "Bookmark name:",
+            info_bookmark_saved: "Bookmark saved",
+            info_bookmark_cleared: "Bookmarks deleted",
+            err_bookmark: "Could not save the bookmark",
             panel_playlist: "Playlist",
             playlist_no_sidecar: "(no external subtitle)",
             help_playlist: "Playlist panel",
@@ -525,6 +583,8 @@ impl Strings {
             ab_cleared: "A-B loop cleared",
             ab_need_a: "Set the A point first (Shift+Left)",
             ab_b_before_a: "B point is before A point; nothing marked",
+            delay_sub: "Subtitle delay",
+            delay_audio: "Audio delay",
         }
     }
 
@@ -541,6 +601,8 @@ impl Strings {
             dlg_filter_video: "视频文件",
             dlg_filter_all: "所有文件",
             dlg_title: "选择要播放的视频",
+            dlg_title_folder: "选择要播放的文件夹",
+            menu_open_folder: "打开文件夹...",
             err_startup: "VideoView 启动失败",
             err_video_window: "无法创建画面窗口",
             err_open: "打开文件失败",
@@ -552,6 +614,8 @@ impl Strings {
             err_playback: "播放出错",
             err_bad_unicode: "文件路径不是合法的 Unicode，无法处理。",
             err_not_a_file: "拖进来的不是文件。",
+            err_no_video_in_folder: "这个文件夹里没有视频文件",
+            folder_loaded: "已载入",
             err_read_target: "读取启动目标失败：{e}",
             err_register_class: "注册窗口类失败：{e}",
             diag_hwdec: "解码",
@@ -572,6 +636,8 @@ impl Strings {
             diag_vo_drops: "显示端丢了帧",
             diag_fps_behind: "实际帧率低于文件标称",
             err_command: "播放核心拒绝了一条命令",
+            screenshot_title: "保存截图",
+            screenshot_prompt: "保存到：",
             err_screenshot: "截图保存失败",
             err_report: "复制诊断信息失败",
             info_report_copied: "诊断信息已复制到剪贴板。",
@@ -645,6 +711,15 @@ impl Strings {
             menu_prev: "上一个文件",
             menu_advanced: "高级模式",
             menu_from_beginning: "从头播放",
+            menu_bookmark: "书签",
+            menu_bookmark_add: "添加书签（F2）",
+            menu_bookmark_clear: "删除本文件全部书签",
+            menu_bookmark_none: "（本文件还没有书签）",
+            bookmark_title: "添加书签",
+            bookmark_prompt: "书签名字：",
+            info_bookmark_saved: "书签已保存",
+            info_bookmark_cleared: "书签已删除",
+            err_bookmark: "书签保存失败",
             panel_playlist: "播放列表",
             playlist_no_sidecar: "（没有随这条视频一起拖进来的外挂字幕）",
             help_playlist: "播放列表面板",
@@ -657,6 +732,8 @@ impl Strings {
             ab_cleared: "A-B 循环已清除",
             ab_need_a: "请先按 Shift+← 标记 A 点",
             ab_b_before_a: "B 点在 A 点之前，未标记",
+            delay_sub: "字幕延迟",
+            delay_audio: "音频延迟",
         }
     }
 
@@ -780,7 +857,7 @@ mod tests {
         let en = Strings::new(Lang::En);
         let zh = Strings::new(Lang::ZhCn);
         // err_startup 故意两语言都带 "VideoView"（产品名，不该翻）
-        let en_fields: [(&str, &str); 20] = [
+        let en_fields: [(&str, &str); 24] = [
             ("idle_hint", en.idle_hint),
             ("btn_open", en.btn_open),
             ("btn_play", en.btn_play),
@@ -801,11 +878,15 @@ mod tests {
             ("err_mute", en.err_mute),
             ("err_playback", en.err_playback),
             ("err_bad_unicode", en.err_bad_unicode),
+            ("err_no_video_in_folder", en.err_no_video_in_folder),
+            ("folder_loaded", en.folder_loaded),
+            ("delay_sub", en.delay_sub),
+            ("delay_audio", en.delay_audio),
         ];
         for (name, s) in en_fields {
             assert!(!has_cjk(s), "英文字段 {name} 里混进了中文：{s}");
         }
-        let zh_fields: [(&str, &str); 10] = [
+        let zh_fields: [(&str, &str); 14] = [
             ("btn_open", zh.btn_open),
             ("btn_play", zh.btn_play),
             ("btn_pause", zh.btn_pause),
@@ -816,6 +897,10 @@ mod tests {
             ("err_seek", zh.err_seek),
             ("err_playback", zh.err_playback),
             ("err_not_a_file", zh.err_not_a_file),
+            ("err_no_video_in_folder", zh.err_no_video_in_folder),
+            ("folder_loaded", zh.folder_loaded),
+            ("delay_sub", zh.delay_sub),
+            ("delay_audio", zh.delay_audio),
         ];
         for (name, s) in zh_fields {
             assert!(has_cjk(s), "中文字段 {name} 里没有中文，疑似漏翻：{s}");

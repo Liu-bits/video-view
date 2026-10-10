@@ -271,9 +271,13 @@ fn belongs_to(sub: &Path, video_name: &str) -> bool {
     // 带语言后缀的那种。**必须连点一起比**，否则 `movie2` 会匹配上 `movie`
     // —— 那是个真会发生的错：目录里常有 `movie.mp4` 与 `movie2.mp4`。
     let prefix_len = video_stem.len();
-    sub_stem.len() > prefix_len
-        && sub_stem[..prefix_len].eq_ignore_ascii_case(video_stem)
-        && sub_stem.as_bytes()[prefix_len] == b'.'
+    // 使用 to_ascii_lowercase 进行忽略大小写前缀比较，避免 `sub_stem[..prefix_len]`
+    // 在多字节字符边界 panic。to_ascii_lowercase 永不 panic，只转换 ASCII 大小写。
+    let sub_lower = sub_stem.to_ascii_lowercase();
+    let video_lower = video_stem.to_ascii_lowercase();
+    let prefix_match =
+        sub_lower.starts_with(&video_lower) && sub_stem.as_bytes()[prefix_len] == b'.';
+    sub_stem.len() > prefix_len && prefix_match
 }
 
 /// 去掉**最后一个**扩展名。
@@ -321,6 +325,34 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    /// 中文视频名 + 中文语言后缀的字幕。
+    ///
+    /// 这一条钉的是一个**会 panic 的 bug**：`belongs_to` 原来用
+    /// `sub_stem[..prefix_len]` 按**字节**切前缀，而 `prefix_len` 来自
+    /// `video_stem.len()`（也是字节数）。如果字幕文件名以中文开头，
+    /// 而视频文件名以 ASCII 开头（例如 `a.mp4` + `电.zh.srt`），
+    /// `sub_stem[..1]` 就会切在一个多字节字符中间 → panic。
+    #[test]
+    fn 字幕匹配_中文视频名不会在字符中间切片() {
+        // 「电影」是 6 个 UTF-8 字节，`电影.zh` 的点在第 6 字节之后 ——
+        // 恰好是字符边界；换成更长的中文名，旧的字节下标就会切进字符中间。
+        assert!(belongs_to(&p(r"d:\v\电影.zh.srt"), "电影.mp4"));
+        assert!(belongs_to(&p(r"d:\v\电影版.zh.srt"), "电影版.mp4"));
+        // 不匹配的仍然不匹配（不能因为修了 panic 就放宽规则）
+        assert!(!belongs_to(&p(r"d:\v\电影2.zh.srt"), "电影.mp4"));
+
+        // 真正的 panic 案例：视频名是 ASCII，字幕名是中文。
+        // `sub_stem[..1]` 会切在「电」的中间。
+        //
+        // `_video` 前缀是刻意的：`belongs_to` 收的是**视频名字符串**，
+        // 这里要的只是一个普通 ASCII 名字，所以下面直接传字面量，
+        // 不需要真的建出 `Path`。
+        let _video = Path::new(r"d:\v\a.mp4");
+        let sub = Path::new(r"d:\v\电.zh.srt");
+        // 不 panic 的调用本身就是通过
+        let _ = belongs_to(sub, "a.mp4");
     }
 
     #[test]

@@ -1,0 +1,47 @@
+# .editorconfig —— 编辑器无关的基础格式约定。
+#
+# 与 .gitattributes 是**一对**，缺一个就会出现抖动：
+#   * .gitattributes 管「入库时按什么行尾存」
+#   * .editorconfig 管「编辑器里敲出来是什么行尾」
+# 两边不一致时，编辑器写 CRLF、git 转成 LF，同一行代码反复产生整文件 diff。
+# 所以下面每一条 end_of_line 都要能在 .gitattributes 里找到依据。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# PowerShell：LF。
+# .gitattributes 里 `*.ps1 text eol=lf`，且仓库里 5 个 .ps1 实测都是 LF。
+# PowerShell 读 LF 脚本完全正常，不要为了「Windows 上看着顺眼」改成 CRLF。
+[*.ps1]
+end_of_line = lf
+
+# 批处理：必须 CRLF。cmd.exe 解析多行 if/for 块时对行尾敏感。
+[*.{bat,cmd}]
+end_of_line = crlf
+
+# NSIS 安装脚本：必须 CRLF。
+# .gitattributes 里这条是 `*.nsi -text`（git 完全不碰行尾），
+# 所以编辑器更不能擅自改成 LF。
+[*.nsi]
+end_of_line = crlf
+
+# 配置类文件惯例 2 空格
+[*.{toml,yml,yaml,json}]
+indent_size = 2
+
+# Markdown：行尾两个空格 = 硬换行，缩进有语义，都不能被自动清理
+[*.md]
+trim_trailing_whitespace = false
+indent_size = 2
+
+# 二进制 / 测试媒体：不做任何文本处理
+[*.{png,ico,icns,dll,exe,7z,zip,mp4,mkv,avi,mov,wmv,webm,flv,ogg,mp3,srt,ass,ssa,vtt}]
+insert_final_newline = false
+trim_trailing_whitespace = false

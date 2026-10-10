@@ -80,6 +80,8 @@ pub mod base {
     pub const CODING: u16 = 3000;
     /// 字幕大小项（`sub-scale`）
     pub const SCALE: u16 = 3100;
+    /// 书签项（当前文件的书签，点一条跳到那个位置）
+    pub const BOOKMARK: u16 = 3200;
 }
 
 /// 每段的长度（能放多少个项）。
@@ -99,6 +101,16 @@ pub const SEGMENTS: &[(u16, u16)] = &[
     (base::SUB, 1000),
     (base::CODING, 40),
     (base::SCALE, 40),
+    // 给满 `MAX_BOOKMARKS` 个名额。
+    //
+    // 这里原本写的是 200，而 `bookmark::MAX_BOOKMARKS` 是 2000 ——
+    // 第 201 条书签的 ID 就落到段外了，`decode` 把它解成 `Unknown`，
+    // **点了没反应，而且没有任何提示**（`run_menu_command` 里 `Unknown`
+    // 是安静返回的）。段长只是一段没被用到的 ID 空间，不占运行时代价，
+    // 没有理由比真实上限更紧。
+    //
+    // 下面 `书签段的容量至少等于书签上限` 那条测试钉着这个不变量。
+    (base::BOOKMARK, crate::bookmark::MAX_BOOKMARKS as u16),
 ];
 
 /// 「没有轨道」时的占位项 ID。
@@ -111,6 +123,7 @@ const NO_TRACK_ID: u16 = 0xffff;
 /// 固定命令项的 ID。
 pub mod id {
     pub const OPEN: u16 = 1;
+    pub const OPEN_FOLDER: u16 = 71;
     pub const PLAY_PAUSE: u16 = 2;
     pub const STOP: u16 = 3;
 
@@ -168,6 +181,12 @@ pub mod id {
     pub const AUDIO_DELAY_INC: u16 = 68;
     pub const AUDIO_DELAY_DEC: u16 = 69;
     pub const AUDIO_DELAY_RESET: u16 = 70;
+    /// 书签：F2 添加；右键「书签」子菜单里管理。
+    ///
+    /// 两个固定项（添加 / 清除本文件全部）与一段动态列表共用一段编号：
+    /// 动态列表是 `base::BOOKMARK + 下标`，见 `Decoded::Bookmark`。
+    pub const BOOKMARK_ADD: u16 = 72;
+    pub const BOOKMARK_CLEAR: u16 = 73;
 }
 
 /// 菜单里可选的字幕编码，映射到 mpv 的 `sub-codepage`。
@@ -239,6 +258,8 @@ pub enum Decoded {
     SubCoding(&'static str),
     /// 把 `sub-scale` 设成这个值
     SubScale(f64),
+    /// 跳到当前文件的第 `n` 条书签
+    Bookmark(usize),
     /// 占位项或不该出现的东西。不当错误处理。
     Unknown,
 }
@@ -273,6 +294,7 @@ pub fn decode(cmd: Command) -> Decoded {
                 Some(v) => Decoded::SubScale(*v),
                 None => Decoded::Unknown,
             },
+            base::BOOKMARK => Decoded::Bookmark(n),
             // `SEGMENTS` 里出现了一个上面没处理的新起点。加段的人忘了在
             // 这里加分支 —— 宁可当未知，也不要把别的段的语义套上去。
             _ => Decoded::Unknown,
@@ -324,7 +346,11 @@ pub struct Snapshot<'a> {
     /// mpv 的 `ab-loop` 要 a 和 b **都**是有效时间才生效，只设 b 等于
     /// 没设。与其让用户点了之后发现没反应，不如一开始就灰掉。
     pub ab_set: bool,
-    /// A、B 都设好了（也就是「正在循环」）。
+    /// A **和** B 都标好了。
+    ///
+    /// `ab_set` 只表示 A 标了，而 A-B 循环要两个点都有效 —— 这个字段是
+    /// 给「清除」按钮用的：只有 A 和 B 都标了才该允许清除。没有 A 或
+    /// 两者都没有时，「清除」是灰的，不然用户会点击「清除」发现什么都没变。
     pub ab_active: bool,
     /// 当前字幕延迟（mpv 的 `sub-delay`，秒）。
     ///
@@ -334,6 +360,22 @@ pub struct Snapshot<'a> {
     /// 当前音频延迟（mpv 的 `audio-delay`，秒）。
     pub audio_delay: f64,
     pub tracks: &'a TrackSet,
+    /// 当前文件的书签，已经按位置排好序（见 `bookmark::for_file`）。
+    ///
+    /// 借用切片而不是 `&[Bookmark]`：菜单要的是**画出来的那一行**
+    /// （截短的名字 + 格式化的时间），那个字符串由 `App` 侧拼好。
+    /// 在菜单里现拼会多几十次 `format!`，而菜单是一弹就关的东西 ——
+    /// 但这两者的差别不值得为此在 `Snapshot` 上多挂一个借用。
+    pub bookmarks: &'a [BookmarkRow],
+}
+
+/// 书签子菜单里的一项。标签由 `App` 侧拼好，菜单只负责画。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BookmarkRow {
+    /// 截短过的名字
+    pub label: String,
+    /// 格式化的时间，如 `12:34`
+    pub at: String,
 }
 
 /// 弹出菜单并等用户选完。返回选中的命令（按 Esc / 点外面关掉则 `None`）。
@@ -402,6 +444,7 @@ fn build(s: &lang::Strings, snap: Snapshot<'_>) -> Option<HMENU> {
         separator(menu);
 
         append(menu, id::OPEN, s.menu_open, false);
+        append(menu, id::OPEN_FOLDER, s.menu_open_folder, false);
         // 没有媒体时这几项**置灰**而不是不画：位置不变，用户学得到布局，
         // 灰着也比「凭空少了两项」清楚为什么点不动。
         append(menu, id::PLAY_PAUSE, s.menu_play_pause, false);
@@ -476,8 +519,54 @@ fn build(s: &lang::Strings, snap: Snapshot<'_>) -> Option<HMENU> {
         separator(menu);
 
         build_timing(menu, s, snap);
+        separator(menu);
+
+        build_bookmark(menu, s, snap);
 
         Some(menu)
+    }
+}
+
+/// 「书签」那一组的右键子菜单。
+///
+/// ## 为什么占两项固定命令 + 一段动态列表
+///
+/// 固定的两项是「添加」与「删除本文件全部」，命令语义与文件无关；
+/// 中间那段是**当前文件**的书签，每条一个 ID（`base::BOOKMARK + 下标`），
+/// 点了直接 seek 过去。
+///
+/// 动态段用 ID 段而不是把名字塞进标签再回传 —— 回传只能传 ID，
+/// 而「跳到哪一个」必须由下标决定，否则名字里出现的特殊字符、
+/// 或者是两个同名书签（不同文件各有一个「开场」）都会解不开。
+fn build_bookmark(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
+    // SAFETY: 只调 Win32 菜单 API。
+    unsafe {
+        let Ok(sub) = CreatePopupMenu() else { return };
+
+        append(sub, id::BOOKMARK_ADD, s.menu_bookmark_add, false);
+        // 没有媒体就没有「当前位置」，按了也存不出有效书签。
+        enable(sub, id::BOOKMARK_ADD, snap.loaded);
+
+        if snap.bookmarks.is_empty() {
+            append(sub, NO_TRACK_ID, s.menu_bookmark_none, false);
+            enable(sub, NO_TRACK_ID, false);
+        } else {
+            for (n, b) in snap.bookmarks.iter().enumerate() {
+                append(
+                    sub,
+                    base::BOOKMARK + n as u16,
+                    &format!("{}  {}", b.label, b.at),
+                    false,
+                );
+            }
+            separator(sub);
+        }
+
+        append(sub, id::BOOKMARK_CLEAR, s.menu_bookmark_clear, false);
+        // 没有书签时置灰而不是不画：位置不变，用户学得到布局。
+        enable(sub, id::BOOKMARK_CLEAR, !snap.bookmarks.is_empty());
+
+        append_sub(menu, s.menu_bookmark, sub, snap.loaded);
     }
 }
 
@@ -532,11 +621,7 @@ fn build_timing(menu: HMENU, s: &lang::Strings, snap: Snapshot<'_>) {
         append(sub, id::AB_SET_B, s.menu_ab_set_b, false);
         enable(sub, id::AB_SET_B, snap.loaded && snap.ab_set);
         append(sub, id::AB_CLEAR, s.menu_ab_clear, false);
-        enable(
-            sub,
-            id::AB_CLEAR,
-            snap.loaded && (snap.ab_set || snap.ab_active),
-        );
+        enable(sub, id::AB_CLEAR, snap.loaded && snap.ab_set);
         separator(sub);
 
         append(sub, id::SUB_DELAY_INC, s.menu_sub_delay_inc, false);
@@ -789,8 +874,8 @@ mod tests {
     use super::*;
     use crate::track::{Track, TrackKind};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetMenuItemCount, GetMenuItemInfoW, GetMenuState, GetSubMenu, MENUITEMINFOW,
-        MENU_ITEM_MASK, MFS_CHECKED, MFS_GRAYED, MF_BYPOSITION, MIIM_ID, MIIM_STRING, MIIM_SUBMENU,
+        GetMenuItemCount, GetMenuItemInfoW, GetMenuState, MENUITEMINFOW, MENU_ITEM_MASK,
+        MFS_CHECKED, MFS_GRAYED, MF_BYPOSITION, MIIM_ID, MIIM_STRING, MIIM_SUBMENU,
     };
 
     fn st() -> lang::Strings {
@@ -886,29 +971,15 @@ mod tests {
         })
     }
 
-    /// 顶层菜单里**最后一个**子菜单的句柄。
+    /// 顶层菜单里的「时间」子菜单句柄。
     ///
-    /// 「时间」那一组是 0.8.0 才加的，而且是加在**最后**。所以按位置取
-    /// 「最后一个子菜单」比按标题找更稳 —— 按标题找的话，改一次翻译就要
-    /// 改一次测试，而翻译变动跟这个测试要验的东西毫无关系。
-    ///
-    /// **靠 `GetSubMenu` 返回空句柄来识别普通项**，而不是看 `wID == 0xFFFFFFFF`
-    /// —— 后者在 `MF_POPUP` 项上的返回值依实现而定（实测拿到的是子菜单
-    /// 句柄本身，不是那个全 1 的值），按它判断会一个都找不到。
-    fn last_submenu(m: HMENU) -> HMENU {
-        let mut found = HMENU::default();
-        for i in 0..count(m) {
-            // SAFETY: `i` 落在 `0..count(m)` 之内
-            let sub = unsafe { GetSubMenu(m, i) };
-            if !sub.is_invalid() {
-                found = sub;
-            }
-        }
-        assert!(
-            !found.is_invalid(),
-            "顶层菜单里一个子菜单都没有 —— 「时间」那一组呢？"
-        );
-        found
+    /// **按标题找，不按位置。** 这里原来取的是「最后一个子菜单」，理由是
+    /// 0.8.0 时「时间」那一组是最后加进去的。0.9.0 把**书签**子菜单接在了
+    /// 它后面，于是「最后一个」变成书签子菜单，下面几条测试一起挂。
+    /// 位置会随着菜单结构增长而失效，标题不会 —— 代价只是改翻译时跟着
+    /// 改这一处，而那正是「按标题找」换来稳定性的合理学费。
+    fn timing_submenu(m: HMENU, s: &lang::Strings) -> HMENU {
+        sub_handle(m, find(m, s.menu_timing))
     }
 
     /// 找不到时返回 `None` 而不是 panic —— 用来断言「某一项**不**在菜单里」。
@@ -994,6 +1065,8 @@ mod tests {
             sub_delay: 0.0,
             audio_delay: 0.0,
             tracks,
+            // 书签子菜单在别的测试里单独测；这里的快照不需要书签行。
+            bookmarks: &[],
         }
     }
 
@@ -1079,10 +1152,15 @@ mod tests {
         // `u16::MAX`，`x <= u16::MAX` 恒真，clippy 会以
         // `absurd_extreme_comparisons` 直接拒掉这条测试（而
         // `x < u16::MAX` 是常量，clippy 同样会以「断言恒真」警告）。
-        // 真要守的是「各段都待在低位区」，4000 是给这个约束一个具体数字，
-        // 而占位 ID 的具体值由 `固定命令id互不重复且都在动态段之前` 守着
-        // 「占位项解码成 Unknown」。
-        const SEGMENT_CEILING: u16 = 4000;
+        //
+        // 真要守的是「各段都待在低位区」：哪天有人把某个段长写成
+        // `(base::AUDIO, 60000)`，那一段就会顶到占位 ID 上，`decode`
+        // 再也解不出 `Unknown`，「灰掉的占位项点了不该有反应」就破了。
+        //
+        // 6000 的来历：目前最长的一段是书签（3200 + `MAX_BOOKMARKS`
+        // = 5200），再加一档余量。**动段长的人要跟着看这里** ——
+        // `书签段的容量至少等于书签上限` 会先在段长不合理时报警。
+        const SEGMENT_CEILING: u16 = 6000;
         assert!(
             SEGMENTS.iter().all(|(s, l)| s + l <= SEGMENT_CEILING),
             "有段越过了 {SEGMENT_CEILING}，离占位 ID 太近"
@@ -1208,7 +1286,7 @@ mod tests {
                 ..snap(&EMPTY)
             },
         );
-        let tm1 = last_submenu(m1.0);
+        let tm1 = timing_submenu(m1.0, &s);
         let t1 = item_text(tm1, id::SUB_DELAY_RESET);
         assert!(
             t1.contains("-0.15"),
@@ -1225,7 +1303,7 @@ mod tests {
         // 为 0：归零项**没有意义**（「归零一个已经是 0 的东西」），
         // 置灰是唯一诚实的表达
         let m2 = owned(&s, snap(&EMPTY));
-        let tm2 = last_submenu(m2.0);
+        let tm2 = timing_submenu(m2.0, &s);
         let t3 = item_text(tm2, id::SUB_DELAY_RESET);
         assert!(
             t3.contains('0'),
@@ -1246,7 +1324,7 @@ mod tests {
         let s = st();
         // 标 A：可点；标 B：不可点（mpv 要 a 和 b 都是有效时间才循环）
         let m1 = owned(&s, snap(&EMPTY));
-        let tm1 = last_submenu(m1.0);
+        let tm1 = timing_submenu(m1.0, &s);
         assert!(!is_grayed(tm1, find_cmd(tm1, id::AB_SET_A)));
         assert!(
             is_grayed(tm1, find_cmd(tm1, id::AB_SET_B)),
@@ -1264,7 +1342,7 @@ mod tests {
                 ..snap(&EMPTY)
             },
         );
-        let tm2 = last_submenu(m2.0);
+        let tm2 = timing_submenu(m2.0, &s);
         assert!(!is_grayed(tm2, find_cmd(tm2, id::AB_SET_B)));
         assert!(!is_grayed(tm2, find_cmd(tm2, id::AB_CLEAR)));
     }
@@ -1286,7 +1364,7 @@ mod tests {
                 ..snap(&EMPTY)
             },
         );
-        let tm = last_submenu(off.0);
+        let tm = timing_submenu(off.0, &s);
         for id in [
             id::AB_SET_A,
             id::AB_SET_B,
@@ -1703,5 +1781,97 @@ mod tests {
             let found = (0..count(m.0) as u32).any(|i| cmd(m.0, i) == want as u32);
             assert!(found, "菜单里找不到命令 ID {want}");
         }
+    }
+
+    // ---- 书签子菜单 ----
+
+    /// 带书签行的快照。`snap()` / `snap_full()` 都不带书签，书签子菜单
+    /// 那段动态列表在这两条辅助函数下覆盖不到。
+    fn snap_bookmarks(bookmarks: &[BookmarkRow]) -> Snapshot<'_> {
+        Snapshot {
+            loaded: true,
+            paused: false,
+            speed: 1.0,
+            theatre: false,
+            fullscreen: false,
+            diag_open: false,
+            advanced: true,
+            sub_codepage: "auto",
+            sub_scale: 1.0,
+            ab_set: false,
+            ab_active: false,
+            sub_delay: 0.0,
+            audio_delay: 0.0,
+            tracks: &EMPTY,
+            bookmarks,
+        }
+    }
+
+    fn bm(label: &str, at: &str) -> BookmarkRow {
+        BookmarkRow {
+            label: label.to_string(),
+            at: at.to_string(),
+        }
+    }
+
+    #[test]
+    fn 书签段的容量至少等于书签上限() {
+        // 这条是**修复前会失败**的：`SEGMENTS` 里 BOOKMARK 原本只给 200 个
+        // 名额，而书签上限是 2000。第 201 条书签的 ID（3200 + 200 = 3400）
+        // 落到段外，`decode` 把它解成 `Unknown`，而 `run_menu_command` 对
+        // `Unknown` 是安静返回的 —— 用户点了那条书签，什么都不发生，
+        // 也没有任何提示。
+        let (_, len) = SEGMENTS
+            .iter()
+            .find(|(b, _)| *b == base::BOOKMARK)
+            .copied()
+            .expect("BOOKMARK 必须在 SEGMENTS 里");
+        assert!(
+            usize::from(len) >= crate::bookmark::MAX_BOOKMARKS,
+            "书签段只有 {len} 个名额，而书签上限是 {}：超出的那几条点不动",
+            crate::bookmark::MAX_BOOKMARKS
+        );
+    }
+
+    #[test]
+    fn 书签子菜单空时留占位项且删除置灰() {
+        let s = st();
+        let m = owned(&s, snap_bookmarks(&[]));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_bookmark)));
+        // 添加 + 占位「（没有书签）」 + 删除 = 3
+        assert_eq!(count(sub.0), 3, "空书签时子菜单的构成变了");
+        assert_eq!(cmd(sub.0, 0), u32::from(id::BOOKMARK_ADD));
+        assert_eq!(cmd(sub.0, 2), u32::from(id::BOOKMARK_CLEAR));
+        assert!(is_grayed(sub.0, 1), "占位项不该能点");
+        assert!(is_grayed(sub.0, 2), "没有书签时「删除全部」要置灰");
+    }
+
+    #[test]
+    fn 书签子菜单每条各占一个编号() {
+        let s = st();
+        let rows = [bm("开场", "00:01"), bm("广告", "12:34")];
+        let m = owned(&s, snap_bookmarks(&rows));
+        let sub = Owned(sub_handle(m.0, find(m.0, s.menu_bookmark)));
+        // 添加 + 2 条 + 分隔 + 删除 = 5
+        assert_eq!(count(sub.0), 5, "两条书签时子菜单的构成变了");
+        assert_eq!(cmd(sub.0, 1), u32::from(base::BOOKMARK), "第 1 条书签");
+        assert_eq!(cmd(sub.0, 2), u32::from(base::BOOKMARK) + 1, "第 2 条书签");
+        assert!(!is_grayed(sub.0, 4), "有书签时「删除全部」该可用");
+        // 标题里必须同时有名字和时间，否则用户分不清哪条是哪条
+        let text = label(sub.0, 1).unwrap_or_default();
+        assert!(text.contains("开场"), "标题里丢了名字：{text}");
+        assert!(text.contains("00:01"), "标题里丢了时间：{text}");
+    }
+
+    #[test]
+    fn 书签子菜单两种语言项数一致() {
+        let rows = [bm("开场", "00:01")];
+        let zh = lang::Strings::new(lang::Lang::ZhCn);
+        let en = lang::Strings::new(lang::Lang::En);
+        let mz = owned(&zh, snap_bookmarks(&rows));
+        let me = owned(&en, snap_bookmarks(&rows));
+        let cz = count(sub_handle(mz.0, find(mz.0, zh.menu_bookmark)));
+        let ce = count(sub_handle(me.0, find(me.0, en.menu_bookmark)));
+        assert_eq!(cz, ce, "书签子菜单在两种语言下的项数必须一致");
     }
 }

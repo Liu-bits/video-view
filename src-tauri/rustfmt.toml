@@ -1,0 +1,34 @@
+# rustfmt 配置。
+#
+# **只用 stable 支持的选项。** 很多耳熟能详的项 —— imports_granularity、
+# wrap_comments、comment_width、fn_single_line —— 都是 nightly-only：
+# 写在 stable 的 rustfmt.toml 里不会报错，只会被静默忽略，然后留下一条
+# warning。更糟的是要用它们就必须 `cargo +nightly fmt`，于是「本地跑 nightly
+# 格式化过、CI 用 stable 检查不过」这一类问题会反复出现。
+#
+# 本仓库的立场：格式基线由 stable 工具链单方面定义，谁都不许引入 nightly 依赖。
+
+edition = "2021"
+
+# 100 是 rustfmt 的默认值。显式写出来，是为了把「这个仓库的宽度就是 100」
+# 变成一条可断言的事实，而不是「碰巧没配所以是默认值」——
+# 后者会在某次 rustfmt 改默认值时无声地改变全仓库的换行位置。
+max_width = 100
+
+hard_tabs = false
+tab_spaces = 4
+
+# 一律 LF，与 .gitattributes 的 `* text=auto eol=lf` 对上
+newline_style = "Unix"
+
+# use 与 mod 声明排序（都是 stable 选项）
+reorder_imports = true
+reorder_modules = true
+
+# 竖排 match 分支的末位逗号。rustfmt 默认行为，写成显式约定。
+#
+# 注意这里**只写 `match_block_trailing_comma`**：它的近亲 `trailing_comma`
+# 同样是 nightly-only（实测：stable 1.99 上写 `trailing_comma = "Vertical"`
+# 会输出 `can't set ... unstable features are only available in nightly channel`，
+# 每个源文件重复一遍）。凡是 nightly-only 的项一律不进这个文件。
+match_block_trailing_comma = false

@@ -13,14 +13,17 @@
 //! 且 DPI 缩放由系统与 GDI 原生处理，不存在浏览器位图拉伸导致的文字发虚。
 
 mod app;
+pub mod bookmark;
 pub mod cpu;
 pub mod crashlog;
 pub mod diag;
+pub mod folder;
 pub mod gpu;
 pub mod lang;
 pub mod menu;
 pub mod mpv;
 pub mod playlist;
+mod prompt;
 pub mod resume;
 pub mod settings;
 mod surface;
