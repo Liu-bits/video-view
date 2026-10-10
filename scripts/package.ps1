@@ -95,23 +95,12 @@ build.rs 不会替换这个值，必须手动同步 src-tauri/assets/app.manifes
 "@
 }
 
-# ---- 校验嵌进 exe 的版本号与 Cargo.toml 一致 ---------------------------------
-# app.rc 的 FILEVERSION / FileVersion 由 build.rs 从 CARGO_PKG_VERSION 注入，
-# 所以这里不需要（也不该）去同步 app.rc —— 漏的是重新 build。症状是
-# 「控制面板还显示上一版、文件名已经是新版」。
-$Exe = Join-Path $TauriDir "target\release\video-view.exe"
-if (-not (Test-Path -LiteralPath $Exe)) {
-    throw "找不到 $Exe（是否忘了 -SkipBuild？）"
-}
-$FileVer = (Get-Item -LiteralPath $Exe).VersionInfo.FileVersion
-if ($FileVer -notmatch ("^" + [regex]::Escape($Version) + "(\.|$)")) {
-    throw @"
-exe 里的文件版本号是 $FileVer，与 Cargo.toml 的 $Version 不一致。
-FileVersion 由 build.rs 从 CARGO_PKG_VERSION 注入，所以要重新
-  cargo build --release
-（用了 -SkipBuild 时最容易漏这一步）。
-"@
-}
+# exe 版本号的校验在**编译之后**（见下面「校验 exe 版本号」那一节）。
+#
+# 它原来就在这个位置 —— 编译**之前** —— 结果是「改完版本号第一次打包」
+# 必然失败：那时 target\release\video-view.exe 要么还是上一版的（版本号
+# 对不上），要么根本不存在，而脚本明明有能力自己编出来，却先 throw 了。
+# 这个顺序错了很多版没被发现，是因为每次发版前都先手动跑过一次 release 编译。
 
 # ---- 编译 -------------------------------------------------------------------
 if (-not $SkipBuild) {
@@ -135,6 +124,27 @@ if (-not $SkipBuild) {
     finally {
         Pop-Location
     }
+}
+
+# ---- 校验 exe 的版本号（**必须在编译之后**）----------------------------------
+# app.rc 的 FILEVERSION / FileVersion 由 build.rs 从 CARGO_PKG_VERSION 注入，
+# 所以这里不需要（也不该）去同步 app.rc —— 漏的是重新 build。症状是
+# 「控制面板还显示上一版、文件名已经是新版」。
+#
+# 位置很关键：放在编译之前的话，改完版本号后的第一次打包永远走不到编译
+# （exe 还是上一版的、版本号对不上，直接 throw），而脚本明明能自己编出来。
+$Exe = Join-Path $TauriDir "target\release\video-view.exe"
+if (-not (Test-Path -LiteralPath $Exe)) {
+    throw "找不到 $Exe（cargo build --release 没有产出可执行文件）"
+}
+$FileVer = (Get-Item -LiteralPath $Exe).VersionInfo.FileVersion
+if ($FileVer -notmatch ("^" + [regex]::Escape($Version) + "(\.|$)")) {
+    throw @"
+exe 里的文件版本号是 $FileVer，与 Cargo.toml 的 $Version 不一致。
+FileVersion 由 build.rs 从 CARGO_PKG_VERSION 注入，所以要重新
+  cargo build --release
+（用了 -SkipBuild 时最容易漏这一步）。
+"@
 }
 
 # ---- 铺暂存目录 -------------------------------------------------------------
