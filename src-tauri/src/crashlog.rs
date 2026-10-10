@@ -299,7 +299,19 @@ fn ensure_dir(dir: &Path) -> bool {
         if GetFileAttributesW(PCWSTR(p.as_ptr())) != INVALID_FILE_ATTRIBUTES {
             return true;
         }
-        CreateDirectoryW(PCWSTR(p.as_ptr()), None).is_ok()
+        if CreateDirectoryW(PCWSTR(p.as_ptr()), None).is_ok() {
+            return true;
+        }
+        // 建目录失败**不等于**这目录不可用：另一个线程 / 进程可能正好在
+        // 「查属性」和「建目录」之间把它建好了，于是这里拿到的是
+        // `ERROR_ALREADY_EXISTS`。所以再确认一次。
+        //
+        // 这条路径在开发机上几乎测不出来 —— 目录早就存在，走的是上面那个
+        // 提前 return。CI 上是全新环境，而 `cargo test` 是多线程跑的：
+        // 首次跑 CI 时 `bookmark::tests::书签文件只拼一层_video_view` 就红在
+        // 这里（两次并发调用，一次成功、一次拿到 false，后者让
+        // `appdata_dir()` 返回了 `None`）。
+        GetFileAttributesW(PCWSTR(p.as_ptr())) != INVALID_FILE_ATTRIBUTES
     }
 }
 
@@ -540,5 +552,47 @@ mod tests {
             in_exe || in_local,
             "日志路径 {p:?} 既不在 exe 目录 {exe:?} 也不在 LOCALAPPDATA 下"
         );
+    }
+
+    /// 并发建同一个目录时，`ensure_dir` 不能有人被误判成「建不出来」。
+    ///
+    /// 「查属性 → 建目录」这两步不是原子的：另一个线程正好在两步之间把目录
+    /// 建好时，`CreateDirectoryW` 返回的是 `ERROR_ALREADY_EXISTS`。修复前那
+    /// 一路直接返回 `false`，于是 `appdata_dir()` 给出 `None` ——
+    /// 「书签 / 续播」静默失效。
+    ///
+    /// 必须用一个**此刻还不存在**的目录：目录已存在就走提前 return，竞态根本
+    /// 发生不了（这正是它在开发机上一直没被暴露的原因 —— 那儿目录早就建过了）。
+    /// 用 `Barrier` 把线程卡在同一时刻进函数，否则「8 个线程恰好全没赶上」
+    /// 会让这个测试时绿时红，而靠运气的测试不如没有。
+    #[test]
+    fn 并发建同一个目录不会有人被误判成失败() {
+        use std::sync::{Arc, Barrier};
+
+        let base = tmpdir("videoview-concurrent-ensure");
+        let target = base.join("VideoView");
+        assert!(!target.exists(), "前提：这个目录此刻必须不存在");
+
+        let n = 8;
+        let barrier = Arc::new(Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let t = target.clone();
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    ensure_dir(&t)
+                })
+            })
+            .collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            results.iter().all(|ok| *ok),
+            "有线程被误判为建不出来：{results:?}"
+        );
+        assert!(target.is_dir(), "目录最终必须存在");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
